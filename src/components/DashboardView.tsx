@@ -1,0 +1,640 @@
+import React, { useMemo, useState } from 'react';
+import {
+  ArrowRight,
+  Award,
+  Bell,
+  Bot,
+  CalendarCheck2,
+  CheckCircle2,
+  Circle,
+  Clock,
+  Download,
+  ExternalLink,
+  FolderOpen,
+  HelpCircle,
+  MessageSquare,
+  NotebookPen,
+  Search,
+  Sigma,
+  Timer,
+  Wrench,
+} from 'lucide-react';
+import {
+  DEPARTMENTS,
+  SEMESTER_LABELS,
+  SEMESTER_LABELS_EN,
+  SUBJECTS_CATALOG,
+  getSubjectsForUser,
+  getTodayDayBn,
+} from '../data/curriculum';
+import { bi } from '../i18n/translations';
+import {
+  AppView,
+  AuthUser,
+  FormulaItem,
+  PlatformNotice,
+  StudyMateState,
+} from '../types/study';
+import { formatDateBn, formatTodayFullBn, toBnDigits } from '../utils/formatBn';
+import { LiveBangladeshClock } from './LiveBangladeshClock';
+import { MathFormula } from './MathFormula';
+
+interface DashboardViewProps {
+  state: StudyMateState;
+  currentUser: AuthUser | null;
+  notices: PlatformNotice[];
+  formulas: FormulaItem[];
+  onNavigate: (view: AppView) => void;
+  onToggleTask: (taskId: string) => void;
+}
+
+export const DashboardView: React.FC<DashboardViewProps> = ({
+  state,
+  currentUser,
+  notices,
+  formulas,
+  onNavigate,
+  onToggleTask,
+}) => {
+  const lang = state.settings.language;
+  const todayBn = getTodayDayBn();
+  const deptInfo = DEPARTMENTS.find((d) => d.id === state.settings.department);
+  const semesterSubjects = getSubjectsForUser(state.settings.department, state.settings.semester);
+
+  const [globalSearch, setGlobalSearch] = useState('');
+
+  const todaysTasks = state.tasks.filter((t) => t.day === todayBn);
+  const completedTodayCount = todaysTasks.filter((t) => t.completed).length;
+  const totalTasksCompleted = state.tasks.filter((t) => t.completed).length;
+  const totalTasks = state.tasks.length;
+  const taskProgressPercent = totalTasks > 0 ? Math.round((totalTasksCompleted / totalTasks) * 100) : 0;
+
+  const totalSemesterChapters = semesterSubjects.reduce((acc, s) => acc + s.chapters.length, 0);
+  const completedSemesterChapters = semesterSubjects.reduce(
+    (acc, s) => acc + s.chapters.filter((ch) => state.completedChapterIds.includes(ch.id)).length,
+    0
+  );
+
+  const avgQuizScore =
+    state.quizHistory.length > 0
+      ? Math.round(
+          state.quizHistory.reduce((acc, q) => acc + q.scorePercent, 0) / state.quizHistory.length
+        )
+      : null;
+
+  const highlightedFormulas = useMemo(() => {
+    const favs = formulas.filter((f) => state.favoriteFormulaIds.includes(f.id));
+    if (favs.length >= 2) return favs.slice(0, 3);
+    return [...favs, ...formulas.filter((f) => !state.favoriteFormulaIds.includes(f.id))].slice(0, 3);
+  }, [formulas, state.favoriteFormulaIds]);
+
+  const searchMatches = useMemo(() => {
+    const q = globalSearch.trim().toLowerCase();
+    if (!q) return { formulas: [] as FormulaItem[], subjects: [] as typeof SUBJECTS_CATALOG };
+    return {
+      formulas: formulas
+        .filter(
+          (f) =>
+            f.nameEn.toLowerCase().includes(q) ||
+            f.nameBn.toLowerCase().includes(q) ||
+            f.chapter.toLowerCase().includes(q)
+        )
+        .slice(0, 4),
+      subjects: SUBJECTS_CATALOG.filter(
+        (s) =>
+          s.code.toLowerCase().includes(q) ||
+          s.nameBn.toLowerCase().includes(q) ||
+          (s.nameEn ?? '').toLowerCase().includes(q)
+      ).slice(0, 4),
+    };
+  }, [globalSearch, formulas]);
+
+  const quickActions: {
+    view: AppView;
+    titleBn: string;
+    titleEn: string;
+    subBn: string;
+    subEn: string;
+    icon: React.ComponentType<{ className?: string }>;
+  }[] = [
+    {
+      view: 'pdf-library',
+      titleBn: 'আমার PDF লাইব্রেরি',
+      titleEn: 'My PDF Library',
+      subBn: 'প্রাইভেট PDF আপলোড ও রিডার',
+      subEn: 'Private PDF Uploads & Reader',
+      icon: FolderOpen,
+    },
+    {
+      view: 'formulas',
+      titleBn: 'ফর্মুলা হাব',
+      titleEn: 'Formula Hub',
+      subBn: `${toBnDigits(formulas.length)}টি Physics ও Math সূত্র`,
+      subEn: `${formulas.length} Physics & Math Formulas`,
+      icon: Sigma,
+    },
+    {
+      view: 'ai',
+      titleBn: 'এআই টিউটর',
+      titleEn: 'AI Tutor',
+      subBn: 'দ্রুত স্ট্রিমিং সমাধান',
+      subEn: 'Fast Streaming Mentor',
+      icon: Bot,
+    },
+    {
+      view: 'tools',
+      titleBn: 'পাওয়ার ও ইঞ্জিনিয়ারিং টুলস',
+      titleEn: 'Power Tech Tools',
+      subBn: 'ওহম, পাওয়ার, এনার্জি ও সূত্র',
+      subEn: "Ohm's Law, Power & Calculators",
+      icon: Wrench,
+    },
+    {
+      view: 'result',
+      titleBn: 'BTEB রেজাল্ট',
+      titleEn: 'BTEB Result',
+      subBn: 'অফিশিয়াল রেজাল্ট পোর্টাল',
+      subEn: 'Official Board Result Search',
+      icon: Award,
+    },
+    {
+      view: 'quiz',
+      titleBn: 'MCQ ও মডেল টেস্ট',
+      titleEn: 'MCQ & Model Test',
+      subBn: 'টাইমারসহ কুইজ অনুশীলন',
+      subEn: 'Timed Practice Tests',
+      icon: HelpCircle,
+    },
+    {
+      view: 'community',
+      titleBn: 'স্টুডেন্ট কমিউনিটি',
+      titleEn: 'Student Community',
+      subBn: 'প্রশ্ন-উত্তর ও আলোচনা',
+      subEn: 'Q&A & Peer Help',
+      icon: MessageSquare,
+    },
+    {
+      view: 'notes',
+      titleBn: 'নোটস ও শেয়ার্ড PDF',
+      titleEn: 'Notes & Shared PDFs',
+      subBn: `${toBnDigits(state.notes.length)}টি সংরক্ষিত নোট`,
+      subEn: `${state.notes.length} Saved Notes`,
+      icon: NotebookPen,
+    },
+    {
+      view: 'install',
+      titleBn: 'অ্যাপ ইনস্টল (PWA/APK)',
+      titleEn: 'Install App (PWA/APK)',
+      subBn: 'অফলাইন অ্যাপ ও APK স্ট্যাটাস',
+      subEn: 'Offline PWA & Android APK',
+      icon: Download,
+    },
+  ];
+
+  const displayName = currentUser?.fullName || state.settings.studentName;
+
+  return (
+    <div className="space-y-6">
+      {/* Global Quick Search */}
+      <div className="relative">
+        <Search className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2" />
+        <input
+          type="text"
+          value={globalSearch}
+          onChange={(e) => setGlobalSearch(e.target.value)}
+          placeholder={bi(
+            lang,
+            'ফর্মুলা (যেমন Ohm, Torque), বিষয় কোড (27141) বা অধ্যায় খুঁজুন...',
+            'Search formulas (e.g. Ohm, Torque), subject code (27141), or chapters...'
+          )}
+          className="w-full min-h-[46px] pl-11 pr-4 py-2.5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
+        />
+        {(searchMatches.formulas.length > 0 || searchMatches.subjects.length > 0) && (
+          <div className="absolute left-0 right-0 top-13 z-30 rounded-2xl bg-white dark:bg-[#0D1426] border border-slate-200 dark:border-slate-800 shadow-2xl divide-y divide-slate-200 dark:divide-slate-800">
+            {searchMatches.formulas.map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => {
+                  setGlobalSearch('');
+                  onNavigate('formulas');
+                }}
+                className="w-full px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-slate-50 dark:hover:bg-slate-800/60"
+              >
+                <div>
+                  <p className="text-[11px] font-semibold text-cyan-600 dark:text-cyan-400">
+                    {f.subject === 'physics' ? 'Physics' : 'Mathematics'} · {f.chapter}
+                  </p>
+                  <p className="text-sm font-medium text-slate-900 dark:text-white">
+                    {lang === 'en' ? f.nameEn : f.nameBn}
+                  </p>
+                </div>
+                <ArrowRight className="w-4 h-4 text-slate-400" />
+              </button>
+            ))}
+            {searchMatches.subjects.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => {
+                  setGlobalSearch('');
+                  onNavigate('subjects');
+                }}
+                className="w-full px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-slate-50 dark:hover:bg-slate-800/60"
+              >
+                <div>
+                  <p className="text-xs font-mono font-semibold text-cyan-600 dark:text-cyan-400">
+                    {m.code}
+                  </p>
+                  <p className="text-sm font-medium text-slate-900 dark:text-white">
+                    {lang === 'en' ? m.nameEn || m.nameBn : m.nameBn}
+                  </p>
+                </div>
+                <ArrowRight className="w-4 h-4 text-slate-400" />
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Welcome Banner */}
+      <section className="relative overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-900 text-white">
+        <img
+          src="/src/assets/images/diploma_study_blueprint_1794839045900.jpg"
+          alt="Polytechnic Hub Blueprint"
+          referrerPolicy="no-referrer"
+          className="absolute inset-0 w-full h-full object-cover opacity-35"
+          onError={(e) => {
+            e.currentTarget.style.display = 'none';
+          }}
+        />
+        <div className="absolute inset-0 bg-gradient-to-r from-[#060B16]/95 via-[#060B16]/85 to-[#0B1D36]/65" />
+
+        <div className="relative p-6 lg:p-8 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">
+          <div className="space-y-2 max-w-2xl">
+            <p className="text-xs font-medium text-cyan-300">
+              {formatTodayFullBn()} · {lang === 'en' ? deptInfo?.nameEn : deptInfo?.nameBn} ·{' '}
+              {lang === 'en'
+                ? SEMESTER_LABELS_EN[state.settings.semester]
+                : SEMESTER_LABELS[state.settings.semester]}
+            </p>
+            <h1 className="text-2xl lg:text-3xl font-bold tracking-tight text-balance">
+              {bi(lang, `স্বাগতম, ${displayName}`, `Welcome back, ${displayName}`)}
+            </h1>
+            <p className="text-sm lg:text-base text-slate-300 leading-relaxed">
+              {bi(
+                lang,
+                'Polytechnic Hub — আপনার ব্যক্তিগত PDF লাইব্রেরি, পদার্থবিজ্ঞান ও গণিত ফর্মুলা হাব, দ্রুত এআই টিউটর ও ইঞ্জিনিয়ারিং টুলস।',
+                'Polytechnic Hub — Your Private PDF Library, Physics & Math Formula Hub, Fast AI Tutor & Engineering Tools.'
+              )}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 shrink-0">
+            <button
+              type="button"
+              onClick={() => onNavigate('pdf-library')}
+              className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-sm font-bold transition-colors whitespace-nowrap"
+            >
+              <FolderOpen className="w-4 h-4" />
+              <span>{bi(lang, 'আমার PDF লাইব্রেরি', 'My PDF Library')}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onNavigate('formulas')}
+              className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-sm font-medium transition-colors whitespace-nowrap"
+            >
+              <Sigma className="w-4 h-4" />
+              <span>{bi(lang, 'ফর্মুলা হাব', 'Formula Hub')}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onNavigate('timer')}
+              className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-sm font-medium transition-colors whitespace-nowrap"
+            >
+              <Timer className="w-4 h-4" />
+              <span>{bi(lang, 'স্টাডি টাইমার', 'Study Timer')}</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {/* Live Bangladesh Clock + Important Notices */}
+      <section className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+        <div className="lg:col-span-6">
+          <LiveBangladeshClock onOpenTimer={() => onNavigate('timer')} />
+        </div>
+
+        <div className="lg:col-span-6 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 flex flex-col justify-between gap-3">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <Bell className="w-4 h-4 text-cyan-500" />
+              <span>{bi(lang, 'গুরুত্বপূর্ণ নোটিশ', 'Important Notices')}</span>
+            </h2>
+            <button
+              type="button"
+              onClick={() => onNavigate('result')}
+              className="text-xs font-semibold text-cyan-600 dark:text-cyan-400 hover:underline whitespace-nowrap"
+            >
+              {bi(lang, 'BTEB রেজাল্ট', 'BTEB Result')}
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {notices.slice(0, 2).map((n) => (
+              <div
+                key={n.id}
+                className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 flex items-start justify-between gap-2"
+              >
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                    {n.title}
+                  </p>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-2 mt-0.5">
+                    {n.body}
+                  </p>
+                </div>
+                {n.officialLink && (
+                  <a
+                    href={n.officialLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label="Open official link"
+                    className="p-1.5 rounded-lg text-cyan-500 hover:bg-cyan-500/10 shrink-0"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* 4-Column Study Metrics Strip */}
+      <section className="grid grid-cols-2 lg:grid-cols-4 gap-3 lg:gap-4">
+        <div className="p-4 lg:p-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {bi(lang, `আজকের টাস্ক (${todayBn})`, "Today's Tasks")}
+          </p>
+          <p className="mt-2 text-2xl font-bold text-slate-900 dark:text-white tabular-nums">
+            {lang === 'bn'
+              ? `${toBnDigits(completedTodayCount)} / ${toBnDigits(todaysTasks.length)}`
+              : `${completedTodayCount} / ${todaysTasks.length}`}
+          </p>
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            {bi(lang, 'সম্পন্ন হয়েছে', 'Completed')}
+          </p>
+        </div>
+
+        <div className="p-4 lg:p-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {bi(lang, 'রুটিন অগ্রগতি', 'Routine Progress')}
+          </p>
+          <p className="mt-2 text-2xl font-bold text-cyan-600 dark:text-cyan-400 tabular-nums">
+            {lang === 'bn' ? `${toBnDigits(taskProgressPercent)}%` : `${taskProgressPercent}%`}
+          </p>
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+            {bi(lang, `মোট ${toBnDigits(totalTasksCompleted)}টি সম্পন্ন`, `${totalTasksCompleted} tasks done`)}
+          </p>
+        </div>
+
+        <div className="p-4 lg:p-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {bi(lang, 'অধ্যায় সমাপ্তি', 'Chapters Finished')}
+          </p>
+          <p className="mt-2 text-2xl font-bold text-emerald-600 dark:text-emerald-400 tabular-nums">
+            {lang === 'bn'
+              ? `${toBnDigits(completedSemesterChapters)} / ${toBnDigits(totalSemesterChapters)}`
+              : `${completedSemesterChapters} / ${totalSemesterChapters}`}
+          </p>
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            {bi(lang, 'বর্তমান সেমিস্টার', 'Current Semester')}
+          </p>
+        </div>
+
+        <div className="p-4 lg:p-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {bi(lang, 'গড় কুইজ স্কোর', 'Avg Quiz Score')}
+          </p>
+          <p className="mt-2 text-2xl font-bold text-slate-900 dark:text-white tabular-nums">
+            {avgQuizScore !== null
+              ? lang === 'bn'
+                ? `${toBnDigits(avgQuizScore)}%`
+                : `${avgQuizScore}%`
+              : '—'}
+          </p>
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+            {state.quizHistory.length > 0
+              ? bi(lang, `${toBnDigits(state.quizHistory.length)}টি কুইজ`, `${state.quizHistory.length} quizzes taken`)
+              : bi(lang, 'এখনো কুইজ দেওয়া হয়নি', 'No quizzes yet')}
+          </p>
+        </div>
+      </section>
+
+      {/* Formula Hub Highlights + Recent Study Activity */}
+      <section className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+        <div className="lg:col-span-7 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+              {bi(lang, 'গুরুত্বপূর্ণ সূত্র (Formula Hub)', 'Formula Hub Highlights')}
+            </h2>
+            <button
+              type="button"
+              onClick={() => onNavigate('formulas')}
+              className="text-xs font-semibold text-cyan-600 dark:text-cyan-400 hover:underline"
+            >
+              {bi(lang, 'সব সূত্র দেখুন', 'Explore Formulas')}
+            </button>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            {highlightedFormulas.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onNavigate('formulas')}
+                className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 hover:border-cyan-500/40 text-left space-y-1.5"
+              >
+                <p className="text-[11px] font-semibold text-cyan-600 dark:text-cyan-400 truncate">
+                  {item.subject === 'physics' ? 'Physics' : 'Math'} · {item.chapter}
+                </p>
+                <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                  {lang === 'en' ? item.nameEn : item.nameBn}
+                </p>
+                <div className="text-xs text-slate-700 dark:text-slate-200 overflow-x-auto">
+                  <MathFormula latex={item.expressionLatex} displayMode={false} />
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="lg:col-span-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
+          <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+            {bi(lang, 'সাম্প্রতিক অধ্যয়ন কার্যক্রম', 'Recent Study Activity')}
+          </h2>
+          {state.timerHistory.length === 0 && state.quizHistory.length === 0 ? (
+            <p className="text-xs text-slate-500 py-3">
+              {bi(
+                lang,
+                'টাইমার সেশন বা MCQ কুইজ সম্পন্ন করলে এখানে কার্যক্রম দেখা যাবে।',
+                'Complete a study timer or quiz to record recent study activity.'
+              )}
+            </p>
+          ) : (
+            <ul className="space-y-2 text-xs">
+              {state.timerHistory.slice(0, 2).map((t) => (
+                <li
+                  key={t.id}
+                  className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2"
+                >
+                  <span className="font-medium text-slate-800 dark:text-slate-200 truncate">
+                    {t.label}
+                  </span>
+                  <span className="font-mono text-emerald-500 font-semibold shrink-0">
+                    {t.completedMinutes}m
+                  </span>
+                </li>
+              ))}
+              {state.quizHistory.slice(0, 2).map((q) => (
+                <li
+                  key={q.id}
+                  className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2"
+                >
+                  <span className="font-medium text-slate-800 dark:text-slate-200 truncate">
+                    Quiz: {q.category}
+                  </span>
+                  <span className="font-mono text-cyan-500 font-semibold shrink-0">
+                    {q.scorePercent}% ({formatDateBn(q.completedAt)})
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </section>
+
+      {/* Main Two-Column Content: Today's Study Tasks + Quick Access Grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <section className="lg:col-span-6 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 flex flex-col">
+          <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-4">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-white">
+                {bi(lang, `আজকের পড়াশোনার তালিকা (${todayBn})`, "Today's Study Tasks")}
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                {bi(lang, 'কাজ সম্পন্ন হলে চেকবক্সে টিক দিন', 'Tap a task to mark completed')}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => onNavigate('routine')}
+              className="min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold text-cyan-600 dark:text-cyan-400 hover:bg-cyan-500/10 whitespace-nowrap"
+            >
+              <CalendarCheck2 className="w-4 h-4 inline mr-1" />
+              {bi(lang, 'রুটিন', 'Routine')}
+            </button>
+          </div>
+
+          {todaysTasks.length === 0 ? (
+            <div className="p-8 text-center space-y-3">
+              <p className="text-sm text-slate-600 dark:text-slate-400">
+                {bi(
+                  lang,
+                  `আজকের (${todayBn}) জন্য এখনো কোনো স্টাডি টাস্ক যোগ করা হয়নি।`,
+                  'No study tasks scheduled for today yet.'
+                )}
+              </p>
+              <button
+                type="button"
+                onClick={() => onNavigate('routine')}
+                className="min-h-[42px] inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold"
+              >
+                <span>{bi(lang, 'রুটিনে টাস্ক যোগ করুন', 'Add Routine Task')}</span>
+              </button>
+            </div>
+          ) : (
+            <ul className="divide-y divide-slate-200 dark:divide-slate-800">
+              {todaysTasks.map((task) => (
+                <li key={task.id}>
+                  <button
+                    type="button"
+                    onClick={() => onToggleTask(task.id)}
+                    className="w-full min-h-[58px] px-5 py-3 flex items-start gap-3 text-left hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors"
+                  >
+                    <span className="mt-0.5 shrink-0">
+                      {task.completed ? (
+                        <CheckCircle2 className="w-5 h-5 text-emerald-500" />
+                      ) : (
+                        <Circle className="w-5 h-5 text-slate-400 dark:text-slate-500" />
+                      )}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <p
+                        className={`text-sm font-medium ${
+                          task.completed
+                            ? 'line-through text-slate-400 dark:text-slate-500'
+                            : 'text-slate-900 dark:text-slate-100'
+                        }`}
+                      >
+                        {task.title}
+                      </p>
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                        <span>{task.subjectName}</span>
+                        <span aria-hidden="true">·</span>
+                        <span className="inline-flex items-center gap-1 tabular-nums">
+                          <Clock className="w-3 h-3" />
+                          {task.startTime} – {task.endTime}
+                        </span>
+                      </div>
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section className="lg:col-span-6 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900 dark:text-white">
+              {bi(lang, 'প্ল্যাটফর্মের দ্রুত প্রবেশ', 'Quick Feature Access')}
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              {bi(lang, 'যেকোনো মডিউলে সরাসরি প্রবেশ করুন', 'Jump straight into any tool or study section')}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            {quickActions.map((action) => {
+              const Icon = action.icon;
+              return (
+                <button
+                  key={action.view}
+                  type="button"
+                  onClick={() => onNavigate(action.view)}
+                  className="min-h-[56px] w-full flex items-center justify-between gap-2.5 px-3.5 py-2.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-cyan-500/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 text-left transition-colors group"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="w-9 h-9 rounded-lg bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex items-center justify-center shrink-0">
+                      <Icon className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                        {bi(lang, action.titleBn, action.titleEn)}
+                      </p>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                        {bi(lang, action.subBn, action.subEn)}
+                      </p>
+                    </div>
+                  </div>
+                  <ArrowRight className="w-3.5 h-3.5 text-slate-400 group-hover:text-cyan-500 shrink-0" />
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+};

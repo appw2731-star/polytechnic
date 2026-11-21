@@ -1,0 +1,6 @@
+{
+  "name": "StudyMate",
+  "description": "ডিপ্লোমা শিক্ষার্থীদের জন্য সম্পূর্ণ বাংলা অধ্যয়ন ও প্রস্তুতি অ্যাপ — বিষয়ভিত্তিক রিসোর্স, স্টাডি রুটিন, এমসিকিউ কুইজ, নোটস ও এআই স্টাডি সহায়ক।",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

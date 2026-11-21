@@ -1,0 +1,481 @@
+import React, { useState } from 'react';
+import {
+  Award,
+  BarChart3,
+  Bell,
+  BookMarked,
+  Bot,
+  CalendarCheck2,
+  Download,
+  ExternalLink,
+  FolderOpen,
+  HelpCircle,
+  Home,
+  Languages,
+  Menu,
+  MessageSquare,
+  Moon,
+  NotebookPen,
+  Settings,
+  Shield,
+  Sigma,
+  Sun,
+  Timer,
+  User,
+  Wrench,
+  X,
+} from 'lucide-react';
+import { DEPARTMENTS, SEMESTER_LABELS, SEMESTER_LABELS_EN } from '../data/curriculum';
+import { bi, VIEW_TITLES } from '../i18n/translations';
+import {
+  AppView,
+  AuthUser,
+  DepartmentId,
+  LanguageMode,
+  PlatformNotice,
+  SemesterNumber,
+  ThemeMode,
+} from '../types/study';
+import {
+  OfflineStatusBadge,
+  PolytechnicHubLogo,
+  PWAInstallButton,
+} from './PolytechnicHubLogo';
+
+export interface NavItem {
+  id: AppView;
+  labelBn: string;
+  labelEn: string;
+  shortLabelBn: string;
+  shortLabelEn: string;
+  group: 'main' | 'study' | 'platform';
+  icon: React.ComponentType<{ className?: string }>;
+}
+
+export const NAV_ITEMS: NavItem[] = [
+  // Main Nav
+  { id: 'dashboard', labelBn: 'হোম', labelEn: 'Home', shortLabelBn: 'হোম', shortLabelEn: 'Home', group: 'main', icon: Home },
+  { id: 'pdf-library', labelBn: 'আমার PDF লাইব্রেরি', labelEn: 'My PDF Library', shortLabelBn: 'PDF', shortLabelEn: 'PDFs', group: 'main', icon: FolderOpen },
+  { id: 'formulas', labelBn: 'ফর্মুলা হাব', labelEn: 'Formula Hub', shortLabelBn: 'ফর্মুলা', shortLabelEn: 'Formulas', group: 'main', icon: Sigma },
+  { id: 'result', labelBn: 'BTEB রেজাল্ট', labelEn: 'BTEB Result', shortLabelBn: 'রেজাল্ট', shortLabelEn: 'Result', group: 'main', icon: Award },
+  { id: 'ai', labelBn: 'এআই টিউটর', labelEn: 'AI Tutor', shortLabelBn: 'এআই', shortLabelEn: 'AI', group: 'main', icon: Bot },
+  { id: 'tools', labelBn: 'পাওয়ার টুলস', labelEn: 'Power Tools', shortLabelBn: 'টুলস', shortLabelEn: 'Tools', group: 'main', icon: Wrench },
+  { id: 'profile', labelBn: 'প্রোফাইল', labelEn: 'Profile', shortLabelBn: 'প্রোফাইল', shortLabelEn: 'Profile', group: 'main', icon: User },
+  // Study Modules
+  { id: 'subjects', labelBn: 'অধ্যায় ও সিলেবাস', labelEn: 'Chapters', shortLabelBn: 'অধ্যায়', shortLabelEn: 'Chapters', group: 'study', icon: BookMarked },
+  { id: 'notes', labelBn: 'নোটস ও শেয়ার্ড PDF', labelEn: 'Notes', shortLabelBn: 'নোটস', shortLabelEn: 'Notes', group: 'study', icon: NotebookPen },
+  { id: 'quiz', labelBn: 'MCQ ও মডেল টেস্ট', labelEn: 'MCQ & Quiz', shortLabelBn: 'কুইজ', shortLabelEn: 'Quiz', group: 'study', icon: HelpCircle },
+  { id: 'routine', labelBn: 'স্টাডি রুটিন', labelEn: 'Routine', shortLabelBn: 'রুটিন', shortLabelEn: 'Routine', group: 'study', icon: CalendarCheck2 },
+  { id: 'timer', labelBn: 'ক্লক ও টাইমার', labelEn: 'Clock & Timer', shortLabelBn: 'টাইমার', shortLabelEn: 'Timer', group: 'study', icon: Timer },
+  { id: 'progress', labelBn: 'অগ্রগতি রিপোর্ট', labelEn: 'Progress', shortLabelBn: 'অগ্রগতি', shortLabelEn: 'Progress', group: 'study', icon: BarChart3 },
+  // Platform
+  { id: 'community', labelBn: 'স্টুডেন্ট কমিউনিটি', labelEn: 'Community', shortLabelBn: 'ফোরাম', shortLabelEn: 'Forum', group: 'platform', icon: MessageSquare },
+  { id: 'install', labelBn: 'অ্যাপ ইনস্টল (PWA/APK)', labelEn: 'Install App', shortLabelBn: 'ইনস্টল', shortLabelEn: 'Install', group: 'platform', icon: Download },
+  { id: 'settings', labelBn: 'সেটিংস', labelEn: 'Settings', shortLabelBn: 'সেটিংস', shortLabelEn: 'Settings', group: 'platform', icon: Settings },
+  { id: 'admin', labelBn: 'অ্যাডমিন প্যানেল', labelEn: 'Admin Panel', shortLabelBn: 'অ্যাডমিন', shortLabelEn: 'Admin', group: 'platform', icon: Shield },
+];
+
+const DEFAULT_AVATAR = '/src/assets/images/student_scholar_avatar_1794839047562.jpg';
+
+interface DesktopSidebarProps {
+  activeView: AppView;
+  onSelectView: (view: AppView) => void;
+  department: DepartmentId;
+  semester: SemesterNumber;
+  theme: ThemeMode;
+  language: LanguageMode;
+  onToggleTheme: () => void;
+  studentName: string;
+  currentUser: AuthUser | null;
+}
+
+export const DesktopSidebar: React.FC<DesktopSidebarProps> = ({
+  activeView,
+  onSelectView,
+  department,
+  semester,
+  theme,
+  language,
+  onToggleTheme,
+  studentName,
+  currentUser,
+}) => {
+  const deptInfo = DEPARTMENTS.find((d) => d.id === department);
+  const visibleItems = NAV_ITEMS.filter(
+    (item) => item.id !== 'admin' || currentUser?.role === 'admin'
+  );
+
+  return (
+    <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 lg:fixed lg:inset-y-0 lg:left-0 bg-white dark:bg-[#0A1020] border-r border-slate-200 dark:border-slate-800/90 z-30 no-print">
+      <div className="h-16 px-4 flex items-center gap-3 border-b border-slate-200 dark:border-slate-800/90">
+        <PolytechnicHubLogo />
+        <div className="min-w-0">
+          <span className="block text-base font-bold tracking-tight text-slate-900 dark:text-white leading-none truncate">
+            Polytechnic Hub
+          </span>
+          <span className="block text-[10px] font-semibold tracking-wider text-cyan-600 dark:text-cyan-400 mt-1 truncate">
+            Learn • Practice • Achieve
+          </span>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        onClick={() => onSelectView('profile')}
+        className="px-4 py-3.5 border-b border-slate-200 dark:border-slate-800/90 text-left hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <img
+            src={currentUser?.avatarUrl || DEFAULT_AVATAR}
+            alt={currentUser?.fullName || studentName}
+            referrerPolicy="no-referrer"
+            onError={(e) => {
+              e.currentTarget.src = DEFAULT_AVATAR;
+            }}
+            className="w-10 h-10 rounded-xl object-cover border border-slate-200 dark:border-slate-700 shrink-0 bg-slate-800"
+          />
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+              {currentUser?.fullName || studentName}
+            </p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              {deptInfo?.shortName ?? 'PT'} ·{' '}
+              {language === 'en' ? SEMESTER_LABELS_EN[semester] : SEMESTER_LABELS[semester]}
+            </p>
+          </div>
+        </div>
+      </button>
+
+      <nav className="flex-1 overflow-y-auto px-3 py-3 space-y-1" aria-label="Main Menu">
+        {visibleItems.map((item) => {
+          const Icon = item.icon;
+          const isActive = activeView === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onSelectView(item.id)}
+              className={`w-full min-h-[40px] flex items-center gap-3 px-3 py-2 rounded-xl text-sm font-medium transition-colors text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500 ${
+                isActive
+                  ? 'bg-cyan-500/12 text-cyan-700 dark:bg-cyan-500/15 dark:text-cyan-300'
+                  : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/70 hover:text-slate-900 dark:hover:text-slate-100'
+              }`}
+            >
+              <Icon className={`w-4 h-4 shrink-0 ${isActive ? 'text-cyan-600 dark:text-cyan-400' : ''}`} />
+              <span className="truncate">{bi(language, item.labelBn, item.labelEn)}</span>
+            </button>
+          );
+        })}
+      </nav>
+
+      <div className="p-3.5 border-t border-slate-200 dark:border-slate-800/90">
+        <button
+          type="button"
+          onClick={onToggleTheme}
+          className="w-full min-h-[42px] flex items-center justify-between px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800/70 transition-colors"
+        >
+          <span>
+            {theme === 'dark'
+              ? bi(language, 'ডার্ক থিম সক্রিয়', 'Dark Theme Active')
+              : bi(language, 'লাইট থিম সক্রিয়', 'Light Theme Active')}
+          </span>
+          {theme === 'dark' ? (
+            <Moon className="w-4 h-4 text-cyan-400" />
+          ) : (
+            <Sun className="w-4 h-4 text-amber-500" />
+          )}
+        </button>
+      </div>
+    </aside>
+  );
+};
+
+interface TopBarProps {
+  activeView: AppView;
+  onSelectView: (view: AppView) => void;
+  theme: ThemeMode;
+  language: LanguageMode;
+  onToggleTheme: () => void;
+  onToggleLanguage: () => void;
+  isOnline: boolean;
+  canPromptPwa: boolean;
+  isPwaInstalled: boolean;
+  onPromptPwa: () => void;
+  notices: PlatformNotice[];
+  readNoticeIds: string[];
+  onMarkNoticesRead: () => void;
+}
+
+export const TopHeader: React.FC<TopBarProps> = ({
+  activeView,
+  onSelectView,
+  theme,
+  language,
+  onToggleTheme,
+  onToggleLanguage,
+  isOnline,
+  canPromptPwa,
+  isPwaInstalled,
+  onPromptPwa,
+  notices,
+  readNoticeIds,
+  onMarkNoticesRead,
+}) => {
+  const [notifOpen, setNotifOpen] = useState(false);
+  const unreadCount = notices.filter((n) => !readNoticeIds.includes(n.id)).length;
+  const viewTitle = VIEW_TITLES[activeView];
+
+  return (
+    <header className="sticky top-0 z-20 h-14 lg:h-16 px-4 lg:px-8 flex items-center justify-between gap-4 bg-white/90 dark:bg-[#060B16]/90 backdrop-blur-md border-b border-slate-200 dark:border-slate-800/90 no-print">
+      <div className="flex items-center gap-2.5 min-w-0">
+        <div className="lg:hidden flex items-center gap-2">
+          <PolytechnicHubLogo size="sm" />
+          <span className="text-sm font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0">
+            Polytechnic Hub
+          </span>
+        </div>
+        <span className="hidden lg:inline text-base font-semibold text-slate-900 dark:text-white whitespace-nowrap shrink-0">
+          {viewTitle ? bi(language, viewTitle.bn, viewTitle.en) : 'Polytechnic Hub'}
+        </span>
+      </div>
+
+      {/* Main 6 Navigation Links on Desktop */}
+      <nav
+        className="hidden md:flex items-center gap-5 text-sm font-medium text-slate-600 dark:text-slate-400"
+        aria-label="Main Navigation"
+      >
+        {(['dashboard', 'pdf-library', 'formulas', 'result', 'ai', 'profile'] as AppView[]).map((viewId) => {
+          const item = NAV_ITEMS.find((n) => n.id === viewId)!;
+          const active = activeView === viewId;
+          return (
+            <button
+              key={viewId}
+              type="button"
+              onClick={() => onSelectView(viewId)}
+              className={`whitespace-nowrap shrink-0 py-1 transition-colors hover:text-slate-900 dark:hover:text-white ${
+                active
+                  ? 'text-cyan-600 dark:text-cyan-400 underline underline-offset-8 decoration-2'
+                  : ''
+              }`}
+            >
+              {bi(language, item.shortLabelBn, item.shortLabelEn)}
+            </button>
+          );
+        })}
+      </nav>
+
+      <div className="flex items-center gap-2 shrink-0 relative">
+        <OfflineStatusBadge isOnline={isOnline} language={language} />
+
+        <button
+          type="button"
+          onClick={onToggleLanguage}
+          aria-label="Switch Language"
+          className="min-h-[36px] inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap"
+        >
+          <Languages className="w-3.5 h-3.5 text-cyan-500" />
+          <span>{language === 'bn' ? 'EN' : 'বাং'}</span>
+        </button>
+
+        {/* Notifications Bell */}
+        <button
+          type="button"
+          onClick={() => {
+            setNotifOpen((prev) => !prev);
+            onMarkNoticesRead();
+          }}
+          aria-label="Notifications"
+          className="relative min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+        >
+          <Bell className="w-4 h-4" />
+          {unreadCount > 0 && (
+            <span className="absolute -top-0.5 -right-0.5 w-4 h-4 rounded-full bg-cyan-500 text-[10px] font-bold text-slate-950 flex items-center justify-center">
+              {unreadCount}
+            </span>
+          )}
+        </button>
+
+        <PWAInstallButton
+          canPrompt={canPromptPwa}
+          isInstalled={isPwaInstalled}
+          onPrompt={onPromptPwa}
+          onOpenInstallView={() => onSelectView('install')}
+          language={language}
+        />
+
+        <button
+          type="button"
+          onClick={onToggleTheme}
+          aria-label="Toggle Theme"
+          className="lg:hidden min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+        >
+          {theme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
+        </button>
+
+        {notifOpen && (
+          <div className="absolute right-0 top-12 w-80 sm:w-96 rounded-2xl bg-white dark:bg-[#0D1426] border border-slate-200 dark:border-slate-800 shadow-2xl p-4 space-y-3 z-50">
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                {bi(language, 'গুরুত্বপূর্ণ নোটিশ ও আপডেট', 'Notices & Updates')}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setNotifOpen(false)}
+                className="p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            {notices.length === 0 ? (
+              <p className="text-xs text-slate-500 py-2">No notices available.</p>
+            ) : (
+              <div className="space-y-2.5 max-h-72 overflow-y-auto">
+                {notices.slice(0, 5).map((n) => (
+                  <div
+                    key={n.id}
+                    className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-1"
+                  >
+                    <p className="text-xs font-bold text-slate-900 dark:text-white">{n.title}</p>
+                    <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed">
+                      {n.body}
+                    </p>
+                    {n.officialLink && (
+                      <a
+                        href={n.officialLink}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-[11px] font-semibold text-cyan-600 dark:text-cyan-400 hover:underline pt-1"
+                      >
+                        <span>Open Link</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </header>
+  );
+};
+
+interface MobileBottomNavProps {
+  activeView: AppView;
+  onSelectView: (view: AppView) => void;
+  language: LanguageMode;
+  currentUser: AuthUser | null;
+}
+
+export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
+  activeView,
+  onSelectView,
+  language,
+  currentUser,
+}) => {
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  const primaryTabs: AppView[] = ['dashboard', 'pdf-library', 'formulas', 'ai'];
+  const secondaryActive = !primaryTabs.includes(activeView);
+
+  const visibleItems = NAV_ITEMS.filter(
+    (item) => item.id !== 'admin' || currentUser?.role === 'admin'
+  );
+
+  const handleNavigate = (view: AppView) => {
+    onSelectView(view);
+    setDrawerOpen(false);
+  };
+
+  return (
+    <>
+      <nav
+        aria-label="Mobile Bottom Navigation"
+        className="lg:hidden fixed bottom-0 left-0 right-0 z-30 h-14 bg-white/95 dark:bg-[#0A1020]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-5 items-center no-print"
+      >
+        {primaryTabs.map((id) => {
+          const item = NAV_ITEMS.find((n) => n.id === id)!;
+          const Icon = item.icon;
+          const isActive = activeView === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              onClick={() => handleNavigate(id)}
+              className={`min-h-[44px] flex flex-col items-center justify-center gap-0.5 transition-colors ${
+                isActive ? 'text-cyan-600 dark:text-cyan-400' : 'text-slate-500 dark:text-slate-400'
+              }`}
+            >
+              <Icon className="w-5 h-5" />
+              <span className="text-[11px] font-medium leading-none">
+                {bi(language, item.shortLabelBn, item.shortLabelEn)}
+              </span>
+            </button>
+          );
+        })}
+
+        <button
+          type="button"
+          onClick={() => setDrawerOpen(true)}
+          className={`min-h-[44px] flex flex-col items-center justify-center gap-0.5 transition-colors ${
+            secondaryActive || drawerOpen ? 'text-cyan-600 dark:text-cyan-400' : 'text-slate-500 dark:text-slate-400'
+          }`}
+        >
+          <Menu className="w-5 h-5" />
+          <span className="text-[11px] font-medium leading-none">
+            {bi(language, 'আরও', 'More')}
+          </span>
+        </button>
+      </nav>
+
+      {drawerOpen && (
+        <div
+          className="lg:hidden fixed inset-0 z-50 bg-black/65 backdrop-blur-xs flex items-end"
+          onClick={() => setDrawerOpen(false)}
+        >
+          <div
+            className="w-full max-h-[82vh] overflow-y-auto rounded-t-3xl bg-white dark:bg-[#0D1426] border-t border-slate-200 dark:border-slate-800 p-5 pb-8"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="w-10 h-1.5 rounded-full bg-slate-300 dark:bg-slate-700 mx-auto mb-4" />
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                {bi(language, 'Polytechnic Hub মেনু', 'Polytechnic Hub Menu')}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setDrawerOpen(false)}
+                aria-label="Close menu"
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2.5">
+              {visibleItems.map((item) => {
+                const Icon = item.icon;
+                const active = activeView === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => handleNavigate(item.id)}
+                    className={`min-h-[46px] flex items-center gap-2.5 px-3 py-2 rounded-xl border text-xs font-medium text-left transition-colors ${
+                      active
+                        ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300'
+                        : 'border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/60'
+                    }`}
+                  >
+                    <Icon className="w-4 h-4 shrink-0" />
+                    <span className="truncate">{bi(language, item.labelBn, item.labelEn)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+};
