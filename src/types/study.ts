@@ -19,6 +19,7 @@ export type SemesterNumber = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
 
 export type AppView =
   | 'dashboard'
+  | 'notifications'
   | 'pdf-library'
   | 'formulas'
   | 'result'
@@ -214,6 +215,7 @@ export interface UserSettings {
   theme: ThemeMode;
   language: LanguageMode;
   showEnglishTerms: boolean;
+  weeklyStudyGoalHours?: number;
 }
 
 export interface StudyMateState {
@@ -247,6 +249,8 @@ export interface AuthUser {
   instituteName: string;
   rollNumber: string;
   profileVisibility: 'public' | 'department' | 'private';
+  firebaseUid?: string;
+  isDisabled?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -288,6 +292,10 @@ export interface UserPdfRecord {
   storagePath: string;
   fileSizeBytes: number;
   mimeType: string;
+  department?: string;
+  semester?: number;
+  subjectName?: string;
+  sourceBackend?: 'supabase' | 'server';
   createdAt: string;
   updatedAt: string;
 }
@@ -310,6 +318,8 @@ export interface SharedPdfNote {
   subjectCode: string;
   summary: string;
   pdfUrl: string;
+  storagePath?: string;
+  fileSizeBytes?: number;
   downloadPermitted: boolean;
   createdAt: string;
 }
@@ -388,3 +398,113 @@ export interface OfflinePdfRecord {
   textContent?: string;
   savedAt: string;
 }
+
+export type PushCategory = 'APP_UPDATE' | 'IMPORTANT' | 'EDUCATION' | 'EMERGENCY' | 'GENERAL';
+export type PushAudienceType = 'all' | 'selected_users' | 'department_semester';
+export type PushSoundMode = 'custom' | 'default' | 'silent';
+
+export interface DeviceTokenRecord {
+  id: string;
+  userId: string;
+  token: string;
+  platform: 'web' | 'android' | 'ios';
+  browserOrDevice: string;
+  appVersion: string;
+  isActive: boolean;
+  lastSeenAt: string;
+  createdAt: string;
+}
+
+export interface NotificationPreferences {
+  userId: string;
+  pushEnabled: boolean;
+  soundEnabled: boolean;
+  soundStyle: 'chime' | 'alert' | 'soft' | 'bell' | 'system';
+  allowAppUpdate: boolean;
+  allowImportant: boolean;
+  allowEducation: boolean;
+  allowEmergency: boolean;
+  allowGeneral: boolean;
+  respectDnd: boolean;
+  updatedAt: string;
+}
+
+export interface UserNotificationItem {
+  id: string;
+  notificationId: string;
+  userId: string;
+  title: string;
+  body: string;
+  category: PushCategory;
+  imageUrl: string;
+  targetView: string;
+  actionUrl: string;
+  isRead: boolean;
+  readAt: string;
+  deliveredVia: 'fcm_and_in_app' | 'in_app' | 'web_push';
+  createdAt: string;
+}
+
+export interface PushNotificationCampaign {
+  id: string;
+  title: string;
+  body: string;
+  category: PushCategory;
+  imageUrl: string;
+  targetView: string;
+  actionUrl: string;
+  audienceType: PushAudienceType;
+  targetUserIds: string[];
+  targetDepartment: string;
+  targetSemester: number | null;
+  soundMode: PushSoundMode;
+  status: 'sent' | 'partial' | 'failed';
+  totalRecipients: number;
+  fcmSentCount: number;
+  fcmFailedCount: number;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface ScheduledPushNotification {
+  id: string;
+  title: string;
+  body: string;
+  category: PushCategory;
+  imageUrl: string;
+  targetView: string;
+  actionUrl: string;
+  audienceType: PushAudienceType;
+  targetUserIds: string[];
+  targetDepartment: string;
+  targetSemester: number | null;
+  soundMode: PushSoundMode;
+  scheduledFor: string;
+  status: 'pending' | 'processing' | 'sent' | 'cancelled' | 'failed';
+  sentNotificationId: string;
+  errorMessage: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AdminPushStats {
+  totalCampaigns: number;
+  totalPendingScheduled: number;
+  totalRecipientsReached: number;
+  totalFcmSent: number;
+  totalFcmFailed: number;
+  totalInboxRead: number;
+  totalInboxDelivered: number;
+  activeWebDevices: number;
+  activeAndroidDevices: number;
+}
+
+export interface AdminPushDashboardData {
+  fcmConfigured: boolean;
+  supabaseServiceConfigured: boolean;
+  history: PushNotificationCampaign[];
+  scheduled: ScheduledPushNotification[];
+  stats: AdminPushStats;
+}
+

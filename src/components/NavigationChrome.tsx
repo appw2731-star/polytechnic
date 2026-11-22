@@ -25,6 +25,7 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
+import { getCategoryMeta } from '../data/notificationCategories';
 import { DEPARTMENTS, SEMESTER_LABELS, SEMESTER_LABELS_EN } from '../data/curriculum';
 import { bi, VIEW_TITLES } from '../i18n/translations';
 import {
@@ -35,6 +36,7 @@ import {
   PlatformNotice,
   SemesterNumber,
   ThemeMode,
+  UserNotificationItem,
 } from '../types/study';
 import {
   OfflineStatusBadge,
@@ -55,6 +57,7 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   // Main Nav
   { id: 'dashboard', labelBn: 'হোম', labelEn: 'Home', shortLabelBn: 'হোম', shortLabelEn: 'Home', group: 'main', icon: Home },
+  { id: 'notifications', labelBn: 'নোটিফিকেশন', labelEn: 'Notifications', shortLabelBn: 'ইনবক্স', shortLabelEn: 'Inbox', group: 'main', icon: Bell },
   { id: 'pdf-library', labelBn: 'আমার PDF লাইব্রেরি', labelEn: 'My PDF Library', shortLabelBn: 'PDF', shortLabelEn: 'PDFs', group: 'main', icon: FolderOpen },
   { id: 'formulas', labelBn: 'ফর্মুলা হাব', labelEn: 'Formula Hub', shortLabelBn: 'ফর্মুলা', shortLabelEn: 'Formulas', group: 'main', icon: Sigma },
   { id: 'result', labelBn: 'BTEB রেজাল্ট', labelEn: 'BTEB Result', shortLabelBn: 'রেজাল্ট', shortLabelEn: 'Result', group: 'main', icon: Award },
@@ -87,6 +90,7 @@ interface DesktopSidebarProps {
   onToggleTheme: () => void;
   studentName: string;
   currentUser: AuthUser | null;
+  unreadPushCount?: number;
 }
 
 export const DesktopSidebar: React.FC<DesktopSidebarProps> = ({
@@ -99,6 +103,7 @@ export const DesktopSidebar: React.FC<DesktopSidebarProps> = ({
   onToggleTheme,
   studentName,
   currentUser,
+  unreadPushCount = 0,
 }) => {
   const deptInfo = DEPARTMENTS.find((d) => d.id === department);
   const visibleItems = NAV_ITEMS.filter(
@@ -162,7 +167,12 @@ export const DesktopSidebar: React.FC<DesktopSidebarProps> = ({
               }`}
             >
               <Icon className={`w-4 h-4 shrink-0 ${isActive ? 'text-cyan-600 dark:text-cyan-400' : ''}`} />
-              <span className="truncate">{bi(language, item.labelBn, item.labelEn)}</span>
+              <span className="truncate flex-1">{bi(language, item.labelBn, item.labelEn)}</span>
+              {item.id === 'notifications' && unreadPushCount > 0 && (
+                <span className="px-1.5 py-0.5 rounded-md bg-cyan-500 text-slate-950 text-[10px] font-bold tabular-nums">
+                  {unreadPushCount}
+                </span>
+              )}
             </button>
           );
         })}
@@ -204,6 +214,8 @@ interface TopBarProps {
   notices: PlatformNotice[];
   readNoticeIds: string[];
   onMarkNoticesRead: () => void;
+  inboxNotifications?: UserNotificationItem[];
+  unreadPushCount?: number;
 }
 
 export const TopHeader: React.FC<TopBarProps> = ({
@@ -220,9 +232,12 @@ export const TopHeader: React.FC<TopBarProps> = ({
   notices,
   readNoticeIds,
   onMarkNoticesRead,
+  inboxNotifications = [],
+  unreadPushCount = 0,
 }) => {
   const [notifOpen, setNotifOpen] = useState(false);
-  const unreadCount = notices.filter((n) => !readNoticeIds.includes(n.id)).length;
+  const unreadNoticesCount = notices.filter((n) => !readNoticeIds.includes(n.id)).length;
+  const unreadCount = unreadNoticesCount + unreadPushCount;
   const viewTitle = VIEW_TITLES[activeView];
 
   return (
@@ -316,43 +331,98 @@ export const TopHeader: React.FC<TopBarProps> = ({
           <div className="absolute right-0 top-12 w-80 sm:w-96 rounded-2xl bg-white dark:bg-[#0D1426] border border-slate-200 dark:border-slate-800 shadow-2xl p-4 space-y-3 z-50">
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                {bi(language, 'গুরুত্বপূর্ণ নোটিশ ও আপডেট', 'Notices & Updates')}
+                {bi(language, 'পুশ ইনবক্স ও নোটিশ', 'Push Inbox & Notices')}
               </h3>
-              <button
-                type="button"
-                onClick={() => setNotifOpen(false)}
-                className="p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            {notices.length === 0 ? (
-              <p className="text-xs text-slate-500 py-2">No notices available.</p>
-            ) : (
-              <div className="space-y-2.5 max-h-72 overflow-y-auto">
-                {notices.slice(0, 5).map((n) => (
-                  <div
-                    key={n.id}
-                    className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-1"
-                  >
-                    <p className="text-xs font-bold text-slate-900 dark:text-white">{n.title}</p>
-                    <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed">
-                      {n.body}
-                    </p>
-                    {n.officialLink && (
-                      <a
-                        href={n.officialLink}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-[11px] font-semibold text-cyan-600 dark:text-cyan-400 hover:underline pt-1"
-                      >
-                        <span>Open Link</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
-                    )}
-                  </div>
-                ))}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNotifOpen(false);
+                    onSelectView('notifications');
+                  }}
+                  className="text-[11px] font-semibold text-cyan-600 dark:text-cyan-400 hover:underline"
+                >
+                  {bi(language, 'সব দেখুন', 'Open Center')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setNotifOpen(false)}
+                  className="p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white"
+                >
+                  <X className="w-4 h-4" />
+                </button>
               </div>
+            </div>
+
+            {inboxNotifications.length > 0 && (
+              <div className="space-y-2 max-h-48 overflow-y-auto">
+                {inboxNotifications.slice(0, 4).map((item) => {
+                  const meta = getCategoryMeta(item.category);
+                  const CatIcon = meta.icon;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => {
+                        setNotifOpen(false);
+                        onSelectView((item.targetView as AppView) || 'notifications');
+                      }}
+                      className={`w-full text-left p-2.5 rounded-xl border transition-colors ${
+                        item.isRead
+                          ? 'bg-slate-50/60 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800'
+                          : 'bg-cyan-500/8 dark:bg-cyan-500/10 border-cyan-500/35'
+                      }`}
+                    >
+                      <div className="flex items-start gap-2">
+                        <div className={`w-6 h-6 rounded-lg flex items-center justify-center shrink-0 ${meta.iconBgClass}`}>
+                          <CatIcon className="w-3.5 h-3.5" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                            {item.title}
+                          </p>
+                          <p className="text-[11px] text-slate-600 dark:text-slate-300 line-clamp-2">
+                            {item.body}
+                          </p>
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {notices.length === 0 && inboxNotifications.length === 0 ? (
+              <p className="text-xs text-slate-500 py-2">
+                {bi(language, 'কোনো নোটিশ বা বার্তা নেই।', 'No notifications available.')}
+              </p>
+            ) : (
+              notices.length > 0 && (
+                <div className="space-y-2 max-h-44 overflow-y-auto border-t border-slate-200 dark:border-slate-800 pt-2">
+                  {notices.slice(0, 3).map((n) => (
+                    <div
+                      key={n.id}
+                      className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-1"
+                    >
+                      <p className="text-xs font-bold text-slate-900 dark:text-white">{n.title}</p>
+                      <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed line-clamp-2">
+                        {n.body}
+                      </p>
+                      {n.officialLink && (
+                        <a
+                          href={n.officialLink}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-[11px] font-semibold text-cyan-600 dark:text-cyan-400 hover:underline"
+                        >
+                          <span>Open Link</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )
             )}
           </div>
         )}

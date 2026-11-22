@@ -2,13 +2,16 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   Activity,
   Atom,
+  Ban,
   Bell,
+  BellRing,
   Bot,
   CheckCircle2,
   Eye,
   EyeOff,
   FileText,
   HelpCircle,
+  Layers,
   MessageSquare,
   Plus,
   Settings,
@@ -16,6 +19,7 @@ import {
   ShieldCheck,
   Sigma,
   Trash2,
+  Upload,
   Users,
 } from 'lucide-react';
 import { DEPARTMENTS } from '../data/curriculum';
@@ -34,6 +38,7 @@ import {
   PlatformNotice,
   SharedPdfNote,
 } from '../types/study';
+import { AdminNotificationManager } from './AdminNotificationManager';
 import { MathFormula } from './MathFormula';
 
 interface AdminDashboardViewProps {
@@ -49,6 +54,7 @@ interface AdminDashboardViewProps {
 
 type AdminTab =
   | 'overview'
+  | 'push-notifications'
   | 'physics'
   | 'mathematics'
   | 'ai-config'
@@ -76,7 +82,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
   // Usage Metrics & AI Config
   const [metrics, setMetrics] = useState<AdminUsageMetrics | null>(null);
   const [aiConfig, setAiConfig] = useState<AdminAiConfig>({
-    activeModel: 'gemini-3.1-flash-lite',
+    activeModel: 'gemini-4-hydrogen',
     thinkingLevel: 'LOW',
     conciseByDefault: false,
     maxHistoryTurns: 8,
@@ -103,13 +109,17 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
   const [nLink, setNLink] = useState('');
   const [nPinned, setNPinned] = useState(false);
 
-  // Shared PDF Note Form
+  // Shared PDF Book / Note Form
+  const [editingSharedNoteId, setEditingSharedNoteId] = useState<string | null>(null);
   const [snTitle, setSnTitle] = useState('');
   const [snDept, setSnDept] = useState('power');
   const [snSem, setSnSem] = useState(4);
   const [snCode, setSnCode] = useState('');
   const [snSummary, setSnSummary] = useState('');
   const [snPdfUrl, setSnPdfUrl] = useState('');
+  const [snFile, setSnFile] = useState<File | null>(null);
+  const [snUploading, setSnUploading] = useState(false);
+  const [snUploadPct, setSnUploadPct] = useState(0);
   const [snPermitted, setSnPermitted] = useState(true);
 
   // MCQ Form
@@ -254,27 +264,70 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
     }
   };
 
+  const resetSharedNoteForm = () => {
+    setEditingSharedNoteId(null);
+    setSnTitle('');
+    setSnCode('');
+    setSnSummary('');
+    setSnPdfUrl('');
+    setSnFile(null);
+    setSnUploadPct(0);
+    setSnPermitted(true);
+  };
+
   const handleAddSharedNote = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+    setSnUploading(true);
+    setSnUploadPct(0);
     try {
-      await apiClient.adminCreateSharedNote({
-        title: snTitle,
-        department: snDept,
-        semester: snSem,
-        subjectCode: snCode,
-        summary: snSummary,
-        pdfUrl: snPdfUrl,
-        downloadPermitted: snPermitted,
-      });
-      setSnTitle('');
-      setSnCode('');
-      setSnSummary('');
-      setSnPdfUrl('');
-      await onRefreshBootstrap();
-      notify('Shared PDF Note added!');
+      if (editingSharedNoteId) {
+        await apiClient.adminUpdateSharedNote(editingSharedNoteId, {
+          title: snTitle,
+          department: snDept,
+          semester: snSem,
+          subjectCode: snCode,
+          summary: snSummary,
+          pdfUrl: snPdfUrl || undefined,
+          downloadPermitted: snPermitted,
+        });
+        resetSharedNoteForm();
+        await onRefreshBootstrap();
+        notify('PDF Book / Note updated!');
+      } else if (snFile) {
+        await apiClient.adminUploadSharedNote(
+          snFile,
+          {
+            title: snTitle,
+            department: snDept,
+            semester: snSem,
+            subjectCode: snCode,
+            summary: snSummary,
+            downloadPermitted: snPermitted,
+          },
+          (pct) => setSnUploadPct(pct)
+        );
+        resetSharedNoteForm();
+        await onRefreshBootstrap();
+        notify('PDF Book uploaded and published!');
+      } else {
+        await apiClient.adminCreateSharedNote({
+          title: snTitle,
+          department: snDept,
+          semester: snSem,
+          subjectCode: snCode,
+          summary: snSummary,
+          pdfUrl: snPdfUrl,
+          downloadPermitted: snPermitted,
+        });
+        resetSharedNoteForm();
+        await onRefreshBootstrap();
+        notify('PDF Book / Note published!');
+      }
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed');
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to save PDF book');
+    } finally {
+      setSnUploading(false);
     }
   };
 
@@ -325,12 +378,13 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
 
   const tabs: { id: AdminTab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
     { id: 'overview', label: 'Overview & Usage', icon: Activity },
+    { id: 'push-notifications', label: 'Push Notifications', icon: BellRing },
     { id: 'physics', label: 'Physics Formulas', icon: Atom },
     { id: 'mathematics', label: 'Math Formulas', icon: Sigma },
     { id: 'ai-config', label: 'AI API Config', icon: Bot },
     { id: 'users', label: 'Users & Roles', icon: Users },
     { id: 'notices', label: 'Notices', icon: Bell },
-    { id: 'notes', label: 'Shared Notes', icon: FileText },
+    { id: 'notes', label: 'PDF Books & Notes', icon: FileText },
     { id: 'mcqs', label: 'MCQs', icon: HelpCircle },
     { id: 'community', label: 'Moderation', icon: MessageSquare },
     { id: 'config', label: 'App & APK', icon: Settings },
@@ -454,6 +508,47 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
               <p className="text-lg font-bold text-slate-900 dark:text-white mt-0.5 tabular-nums">
                 {metrics?.serverUptimeSeconds ?? 0}s
               </p>
+            </div>
+          </div>
+
+          {/* Departments & Semesters Matrix */}
+          <div className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <Layers className="w-4 h-4 text-cyan-500" />
+              <span>Departments & Semesters Management Overview ({DEPARTMENTS.length} Technologies · 8 Semesters)</span>
+            </h2>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
+                  <tr>
+                    <th className="py-2 pr-3">Code</th>
+                    <th className="py-2 pr-3">Department</th>
+                    <th className="py-2 pr-3 text-right">Registered Users</th>
+                    <th className="py-2 pr-3 text-right">PDF Books</th>
+                    <th className="py-2 text-right">Admin MCQs</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
+                  {DEPARTMENTS.map((dept) => {
+                    const userCount = users.filter((u) => u.department === dept.id).length;
+                    const bookCount = sharedNotes.filter((sn) => sn.department === dept.id).length;
+                    const mcqCount = mcqs.filter((m) => m.department === dept.id).length;
+                    return (
+                      <tr key={dept.id}>
+                        <td className="py-2 pr-3 font-mono font-bold text-cyan-600 dark:text-cyan-400">
+                          {dept.shortName}
+                        </td>
+                        <td className="py-2 pr-3 text-slate-800 dark:text-slate-200">
+                          {language === 'en' ? dept.nameEn : dept.nameBn}
+                        </td>
+                        <td className="py-2 pr-3 text-right tabular-nums">{userCount}</td>
+                        <td className="py-2 pr-3 text-right tabular-nums">{bookCount}</td>
+                        <td className="py-2 text-right tabular-nums">{mcqCount}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
@@ -645,8 +740,8 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
               }
               className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs"
             >
+              <option value="gemini-4-hydrogen">gemini-4-hydrogen (Recommended Fast Reasoning)</option>
               <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Ultra-Fast Low Latency)</option>
-              <option value="gemini-4-hydrogen">gemini-4-hydrogen (Balanced Reasoning)</option>
             </select>
           </div>
 
@@ -800,19 +895,22 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
         </div>
       )}
 
-      {/* SHARED NOTES */}
+      {/* PDF BOOKS & SHARED NOTES */}
       {tab === 'notes' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <form
             onSubmit={handleAddSharedNote}
             className="lg:col-span-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-3"
           >
-            <h2 className="text-sm font-bold text-slate-900 dark:text-white">Add Shared PDF Note</h2>
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <Upload className="w-4 h-4 text-cyan-500" />
+              <span>{editingSharedNoteId ? 'Edit PDF Book / Note' : 'Upload or Add PDF Book'}</span>
+            </h2>
             <input
               required
               value={snTitle}
               onChange={(e) => setSnTitle(e.target.value)}
-              placeholder="Note Title"
+              placeholder="Book / Note Title"
               className="w-full min-h-[40px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs"
             />
             <div className="grid grid-cols-2 gap-2">
@@ -821,6 +919,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                 onChange={(e) => setSnDept(e.target.value)}
                 className="min-h-[40px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs"
               >
+                <option value="common">All / Common</option>
                 {DEPARTMENTS.map((d) => (
                   <option key={d.id} value={d.id}>
                     {d.shortName}
@@ -842,63 +941,137 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
             <input
               value={snCode}
               onChange={(e) => setSnCode(e.target.value)}
-              placeholder="Subject Code (optional)"
+              placeholder="Subject Code (optional, e.g. 67141)"
               className="w-full min-h-[40px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs font-mono"
             />
             <textarea
               rows={2}
               value={snSummary}
               onChange={(e) => setSnSummary(e.target.value)}
-              placeholder="Summary"
+              placeholder="Book summary or syllabus notes"
               className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs"
             />
+            {!editingSharedNoteId && (
+              <div className="space-y-1">
+                <label className="block text-[11px] font-medium text-slate-500">
+                  Upload PDF File directly (Max 50 MB)
+                </label>
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  disabled={snUploading}
+                  onChange={(e) => {
+                    const picked = e.target.files?.[0] ?? null;
+                    setSnFile(picked);
+                    if (picked && !snTitle.trim()) {
+                      setSnTitle(picked.name.replace(/\.pdf$/i, ''));
+                    }
+                  }}
+                  className="w-full text-[11px] text-slate-500 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:bg-cyan-500/15 file:text-cyan-700 dark:file:text-cyan-300 file:font-semibold"
+                />
+              </div>
+            )}
             <input
-              type="url"
+              type="text"
               value={snPdfUrl}
+              disabled={Boolean(snFile)}
               onChange={(e) => setSnPdfUrl(e.target.value)}
-              placeholder="Permitted PDF URL"
-              className="w-full min-h-[40px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs"
+              placeholder={snFile ? 'Using uploaded PDF file' : 'Or external PDF URL (optional)'}
+              className="w-full min-h-[40px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs disabled:opacity-50"
             />
+            {snUploading && snUploadPct > 0 && (
+              <div className="h-1.5 w-full rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                <div className="h-full bg-cyan-500" style={{ width: `${snUploadPct}%` }} />
+              </div>
+            )}
             <label className="flex items-center gap-2 text-xs">
               <input
                 type="checkbox"
                 checked={snPermitted}
                 onChange={(e) => setSnPermitted(e.target.checked)}
               />
-              Allow Download
+              Allow Student Download
             </label>
-            <button
-              type="submit"
-              className="w-full min-h-[42px] rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold"
-            >
-              Publish Shared Note
-            </button>
-          </form>
-
-          <div className="lg:col-span-7 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
-            <h2 className="text-sm font-bold text-slate-900 dark:text-white">
-              Shared Notes ({sharedNotes.length})
-            </h2>
-            {sharedNotes.map((sn) => (
-              <div
-                key={sn.id}
-                className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2"
+            <div className="flex gap-2">
+              <button
+                type="submit"
+                disabled={snUploading}
+                className="flex-1 min-h-[42px] rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-bold"
               >
-                <div>
-                  <p className="text-xs font-bold text-slate-900 dark:text-white">{sn.title}</p>
-                  <p className="text-[11px] text-slate-500">
-                    {sn.department} · Sem {sn.semester} · {sn.subjectCode}
-                  </p>
-                </div>
+                {snUploading
+                  ? 'Saving PDF...'
+                  : editingSharedNoteId
+                    ? 'Update Book'
+                    : 'Publish PDF Book'}
+              </button>
+              {editingSharedNoteId && (
                 <button
                   type="button"
-                  onClick={() => void apiClient.adminDeleteSharedNote(sn.id).then(onRefreshBootstrap)}
-                  className="p-2 text-red-500 hover:bg-red-500/10 rounded-lg"
+                  onClick={resetSharedNoteForm}
+                  className="px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs"
                 >
-                  <Trash2 className="w-4 h-4" />
+                  Cancel
                 </button>
-              </div>
-            ))}
+              )}
+            </div>
+          </form>
+
+          <div className="lg:col-span-7 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-3 max-h-[680px] overflow-y-auto">
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+              Department PDF Books & Notes ({sharedNotes.length})
+            </h2>
+            {sharedNotes.length === 0 ? (
+              <p className="text-xs text-slate-500">No curated PDF books added yet.</p>
+            ) : (
+              sharedNotes.map((sn) => (
+                <div
+                  key={sn.id}
+                  className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2"
+                >
+                  <div className="min-w-0">
+                    <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                      {sn.title}
+                    </p>
+                    <p className="text-[11px] text-slate-500 truncate">
+                      {sn.department} · Sem {sn.semester}
+                      {sn.subjectCode ? ` · #${sn.subjectCode}` : ''}
+                      {sn.fileSizeBytes ? ` · ${(sn.fileSizeBytes / (1024 * 1024)).toFixed(2)} MB` : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingSharedNoteId(sn.id);
+                        setSnTitle(sn.title);
+                        setSnDept(sn.department);
+                        setSnSem(sn.semester);
+                        setSnCode(sn.subjectCode);
+                        setSnSummary(sn.summary);
+                        setSnPdfUrl(sn.pdfUrl);
+                        setSnFile(null);
+                        setSnPermitted(sn.downloadPermitted);
+                      }}
+                      className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void apiClient
+                          .adminDeleteSharedNote(sn.id)
+                          .then(onRefreshBootstrap)
+                          .then(() => notify('PDF Book deleted.'))
+                      }
+                      className="p-2 text-red-500 hover:bg-red-500/10 rounded-lg"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </div>
       )}
@@ -1159,29 +1332,66 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
               className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3"
             >
               <div>
-                <p className="text-xs font-bold text-slate-900 dark:text-white">
-                  {u.fullName} ({u.role})
+                <p className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <span>
+                    {u.fullName} ({u.role})
+                  </span>
+                  {u.isDisabled && (
+                    <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-red-500/15 text-red-600 dark:text-red-400">
+                      Disabled
+                    </span>
+                  )}
                 </p>
                 <p className="text-[11px] text-slate-500">
                   {u.email} · {u.department} · Sem {u.semester}
                 </p>
               </div>
               {u.id !== currentUser.id && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    void apiClient
-                      .adminSetUserRole(u.id, u.role === 'admin' ? 'student' : 'admin')
-                      .then(loadAdminLists)
-                  }
-                  className="min-h-[34px] px-3 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold"
-                >
-                  {u.role === 'admin' ? 'Demote to Student' : 'Promote to Admin'}
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void apiClient
+                        .adminSetUserRole(u.id, u.role === 'admin' ? 'student' : 'admin')
+                        .then(loadAdminLists)
+                    }
+                    className="min-h-[34px] px-3 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+                  >
+                    {u.role === 'admin' ? 'Demote to Student' : 'Promote to Admin'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void apiClient
+                        .adminSetUserStatus(u.id, !u.isDisabled)
+                        .then(loadAdminLists)
+                        .then(() =>
+                          notify(u.isDisabled ? 'User account enabled.' : 'User account disabled.')
+                        )
+                    }
+                    className={`min-h-[34px] inline-flex items-center gap-1 px-3 py-1 rounded-lg border text-xs font-semibold ${
+                      u.isDisabled
+                        ? 'border-emerald-500/40 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10'
+                        : 'border-red-500/40 text-red-600 dark:text-red-400 hover:bg-red-500/10'
+                    }`}
+                  >
+                    <Ban className="w-3.5 h-3.5" />
+                    <span>{u.isDisabled ? 'Enable' : 'Disable'}</span>
+                  </button>
+                </div>
               )}
             </div>
           ))}
         </div>
+      )}
+      {/* PUSH NOTIFICATIONS MANAGEMENT */}
+      {tab === 'push-notifications' && (
+        <AdminNotificationManager
+          language={language}
+          users={users}
+          onNotify={notify}
+          onError={(msg) => setErrorMsg(msg)}
+        />
       )}
     </div>
   );

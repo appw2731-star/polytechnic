@@ -1,0 +1,274 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny all unspecified paths by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Global Hardened Primitives
+    // -----------------------------------------------------------------------
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'webrokib@gmail.com'
+      );
+    }
+
+    function isValidDepartment(dept) {
+      return dept is string && dept.size() >= 2 && dept.size() <= 40 && dept.matches('^[a-z0-9_\\-]+$');
+    }
+
+    function isValidSemester(sem) {
+      return sem is int && sem >= 1 && sem <= 8;
+    }
+
+    // -----------------------------------------------------------------------
+    // Entity Validation Blueprints (Synchronized with firebase-blueprint.json)
+    // -----------------------------------------------------------------------
+    function isValidUserProfile(data, pathUserId) {
+      return data.keys().hasAll([
+        'uid', 'fullName', 'email', 'department', 'semester', 'role', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid', 'fullName', 'email', 'department', 'semester',
+        'collegeName', 'rollNumber', 'bio', 'role', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.uid) &&
+      data.uid == pathUserId &&
+      data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 100 &&
+      data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+      isValidDepartment(data.department) &&
+      isValidSemester(data.semester) &&
+      (!('collegeName' in data) || (data.collegeName is string && data.collegeName.size() <= 160)) &&
+      (!('rollNumber' in data) || (data.rollNumber is string && data.rollNumber.size() <= 40)) &&
+      (!('bio' in data) || (data.bio is string && data.bio.size() <= 400)) &&
+      (data.role == 'student' || data.role == 'admin') &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidPersonalStudyNote(data, pathUserId, noteId) {
+      return data.keys().hasAll([
+        'id', 'userId', 'title', 'content', 'department', 'semester', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'userId', 'title', 'content', 'subjectName', 'department', 'semester', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == noteId &&
+      isValidId(data.userId) &&
+      data.userId == pathUserId &&
+      data.title is string && data.title.size() >= 2 && data.title.size() <= 160 &&
+      data.content is string && data.content.size() >= 1 && data.content.size() <= 12000 &&
+      (!('subjectName' in data) || (data.subjectName is string && data.subjectName.size() <= 120)) &&
+      isValidDepartment(data.department) &&
+      isValidSemester(data.semester) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidPersonalPdfMetadata(data, pathUserId, pdfId) {
+      return data.keys().hasAll([
+        'id', 'userId', 'customName', 'fileName', 'department', 'semester', 'fileSizeBytes', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'userId', 'customName', 'fileName', 'department', 'semester', 'subjectCode', 'fileSizeBytes', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == pdfId &&
+      isValidId(data.userId) &&
+      data.userId == pathUserId &&
+      data.customName is string && data.customName.size() >= 1 && data.customName.size() <= 180 &&
+      data.fileName is string && data.fileName.size() >= 1 && data.fileName.size() <= 200 &&
+      isValidDepartment(data.department) &&
+      isValidSemester(data.semester) &&
+      (!('subjectCode' in data) || (data.subjectCode is string && data.subjectCode.size() <= 40)) &&
+      data.fileSizeBytes is int && data.fileSizeBytes >= 0 && data.fileSizeBytes <= 52428800 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidAdminMarker(data, pathUserId) {
+      return data.keys().hasAll(['uid', 'email', 'grantedAt']) &&
+      data.keys().hasOnly(['uid', 'email', 'grantedAt']) &&
+      isValidId(data.uid) &&
+      data.uid == pathUserId &&
+      data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+      data.grantedAt is timestamp;
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /admins/{userId}
+    // -----------------------------------------------------------------------
+    match /admins/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isAdmin() &&
+        isValidId(userId) &&
+        isValidAdminMarker(incoming(), userId) &&
+        incoming().grantedAt == request.time;
+      allow update: if isAdmin() &&
+        isValidId(userId) &&
+        isValidAdminMarker(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['email', 'grantedAt']) &&
+        incoming().grantedAt == request.time;
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /users/{userId} (PII Isolated)
+    // -----------------------------------------------------------------------
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+
+      allow create: if isVerifiedUser() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (isOwner(userId) && incoming().role == 'student') ||
+          isAdmin()
+        );
+
+      allow update: if isVerifiedUser() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            isOwner(userId) &&
+            incoming().role == existing().role &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'department', 'semester', 'collegeName', 'rollNumber', 'bio', 'updatedAt'
+            ])
+          ) ||
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'department', 'semester', 'collegeName', 'rollNumber', 'bio', 'role', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+
+      // ---------------------------------------------------------------------
+      // Subcollection: /users/{userId}/studyNotes/{noteId}
+      // ---------------------------------------------------------------------
+      match /studyNotes/{noteId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(noteId) && (isOwner(userId) || isAdmin());
+        allow list: if isSignedIn() && isOwner(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(noteId) &&
+          isValidPersonalStudyNote(incoming(), userId, noteId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isOwner(userId) &&
+          exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(noteId) &&
+          isValidPersonalStudyNote(incoming(), userId, noteId) &&
+          incoming().id == existing().id &&
+          incoming().userId == existing().userId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'title', 'content', 'subjectName', 'department', 'semester', 'updatedAt'
+              ])
+            ) ||
+            (
+              isAdmin() &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'title', 'content', 'subjectName', 'department', 'semester', 'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if isVerifiedUser() && isValidId(userId) && isValidId(noteId) && (isOwner(userId) || isAdmin());
+      }
+
+      // ---------------------------------------------------------------------
+      // Subcollection: /users/{userId}/pdfCatalog/{pdfId}
+      // ---------------------------------------------------------------------
+      match /pdfCatalog/{pdfId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(pdfId) && (isOwner(userId) || isAdmin());
+        allow list: if isSignedIn() && isOwner(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(pdfId) &&
+          isValidPersonalPdfMetadata(incoming(), userId, pdfId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isOwner(userId) &&
+          exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(pdfId) &&
+          isValidPersonalPdfMetadata(incoming(), userId, pdfId) &&
+          incoming().id == existing().id &&
+          incoming().userId == existing().userId &&
+          incoming().fileName == existing().fileName &&
+          incoming().fileSizeBytes == existing().fileSizeBytes &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'customName', 'department', 'semester', 'subjectCode', 'updatedAt'
+              ])
+            ) ||
+            (
+              isAdmin() &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'customName', 'department', 'semester', 'subjectCode', 'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if isVerifiedUser() && isValidId(userId) && isValidId(pdfId) && (isOwner(userId) || isAdmin());
+      }
+    }
+  }
+}

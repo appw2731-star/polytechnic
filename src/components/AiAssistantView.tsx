@@ -6,6 +6,7 @@ import {
   Calculator,
   Check,
   Compass,
+  Copy,
   History,
   MessageSquarePlus,
   MessageSquareText,
@@ -124,6 +125,7 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
   const [isStreaming, setIsStreaming] = useState(false);
   const [waitingFirstToken, setWaitingFirstToken] = useState(false);
   const [savedMsgId, setSavedMsgId] = useState<string | null>(null);
+  const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
   const [lastPromptInfo, setLastPromptInfo] = useState<{
     text: string;
     mode: AiAssistantMode;
@@ -306,6 +308,16 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
     onSaveAsNote(cleanTitle, msg.text);
     setSavedMsgId(msg.id);
     window.setTimeout(() => setSavedMsgId(null), 2500);
+  };
+
+  const handleCopyReply = async (msg: AiChatMessage) => {
+    try {
+      await navigator.clipboard.writeText(msg.text);
+      setCopiedMsgId(msg.id);
+      window.setTimeout(() => setCopiedMsgId(null), 2000);
+    } catch {
+      // ignore clipboard errors on restricted origins
+    }
   };
 
   const activeModeConfig = MODE_OPTIONS.find((m) => m.id === mode) ?? MODE_OPTIONS[0];
@@ -551,17 +563,38 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
                     <div className="space-y-3">
                       <FormattedAiText text={msg.text} />
                       {(!isStreaming || !isLast) && (
-                        <div className="pt-2 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-                          {isLast && lastPromptInfo && (
+                        <div className="pt-2 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5">
+                            {isLast && lastPromptInfo && (
+                              <button
+                                type="button"
+                                onClick={() => void sendPrompt(lastPromptInfo.text, lastPromptInfo.mode, true)}
+                                className="min-h-[32px] inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium text-slate-500 hover:text-cyan-500"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5" />
+                                <span>{bi(language, 'আবার উত্তর দিন', 'Regenerate')}</span>
+                              </button>
+                            )}
                             <button
                               type="button"
-                              onClick={() => void sendPrompt(lastPromptInfo.text, lastPromptInfo.mode, true)}
+                              onClick={() => void handleCopyReply(msg)}
                               className="min-h-[32px] inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium text-slate-500 hover:text-cyan-500"
                             >
-                              <RotateCcw className="w-3.5 h-3.5" />
-                              <span>{bi(language, 'আবার উত্তর দিন', 'Regenerate')}</span>
+                              {copiedMsgId === msg.id ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-500" />
+                                  <span className="text-emerald-600 dark:text-emerald-400">
+                                    {bi(language, 'কপি হয়েছে', 'Copied')}
+                                  </span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" />
+                                  <span>{bi(language, 'কপি করুন', 'Copy Answer')}</span>
+                                </>
+                              )}
                             </button>
-                          )}
+                          </div>
                           <button
                             type="button"
                             onClick={() => handleSaveReplyToNotes(msg)}

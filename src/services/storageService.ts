@@ -53,6 +53,7 @@ export function createInitialState(): StudyMateState {
       theme: 'dark',
       language: 'bn',
       showEnglishTerms: true,
+      weeklyStudyGoalHours: 14,
     },
     timeSettings: createDefaultTimeSettings(),
     timerHistory: [],
@@ -186,6 +187,11 @@ export const storageService = {
           ...fallback.settings,
           ...(parsed.settings ?? {}),
           language: parsed.settings?.language === 'en' ? 'en' : 'bn',
+          weeklyStudyGoalHours:
+            typeof parsed.settings?.weeklyStudyGoalHours === 'number' &&
+            Number.isFinite(parsed.settings.weeklyStudyGoalHours)
+              ? Math.min(100, Math.max(1, Math.round(parsed.settings.weeklyStudyGoalHours)))
+              : 14,
         },
         timeSettings: {
           ...defaultTime,

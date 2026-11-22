@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bell, RefreshCw, X } from 'lucide-react';
+import { RefreshCw, X } from 'lucide-react';
 import { BASE_MATHEMATICS_FORMULAS, BASE_PHYSICS_FORMULAS } from './data/formulas';
 import { AdminDashboardView } from './components/AdminDashboardView';
 import { AiAssistantView } from './components/AiAssistantView';
@@ -10,6 +10,7 @@ import { FormulaHubView } from './components/FormulaHubView';
 import { InstallAppView } from './components/InstallAppView';
 import { DesktopSidebar, MobileBottomNav, TopHeader } from './components/NavigationChrome';
 import { NotesView } from './components/NotesView';
+import { NotificationCenterView } from './components/NotificationCenterView';
 import { PdfLibraryView } from './components/PdfLibraryView';
 import { SplashScreen } from './components/PolytechnicHubLogo';
 import { PowerToolsView } from './components/PowerToolsView';
@@ -20,17 +21,28 @@ import { RoutineView } from './components/RoutineView';
 import { SettingsView } from './components/SettingsView';
 import { StudyTimeView } from './components/StudyTimeView';
 import { SubjectsView } from './components/SubjectsView';
+import { getCategoryMeta } from './data/notificationCategories';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { usePWAInstall } from './hooks/usePWAInstall';
 import { bi } from './i18n/translations';
 import {
-  isSupabaseMissingRelationError,
-  mapSupabaseProfileToAuthUser,
-  supabase,
-} from './lib/supabaseClient';
+  consumeGoogleRedirectResult,
+  formatFirebaseAuthError,
+  signOutFirebase,
+  subscribeFirebaseAuth,
+} from './lib/firebaseAuth';
+import { supabase } from './lib/supabaseClient';
 import { aiService } from './services/aiService';
 import { apiClient, BootstrapResponse, getStoredToken, setStoredToken } from './services/apiClient';
+import {
+  deleteStudyNoteFromFirestore,
+  subscribeUserStudyNotes,
+  syncStudyNoteToFirestore,
+  syncUserProfileToFirestore,
+} from './services/firestoreService';
+import { playNotificationSound } from './services/notificationSound';
 import { offlineDb } from './services/offlineDb';
+import { pushNotificationService } from './services/pushNotificationService';
 import { createNewAiSession, storageService } from './services/storageService';
 import {
   AiChatMessage,
@@ -40,7 +52,10 @@ import {
   AuthUser,
   CompletedTimerSession,
   DepartmentId,
+  DeviceTokenRecord,
   FormulaItem,
+  NotificationPreferences,
+  PushCategory,
   QuizAttempt,
   SemesterNumber,
   StudyMateState,
@@ -48,9 +63,100 @@ import {
   StudyTask,
   Subject,
   TimeSettings,
+  UserNotificationItem,
   UserSettings,
 } from './types/study';
 import { getDhakaClockSnapshot } from './utils/formatBn';
+
+const VALID_APP_VIEWS = new Set<AppView>([
+  'dashboard',
+  'notifications',
+  'pdf-library',
+  'formulas',
+  'result',
+  'ai',
+  'tools',
+  'profile',
+  'subjects',
+  'routine',
+  'timer',
+  'quiz',
+  'notes',
+  'community',
+  'progress',
+  'install',
+  'settings',
+  'admin',
+]);
+
+const LOCAL_SOUND_PREF_KEY = 'polytechnic_hub_sound_prefs_v1';
+
+function loadLocalSoundPref(): {
+  soundEnabled?: boolean;
+  soundStyle?: NotificationPreferences['soundStyle'];
+} {
+  try {
+    const raw = window.localStorage.getItem(LOCAL_SOUND_PREF_KEY);
+    return raw ? (JSON.parse(raw) as { soundEnabled?: boolean; soundStyle?: NotificationPreferences['soundStyle'] }) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLocalSoundPref(prefs: Partial<NotificationPreferences>): void {
+  try {
+    const cur = loadLocalSoundPref();
+    window.localStorage.setItem(
+      LOCAL_SOUND_PREF_KEY,
+      JSON.stringify({
+        soundEnabled: prefs.soundEnabled ?? cur.soundEnabled ?? true,
+        soundStyle: prefs.soundStyle ?? cur.soundStyle ?? 'chime',
+      })
+    );
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function makeDefaultNotificationPrefs(userId = ''): NotificationPreferences {
+  const now = new Date().toISOString();
+  const saved = typeof window !== 'undefined' ? loadLocalSoundPref() : {};
+  return {
+    userId,
+    pushEnabled: true,
+    soundEnabled: saved.soundEnabled ?? true,
+    soundStyle: saved.soundStyle ?? 'chime',
+    respectDnd: true,
+    allowAppUpdate: true,
+    allowImportant: true,
+    allowEducation: true,
+    allowEmergency: true,
+    allowGeneral: true,
+    updatedAt: now,
+  };
+}
+
+function isCategoryAllowedByPrefs(
+  category: PushCategory,
+  prefs: NotificationPreferences
+): boolean {
+  if (!prefs.pushEnabled) {
+    return category === 'EMERGENCY';
+  }
+  switch (category) {
+    case 'APP_UPDATE':
+      return prefs.allowAppUpdate;
+    case 'IMPORTANT':
+      return prefs.allowImportant;
+    case 'EDUCATION':
+      return prefs.allowEducation;
+    case 'EMERGENCY':
+      return prefs.allowEmergency;
+    case 'GENERAL':
+    default:
+      return prefs.allowGeneral;
+  }
+}
 
 const DEFAULT_APP_CONFIG: AppReleaseConfig = {
   appVersion: '2.0.0',
@@ -69,8 +175,16 @@ export default function App() {
   const [showSplash, setShowSplash] = useState<boolean>(true);
   const [isPasswordRecovery, setIsPasswordRecovery] = useState(false);
 
-  const [inAppToast, setInAppToast] = useState<{ title: string; body: string } | null>(null);
+  const [inAppToast, setInAppToast] = useState<{
+    title: string;
+    body: string;
+    category?: PushCategory;
+    targetView?: AppView;
+    imageUrl?: string;
+    notificationId?: string;
+  } | null>(null);
   const firedRemindersRef = useRef<Set<string>>(new Set());
+  const pendingDeepLinkNotificationIdRef = useRef<string | null>(null);
 
   const isOnline = useOnlineStatus();
   const { canPrompt, isInstalled, isIos, promptInstall } = usePWAInstall();
@@ -78,6 +192,16 @@ export default function App() {
   const [swUpdateHandler, setSwUpdateHandler] = useState<(() => void) | null>(null);
 
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [inboxNotifications, setInboxNotifications] = useState<UserNotificationItem[]>([]);
+  const [unreadPushCount, setUnreadPushCount] = useState<number>(0);
+  const [pushPreferences, setPushPreferences] = useState<NotificationPreferences>(() =>
+    makeDefaultNotificationPrefs()
+  );
+  const [registeredDevices, setRegisteredDevices] = useState<DeviceTokenRecord[]>([]);
+  const [fcmServerConfigured, setFcmServerConfigured] = useState<boolean>(false);
+  const [inboxLoading, setInboxLoading] = useState<boolean>(false);
+  const pushPreferencesRef = useRef<NotificationPreferences>(pushPreferences);
+
   const [bootstrap, setBootstrap] = useState<BootstrapResponse>({
     notices: [],
     sharedNotes: [],
@@ -87,6 +211,10 @@ export default function App() {
     appConfig: DEFAULT_APP_CONFIG,
     hasAdmin: false,
   });
+
+  useEffect(() => {
+    pushPreferencesRef.current = pushPreferences;
+  }, [pushPreferences]);
 
   useEffect(() => {
     const t = window.setTimeout(() => setShowSplash(false), 550);
@@ -104,6 +232,164 @@ export default function App() {
     return () => window.removeEventListener('polytechnic-sw-update', onSwUpdate);
   }, []);
 
+  const refreshNotificationInbox = useCallback(async () => {
+    if (!currentUser || !isOnline) return;
+    setInboxLoading(true);
+    try {
+      const data = await apiClient.getNotificationInbox();
+      setInboxNotifications(data.notifications);
+      setUnreadPushCount(data.unreadCount);
+      setPushPreferences(data.preferences);
+      setRegisteredDevices(data.devices);
+      setFcmServerConfigured(data.fcmConfigured);
+    } catch {
+      // keep current state on transient errors
+    } finally {
+      setInboxLoading(false);
+    }
+  }, [currentUser, isOnline]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const viewParam = params.get('view') as AppView | null;
+    const nidParam = params.get('nid');
+    if (viewParam && VALID_APP_VIEWS.has(viewParam)) {
+      setActiveView(viewParam);
+    }
+    if (nidParam) {
+      pendingDeepLinkNotificationIdRef.current = nidParam;
+    }
+    if (viewParam || nidParam) {
+      const cleanUrl = `${window.location.pathname}${window.location.hash}`;
+      window.history.replaceState({}, '', cleanUrl);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) {
+      setInboxNotifications([]);
+      setUnreadPushCount(0);
+      setRegisteredDevices([]);
+      setPushPreferences(makeDefaultNotificationPrefs());
+      return;
+    }
+    void refreshNotificationInbox();
+    if (pendingDeepLinkNotificationIdRef.current) {
+      const nid = pendingDeepLinkNotificationIdRef.current;
+      pendingDeepLinkNotificationIdRef.current = null;
+      void apiClient
+        .markNotificationRead(nid)
+        .then(() => refreshNotificationInbox())
+        .catch(() => {});
+    }
+  }, [currentUser, refreshNotificationInbox]);
+
+  useEffect(() => {
+    if (!currentUser || !isOnline) return;
+    const poll = window.setInterval(() => {
+      void refreshNotificationInbox();
+    }, 30000);
+    return () => window.clearInterval(poll);
+  }, [currentUser, isOnline, refreshNotificationInbox]);
+
+  useEffect(() => {
+    const unsubscribe = pushNotificationService.subscribeForegroundHandlers({
+      onForegroundMessage: (evt) => {
+        const prefs = pushPreferencesRef.current;
+        if (!isCategoryAllowedByPrefs(evt.category, prefs)) return;
+
+        const shouldPlayCustom =
+          prefs.soundEnabled && evt.soundMode !== 'silent' && evt.soundMode !== 'default';
+        if (shouldPlayCustom) {
+          void playNotificationSound(prefs.soundStyle, true);
+        } else if (prefs.soundEnabled && evt.soundMode === 'default') {
+          void playNotificationSound('system', true);
+        }
+
+        const safeTarget: AppView = VALID_APP_VIEWS.has(evt.targetView as AppView)
+          ? (evt.targetView as AppView)
+          : 'notifications';
+        setInAppToast({
+          title: evt.title,
+          body: evt.body,
+          category: evt.category,
+          targetView: safeTarget,
+          imageUrl: evt.imageUrl || undefined,
+          notificationId: evt.notificationId || undefined,
+        });
+        void refreshNotificationInbox();
+      },
+      onNotificationClick: ({ targetView, notificationId, actionUrl }) => {
+        if (notificationId && currentUser) {
+          void apiClient
+            .markNotificationRead(notificationId)
+            .then(() => refreshNotificationInbox())
+            .catch(() => {});
+        }
+        if (targetView && VALID_APP_VIEWS.has(targetView as AppView)) {
+          setActiveView(targetView as AppView);
+        } else {
+          setActiveView('notifications');
+        }
+        if (actionUrl && actionUrl.startsWith('https://')) {
+          window.location.assign(actionUrl);
+        }
+      },
+    });
+    return unsubscribe;
+  }, [currentUser, refreshNotificationInbox]);
+
+  useEffect(() => {
+    if (!supabase || !currentUser || currentUser.id.startsWith('usr-')) return;
+    const sb = supabase;
+    const channel = sb
+      .channel(`user-notifications-${currentUser.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'user_notifications',
+          filter: `user_id=eq.${currentUser.id}`,
+        },
+        (payload) => {
+          const row = payload.new as {
+            id?: string;
+            title?: string;
+            body?: string;
+            category?: PushCategory;
+            target_view?: string;
+            image_url?: string | null;
+          };
+          const prefs = pushPreferencesRef.current;
+          const cat: PushCategory = row.category || 'GENERAL';
+          if (isCategoryAllowedByPrefs(cat, prefs)) {
+            if (prefs.soundEnabled) {
+              void playNotificationSound(prefs.soundStyle, true);
+            }
+            const safeView: AppView = VALID_APP_VIEWS.has(row.target_view as AppView)
+              ? (row.target_view as AppView)
+              : 'notifications';
+            setInAppToast({
+              title: row.title || 'Polytechnic Hub',
+              body: row.body || '',
+              category: cat,
+              targetView: safeView,
+              imageUrl: row.image_url || undefined,
+              notificationId: row.id,
+            });
+          }
+          void refreshNotificationInbox();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      void sb.removeChannel(channel);
+    };
+  }, [currentUser, refreshNotificationInbox]);
+
   const refreshBootstrap = useCallback(async () => {
     try {
       const data = await apiClient.getBootstrap();
@@ -118,6 +404,9 @@ export default function App() {
   }, []);
 
   const syncSupabaseUserContext = useCallback(async (user: AuthUser) => {
+    void syncUserProfileToFirestore(user).catch((err) => {
+      console.warn('Firestore profile sync notice:', err instanceof Error ? err.message : err);
+    });
     if (!supabase || user.id.startsWith('usr-')) return;
     try {
       const { data: favRows, error: favErr } = await supabase
@@ -133,130 +422,134 @@ export default function App() {
         }));
       }
     } catch {
-      // ignore if migration not yet applied
+      // ignore if migration not yet applied or RLS blocks anon access
     }
 
-    const cloudSessions = await aiService.loadCloudChatSessions(user.id);
-    if (cloudSessions.length > 0) {
-      setState((prev) => {
-        const mergedMap = new Map<string, AiChatSession>();
-        for (const s of cloudSessions) mergedMap.set(s.id, s);
-        for (const s of Array.isArray(prev.aiSessions) ? prev.aiSessions : []) {
-          const safeMsgs = Array.isArray(s?.messages) ? s.messages : [];
-          if (safeMsgs.length > 0 && !mergedMap.has(s.id)) {
-            mergedMap.set(s.id, { ...s, messages: safeMsgs });
+    try {
+      const cloudSessions = await aiService.loadCloudChatSessions(user.id);
+      if (cloudSessions.length > 0) {
+        setState((prev) => {
+          const mergedMap = new Map<string, AiChatSession>();
+          for (const s of cloudSessions) mergedMap.set(s.id, s);
+          for (const s of Array.isArray(prev.aiSessions) ? prev.aiSessions : []) {
+            const safeMsgs = Array.isArray(s?.messages) ? s.messages : [];
+            if (safeMsgs.length > 0 && !mergedMap.has(s.id)) {
+              mergedMap.set(s.id, { ...s, messages: safeMsgs });
+            }
           }
-        }
-        const merged = Array.from(mergedMap.values()).sort((a, b) =>
-          (b.updatedAt || '').localeCompare(a.updatedAt || '')
-        );
-        return {
-          ...prev,
-          aiSessions: merged.length > 0 ? merged : prev.aiSessions,
-          activeAiSessionId: merged[0]?.id ?? prev.activeAiSessionId,
-        };
-      });
+          const merged = Array.from(mergedMap.values()).sort((a, b) =>
+            (b.updatedAt || '').localeCompare(a.updatedAt || '')
+          );
+          return {
+            ...prev,
+            aiSessions: merged.length > 0 ? merged : prev.aiSessions,
+            activeAiSessionId: merged[0]?.id ?? prev.activeAiSessionId,
+          };
+        });
+      }
+    } catch {
+      // keep local chat history intact
     }
   }, []);
 
   useEffect(() => {
     void refreshBootstrap();
 
-    const hydrateSupabaseSession = async () => {
-      if (supabase) {
-        try {
-          const { data } = await supabase.auth.getSession();
-          const sessUser = data.session?.user;
-          if (sessUser) {
-            let profRow: Record<string, unknown> | null = null;
-            const { data: prof, error: profErr } = await supabase
-              .from('profiles')
-              .select('*')
-              .eq('id', sessUser.id)
-              .maybeSingle();
-            if (!profErr && prof) {
-              profRow = prof as Record<string, unknown>;
-            } else if (profErr && !isSupabaseMissingRelationError(profErr)) {
-              console.warn('Profile read note:', profErr.message);
-            }
-            const mapped = mapSupabaseProfileToAuthUser(profRow, sessUser);
-            // Also verify role against server /api/auth/me (checks ADMIN_EMAIL override)
-            try {
-              const serverMe = await apiClient.getMe();
-              if (serverMe.user.role === 'admin') {
-                mapped.role = 'admin';
-              }
-            } catch {
-              // ignore
-            }
-            setCurrentUser(mapped);
-            void syncSupabaseUserContext(mapped);
-            return;
+    let mounted = true;
+    const hydrateUnifiedAuth = async () => {
+      // 1. Check if returning from a Firebase Google Sign-In redirect (mobile / popup-blocked)
+      try {
+        const redirectCred = await consumeGoogleRedirectResult();
+        if (redirectCred?.idToken && mounted) {
+          const synced = await apiClient.firebaseSync({ idToken: redirectCred.idToken });
+          setStoredToken(synced.token);
+          if (mounted) {
+            setCurrentUser(synced.user);
+            void syncSupabaseUserContext(synced.user);
           }
-        } catch {
-          // fallback to local token below
+          return;
+        }
+      } catch (err) {
+        if (mounted) {
+          setInAppToast({
+            title: 'Google Sign-In',
+            body: formatFirebaseAuthError(err, state.settings.language),
+            category: 'IMPORTANT',
+            targetView: 'profile',
+          });
         }
       }
 
+      // 2. Restore persistent session via stored Bearer token
       const token = getStoredToken();
       if (token) {
-        apiClient
-          .getMe()
-          .then((res) => {
-            setCurrentUser(res.user);
-          })
-          .catch(() => {
-            setStoredToken(null);
-          });
+        try {
+          const me = await apiClient.getMe();
+          if (mounted) {
+            setCurrentUser(me.user);
+            void syncSupabaseUserContext(me.user);
+            return;
+          }
+        } catch {
+          setStoredToken(null);
+        }
       }
     };
 
-    void hydrateSupabaseSession();
+    void hydrateUnifiedAuth();
 
-    if (!supabase) return;
-    const sb = supabase;
-    const {
-      data: { subscription },
-    } = sb.auth.onAuthStateChange((event, session) => {
-      if (event === 'PASSWORD_RECOVERY') {
-        setIsPasswordRecovery(true);
-        setActiveView('profile');
-      }
-      if (event === 'SIGNED_OUT') {
-        setCurrentUser(null);
-        return;
-      }
-      if (session?.user) {
-        void (async () => {
-          const { data: prof } = await sb
-            .from('profiles')
-            .select('*')
-            .eq('id', session.user.id)
-            .maybeSingle();
-          const mapped = mapSupabaseProfileToAuthUser(
-            (prof as Record<string, unknown> | null) ?? null,
-            session.user
-          );
-          try {
-            const serverMe = await apiClient.getMe();
-            if (serverMe.user.role === 'admin') {
-              mapped.role = 'admin';
-            }
-          } catch {
-            // ignore
+    // 3. Keep Firebase Auth state synchronized if user returns with active Firebase session
+    const unsubscribeFb = subscribeFirebaseAuth((fbUser) => {
+      if (!fbUser || !mounted) return;
+      if (getStoredToken()) return;
+      void fbUser
+        .getIdToken()
+        .then((idToken) => apiClient.firebaseSync({ idToken }))
+        .then((synced) => {
+          setStoredToken(synced.token);
+          if (mounted) {
+            setCurrentUser(synced.user);
+            void syncSupabaseUserContext(synced.user);
           }
-          setCurrentUser(mapped);
-          void syncSupabaseUserContext(mapped);
-        })();
-      }
+        })
+        .catch(() => {
+          // wait for explicit login
+        });
     });
 
-    return () => subscription.unsubscribe();
-  }, [refreshBootstrap, syncSupabaseUserContext]);
+    return () => {
+      mounted = false;
+      unsubscribeFb();
+    };
+  }, [refreshBootstrap, syncSupabaseUserContext, state.settings.language]);
 
   useEffect(() => {
     storageService.saveState(state);
   }, [state]);
+
+  useEffect(() => {
+    if (!currentUser || !isOnline) return;
+    const unsubscribeNotes = subscribeUserStudyNotes((cloudNotes) => {
+      if (!cloudNotes.length) return;
+      setState((prev) => {
+        const map = new Map<string, StudyNote>();
+        for (const n of prev.notes) map.set(n.id, n);
+        for (const cn of cloudNotes) {
+          const existing = map.get(cn.id);
+          if (!existing || cn.updatedAt > existing.updatedAt) {
+            map.set(cn.id, { ...cn, pinned: existing?.pinned ?? false });
+          }
+        }
+        return {
+          ...prev,
+          notes: Array.from(map.values()).sort((a, b) =>
+            (b.updatedAt || '').localeCompare(a.updatedAt || '')
+          ),
+        };
+      });
+    });
+    return () => unsubscribeNotes();
+  }, [currentUser, isOnline]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -281,14 +574,18 @@ export default function App() {
 
   const triggerNotification = useCallback(
     (title: string, body: string) => {
-      setInAppToast({ title, body });
+      const prefs = pushPreferencesRef.current;
+      if (prefs.soundEnabled) {
+        void playNotificationSound(prefs.soundStyle, true);
+      }
+      setInAppToast({ title, body, category: 'EDUCATION', targetView: 'timer' });
       if (
         state.timeSettings.notificationsEnabled &&
         typeof Notification !== 'undefined' &&
         Notification.permission === 'granted'
       ) {
         try {
-          new Notification(title, { body });
+          new Notification(title, { body, icon: '/icons/icon-192x192.png' });
         } catch {
           // Shown in-app
         }
@@ -440,6 +737,13 @@ export default function App() {
       updatedAt: now,
     };
     setState((prev) => ({ ...prev, notes: [newNote, ...prev.notes] }));
+    void syncStudyNoteToFirestore(
+      newNote,
+      state.settings.department,
+      state.settings.semester
+    ).catch((err) => {
+      console.warn('Firestore studyNote create sync notice:', err instanceof Error ? err.message : err);
+    });
   };
 
   const handleAddSubjectNote = (subject: Subject, title: string, content: string) => {
@@ -453,18 +757,32 @@ export default function App() {
     subjectId?: string,
     subjectName?: string
   ) => {
+    const now = new Date().toISOString();
+    let updatedNote: StudyNote | null = null;
     setState((prev) => ({
       ...prev,
-      notes: prev.notes.map((n) =>
-        n.id === id
-          ? { ...n, title, content, subjectId, subjectName, updatedAt: new Date().toISOString() }
-          : n
-      ),
+      notes: prev.notes.map((n) => {
+        if (n.id !== id) return n;
+        updatedNote = { ...n, title, content, subjectId, subjectName, updatedAt: now };
+        return updatedNote;
+      }),
     }));
+    if (updatedNote) {
+      void syncStudyNoteToFirestore(
+        updatedNote,
+        state.settings.department,
+        state.settings.semester
+      ).catch((err) => {
+        console.warn('Firestore studyNote update sync notice:', err instanceof Error ? err.message : err);
+      });
+    }
   };
 
   const handleDeleteNote = (id: string) => {
     setState((prev) => ({ ...prev, notes: prev.notes.filter((n) => n.id !== id) }));
+    void deleteStudyNoteFromFirestore(id).catch((err) => {
+      console.warn('Firestore studyNote delete sync notice:', err instanceof Error ? err.message : err);
+    });
   };
 
   const handleTogglePinNote = (id: string) => {
@@ -589,6 +907,68 @@ export default function App() {
     }));
   };
 
+  const handleMarkPushRead = async (id: string) => {
+    setInboxNotifications((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, isRead: true, readAt: new Date().toISOString() } : n))
+    );
+    setUnreadPushCount((prev) => Math.max(0, prev - 1));
+    try {
+      await apiClient.markNotificationRead(id);
+      await refreshNotificationInbox();
+    } catch {
+      await refreshNotificationInbox();
+    }
+  };
+
+  const handleMarkAllPushRead = async () => {
+    setInboxNotifications((prev) =>
+      prev.map((n) => ({ ...n, isRead: true, readAt: n.readAt ?? new Date().toISOString() }))
+    );
+    setUnreadPushCount(0);
+    try {
+      await apiClient.markAllNotificationsRead();
+      await refreshNotificationInbox();
+    } catch {
+      await refreshNotificationInbox();
+    }
+  };
+
+  const handleDeletePushNotification = async (id: string) => {
+    setInboxNotifications((prev) => prev.filter((n) => n.id !== id));
+    try {
+      await apiClient.deleteUserNotification(id);
+      await refreshNotificationInbox();
+    } catch {
+      await refreshNotificationInbox();
+    }
+  };
+
+  const handleUpdatePushPreferences = async (partial: Partial<NotificationPreferences>) => {
+    saveLocalSoundPref(partial);
+    setPushPreferences((prev) => ({ ...prev, ...partial, updatedAt: new Date().toISOString() }));
+    if (!currentUser) return;
+    try {
+      const res = await apiClient.updateNotificationPreferences(partial);
+      saveLocalSoundPref(res.preferences);
+      setPushPreferences(res.preferences);
+    } catch {
+      await refreshNotificationInbox();
+    }
+  };
+
+  const handleRequestEnablePush = async () => {
+    const res = await pushNotificationService.requestPermissionAndRegister(Boolean(currentUser));
+    if (res.token && currentUser) {
+      await refreshNotificationInbox();
+    }
+    return res;
+  };
+
+  const handleDeactivateCurrentDevice = async () => {
+    await pushNotificationService.deactivateCurrentDevice();
+    await refreshNotificationInbox();
+  };
+
   const handleAuthSuccess = (user: AuthUser) => {
     setCurrentUser(user);
     handleUpdateSettings({
@@ -601,9 +981,7 @@ export default function App() {
 
   const handleLogout = async () => {
     setStoredToken(null);
-    if (supabase) {
-      await supabase.auth.signOut().catch(() => {});
-    }
+    await signOutFirebase().catch(() => {});
     setCurrentUser(null);
     if (activeView === 'admin') {
       setActiveView('dashboard');
@@ -624,6 +1002,7 @@ export default function App() {
         onToggleTheme={handleToggleTheme}
         studentName={state.settings.studentName}
         currentUser={currentUser}
+        unreadPushCount={unreadPushCount}
       />
 
       <div className="flex-1 lg:pl-64 flex flex-col min-w-0">
@@ -641,6 +1020,8 @@ export default function App() {
           notices={bootstrap.notices}
           readNoticeIds={state.readNoticeIds}
           onMarkNoticesRead={handleMarkNoticesRead}
+          inboxNotifications={inboxNotifications}
+          unreadPushCount={unreadPushCount}
         />
 
         {swUpdateHandler && (
@@ -663,29 +1044,58 @@ export default function App() {
           </div>
         )}
 
-        {inAppToast && (
-          <div className="mx-4 sm:mx-6 lg:mx-8 mt-4 p-3.5 rounded-xl bg-cyan-600/12 border border-cyan-500/40 flex items-start justify-between gap-3 no-print">
-            <div className="flex items-start gap-2.5">
-              <Bell className="w-4 h-4 text-cyan-500 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-slate-900 dark:text-white">
-                  {inAppToast.title}
-                </p>
-                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
-                  {inAppToast.body}
-                </p>
-              </div>
+        {inAppToast && (() => {
+          const toastMeta = getCategoryMeta(inAppToast.category || 'GENERAL');
+          const ToastIcon = toastMeta.icon;
+          return (
+            <div className={`mx-4 sm:mx-6 lg:mx-8 mt-4 p-3.5 rounded-xl border flex items-start justify-between gap-3 no-print ${toastMeta.badgeClass}`}>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = inAppToast.targetView || 'notifications';
+                  if (inAppToast.notificationId && currentUser) {
+                    void handleMarkPushRead(inAppToast.notificationId);
+                  }
+                  setActiveView(target);
+                  setInAppToast(null);
+                }}
+                className="flex items-start gap-2.5 text-left flex-1 min-w-0"
+              >
+                <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 mt-0.5 ${toastMeta.iconBgClass}`}>
+                  <ToastIcon className="w-4 h-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wider opacity-85">
+                      {bi(state.settings.language, toastMeta.labelBn, toastMeta.labelEn)}
+                    </span>
+                  </div>
+                  <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                    {inAppToast.title}
+                  </p>
+                  <p className="text-xs text-slate-700 dark:text-slate-200 mt-0.5 line-clamp-2">
+                    {inAppToast.body}
+                  </p>
+                </div>
+                {inAppToast.imageUrl && (
+                  <img
+                    src={inAppToast.imageUrl}
+                    alt=""
+                    className="w-12 h-12 rounded-lg object-cover border border-white/20 shrink-0"
+                  />
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={() => setInAppToast(null)}
+                aria-label="Close notification"
+                className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-500 hover:bg-slate-200/60 dark:hover:bg-slate-800 shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={() => setInAppToast(null)}
-              aria-label="Close notification"
-              className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-500 hover:bg-slate-200/60 dark:hover:bg-slate-800"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        )}
+          );
+        })()}
 
         <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 pb-24 lg:pb-10">
           {activeView === 'dashboard' && (
@@ -696,6 +1106,29 @@ export default function App() {
               formulas={allFormulas}
               onNavigate={setActiveView}
               onToggleTask={handleToggleTask}
+              onUpdateWeeklyGoal={(hours) =>
+                handleUpdateSettings({ weeklyStudyGoalHours: hours })
+              }
+            />
+          )}
+
+          {activeView === 'notifications' && (
+            <NotificationCenterView
+              language={state.settings.language}
+              currentUser={currentUser}
+              notifications={inboxNotifications}
+              preferences={pushPreferences}
+              devices={registeredDevices}
+              fcmConfigured={fcmServerConfigured}
+              isLoading={inboxLoading}
+              onRefreshInbox={refreshNotificationInbox}
+              onMarkRead={handleMarkPushRead}
+              onMarkAllRead={handleMarkAllPushRead}
+              onDeleteNotification={handleDeletePushNotification}
+              onUpdatePreferences={handleUpdatePushPreferences}
+              onRequestEnablePush={handleRequestEnablePush}
+              onDeactivateDevice={handleDeactivateCurrentDevice}
+              onNavigate={setActiveView}
             />
           )}
 
@@ -703,6 +1136,9 @@ export default function App() {
             <PdfLibraryView
               language={state.settings.language}
               currentUser={currentUser}
+              sharedNotes={bootstrap.sharedNotes}
+              defaultDepartment={state.settings.department}
+              defaultSemester={state.settings.semester}
               isOnline={isOnline}
               onNavigate={setActiveView}
               onTrackRecentPdf={handleTrackRecentPdf}
@@ -723,6 +1159,8 @@ export default function App() {
           {activeView === 'result' && (
             <BtebResultView
               btebResultUrl={bootstrap.appConfig.btebResultUrl}
+              officialWebsiteUrl={bootstrap.appConfig.officialWebsiteUrl}
+              notices={bootstrap.notices}
               language={state.settings.language}
               isOnline={isOnline}
             />
@@ -851,7 +1289,10 @@ export default function App() {
           {activeView === 'settings' && (
             <SettingsView
               state={state}
+              currentUser={currentUser}
+              pushPreferences={pushPreferences}
               onUpdateSettings={handleUpdateSettings}
+              onUpdatePushPreferences={handleUpdatePushPreferences}
               onNavigate={setActiveView}
               onResetDemo={() => setState(storageService.resetToDemo())}
               onClearAll={() => setState(storageService.clearAll())}

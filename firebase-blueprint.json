@@ -1,0 +1,238 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private student or administrator profile document owned by a Firebase Auth user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "department": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "semester": {
+          "type": "integer",
+          "description": "Diploma semester number between 1 and 8."
+        },
+        "collegeName": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "rollNumber": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "bio": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "role": {
+          "type": "string",
+          "enum": ["student", "admin"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "fullName",
+        "email",
+        "department",
+        "semester",
+        "role",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PersonalStudyNote": {
+      "title": "PersonalStudyNote",
+      "description": "Personal study note or saved AI Tutor explanation synced inside a user's private subcollection.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 160
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 12000
+        },
+        "subjectName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "department": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "semester": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "userId",
+        "title",
+        "content",
+        "department",
+        "semester",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PersonalPdfMetadata": {
+      "title": "PersonalPdfMetadata",
+      "description": "Metadata record for a student's private uploaded PDF document synced under their user profile.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "customName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180
+        },
+        "fileName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "department": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "semester": {
+          "type": "integer"
+        },
+        "subjectCode": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "fileSizeBytes": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "userId",
+        "customName",
+        "fileName",
+        "department",
+        "semester",
+        "fileSizeBytes",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminMarker": {
+      "title": "AdminMarker",
+      "description": "Trusted admin lookup document used by Firestore rules to verify elevated privileges.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "grantedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "grantedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Owner-isolated student profile documents containing PII (email, rollNumber)."
+    },
+    "/users/{userId}/studyNotes/{noteId}": {
+      "schema": { "$ref": "#/entities/PersonalStudyNote" },
+      "description": "Private personal study notes and saved AI summaries scoped to the owning user."
+    },
+    "/users/{userId}/pdfCatalog/{pdfId}": {
+      "schema": { "$ref": "#/entities/PersonalPdfMetadata" },
+      "description": "Private personal PDF catalog metadata scoped to the owning user."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminMarker" },
+      "description": "Admin role assignment markers managed strictly by admins."
+    }
+  }
+}

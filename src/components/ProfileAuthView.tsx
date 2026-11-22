@@ -16,10 +16,13 @@ import {
 import { DEPARTMENTS, SEMESTER_LABELS, SEMESTER_LABELS_EN } from '../data/curriculum';
 import { bi } from '../i18n/translations';
 import {
-  isSupabaseConfigured,
-  mapSupabaseProfileToAuthUser,
-  supabase,
-} from '../lib/supabaseClient';
+  formatFirebaseAuthError,
+  isFirebaseAuthConfigured,
+  registerWithEmailFirebase,
+  sendPasswordResetFirebase,
+  signInWithEmailFirebase,
+  signInWithGoogleUnified,
+} from '../lib/firebaseAuth';
 import { apiClient, setStoredToken } from '../services/apiClient';
 import {
   AppView,
@@ -107,44 +110,41 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setEditAvatarUrl(currentUser.avatarUrl || '');
   }, [currentUser]);
 
-  const isSupabaseUser = Boolean(
-    isSupabaseConfigured && supabase && currentUser && !currentUser.id.startsWith('usr-')
-  );
-
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
     setSuccessMsg(null);
     setLoading(true);
     try {
-      if (isSupabaseConfigured && supabase) {
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
-          password,
-        });
-        if (!error && data.user) {
-          const { data: prof } = await supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', data.user.id)
-            .maybeSingle();
-          const mapped = mapSupabaseProfileToAuthUser(
-            (prof as Record<string, unknown> | null) ?? null,
-            data.user
-          );
-          onAuthSuccess(mapped);
-          setSuccessMsg(bi(language, 'সফলভাবে সাইন ইন হয়েছে!', 'Signed in successfully!'));
-          return;
-        }
-        // Fallback to local server login if local account exists (e.g., bootstrap admin)
+      if (isFirebaseAuthConfigured) {
         try {
-          const res = await apiClient.login(email, password);
-          setStoredToken(res.token);
-          onAuthSuccess(res.user);
+          const cred = await signInWithEmailFirebase(email, password);
+          const synced = await apiClient.firebaseSync({ idToken: cred.idToken });
+          setStoredToken(synced.token);
+          onAuthSuccess(synced.user);
           setSuccessMsg(bi(language, 'সফলভাবে সাইন ইন হয়েছে!', 'Signed in successfully!'));
           return;
-        } catch {
-          throw error ?? new Error('Invalid email or password.');
+        } catch (fbErr: unknown) {
+          const code =
+            fbErr && typeof fbErr === 'object' && 'code' in fbErr
+              ? String((fbErr as { code?: string }).code)
+              : '';
+          if (
+            code === 'auth/user-not-found' ||
+            code === 'auth/invalid-credential' ||
+            code === 'auth/wrong-password'
+          ) {
+            try {
+              const res = await apiClient.login(email, password);
+              setStoredToken(res.token);
+              onAuthSuccess(res.user);
+              setSuccessMsg(bi(language, 'সফলভাবে সাইন ইন হয়েছে!', 'Signed in successfully!'));
+              return;
+            } catch {
+              throw new Error(formatFirebaseAuthError(fbErr, language));
+            }
+          }
+          throw new Error(formatFirebaseAuthError(fbErr, language));
         }
       } else {
         const res = await apiClient.login(email, password);
@@ -165,60 +165,21 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setSuccessMsg(null);
     setLoading(true);
     try {
-      if (isSupabaseConfigured && supabase) {
-        const { data, error } = await supabase.auth.signUp({
-          email: email.trim(),
-          password,
-          options: {
-            emailRedirectTo: window.location.origin,
-            data: {
-              full_name: fullName.trim(),
-              department,
-              semester,
-              college_name: collegeName.trim(),
-            },
-          },
+      if (isFirebaseAuthConfigured) {
+        const cred = await registerWithEmailFirebase(email, password, fullName);
+        const synced = await apiClient.firebaseSync({
+          idToken: cred.idToken,
+          fullName: fullName.trim(),
+          department,
+          semester,
+          collegeName: collegeName.trim(),
+          rollNumber: rollNumber.trim(),
         });
-        if (error) throw error;
-        if (data.user) {
-          // Ensure profile row exists if session is immediately active
-          if (data.session) {
-            await supabase.from('profiles').upsert({
-              id: data.user.id,
-              full_name: fullName.trim(),
-              email: email.trim().toLowerCase(),
-              department,
-              semester,
-              college_name: collegeName.trim(),
-              institute_name: collegeName.trim(),
-              roll_number: rollNumber.trim(),
-            });
-            onAuthSuccess(
-              mapSupabaseProfileToAuthUser(
-                {
-                  id: data.user.id,
-                  full_name: fullName.trim(),
-                  email: email.trim().toLowerCase(),
-                  role: 'student',
-                  department,
-                  semester,
-                  college_name: collegeName.trim(),
-                  roll_number: rollNumber.trim(),
-                },
-                data.user
-              )
-            );
-            setSuccessMsg(bi(language, 'নতুন অ্যাকাউন্ট তৈরি ও লগইন সম্পন্ন!', 'Account created & signed in!'));
-          } else {
-            setSuccessMsg(
-              bi(
-                language,
-                'অ্যাকাউন্ট তৈরি হয়েছে! আপনার ইমেইলে পাঠানো ভেরিফিকেশন লিংকে ক্লিক করে লগইন করুন।',
-                'Account created! Please check your email inbox to confirm your address before signing in.'
-              )
-            );
-          }
-        }
+        setStoredToken(synced.token);
+        onAuthSuccess(synced.user);
+        setSuccessMsg(
+          bi(language, 'নতুন অ্যাকাউন্ট তৈরি ও সাইন ইন সম্পন্ন!', 'Account created & signed in!')
+        );
       } else {
         const res = await apiClient.register({
           fullName,
@@ -234,41 +195,69 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
         setSuccessMsg(bi(language, 'নতুন অ্যাকাউন্ট তৈরি হয়েছে!', 'Student account created!'));
       }
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Registration failed');
+      setErrorMsg(
+        isFirebaseAuthConfigured
+          ? formatFirebaseAuthError(err, language)
+          : err instanceof Error
+            ? err.message
+            : 'Registration failed'
+      );
     } finally {
       setLoading(false);
     }
   };
 
   const handleGoogleSignIn = async () => {
-    if (!supabase) {
-      setErrorMsg('Supabase is not configured in environment variables.');
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    if (!isFirebaseAuthConfigured) {
+      setErrorMsg(
+        bi(
+          language,
+          'Google সাইন-ইন চালু করতে .env-এ Firebase Web Config (VITE_FIREBASE_API_KEY, VITE_FIREBASE_AUTH_DOMAIN, VITE_FIREBASE_PROJECT_ID, VITE_FIREBASE_APP_ID) যোগ করুন এবং Firebase Console-এ বর্তমান ডোমেইন Authorized domains-এ যুক্ত করুন।',
+          'To enable Google Sign-In, configure VITE_FIREBASE_API_KEY, VITE_FIREBASE_AUTH_DOMAIN, VITE_FIREBASE_PROJECT_ID, and VITE_FIREBASE_APP_ID in .env and add your app domain under Firebase Console -> Authentication -> Authorized domains.'
+        )
+      );
       return;
     }
-    setErrorMsg(null);
+
     setLoading(true);
     try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: window.location.origin,
-        },
+      const outcome = await signInWithGoogleUnified();
+      if (outcome.redirected) {
+        // Browser will navigate to Google OAuth and return via consumeGoogleRedirectResult
+        return;
+      }
+      if (!outcome.idToken) {
+        throw new Error('Missing Firebase ID token after Google Sign-In.');
+      }
+      const synced = await apiClient.firebaseSync({
+        idToken: outcome.idToken,
+        department,
+        semester,
+        collegeName: collegeName.trim(),
+        rollNumber: rollNumber.trim(),
       });
-      if (error) throw error;
+      setStoredToken(synced.token);
+      onAuthSuccess(synced.user);
+      setSuccessMsg(
+        bi(language, 'Google অ্যাকাউন্ট দিয়ে সফলভাবে লগইন হয়েছে!', 'Signed in with Google!')
+      );
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Google sign-in failed');
+      setErrorMsg(formatFirebaseAuthError(err, language));
+    } finally {
       setLoading(false);
     }
   };
 
   const handleForgotPassword = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!supabase) {
+    if (!isFirebaseAuthConfigured) {
       setErrorMsg(
         bi(
           language,
-          'পাসওয়ার্ড রিসেট ইমেইল পাঠাতে Supabase Auth কনফিগার থাকতে হবে।',
-          'Password reset emails require Supabase Auth.'
+          'পাসওয়ার্ড রিসেট ইমেইল পাঠাতে Firebase Authentication কনফিগার থাকতে হবে।',
+          'Password reset emails require Firebase Authentication.'
         )
       );
       return;
@@ -277,43 +266,25 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setSuccessMsg(null);
     setLoading(true);
     try {
-      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-        redirectTo: window.location.origin,
-      });
-      if (error) throw error;
+      await sendPasswordResetFirebase(email.trim());
       setSuccessMsg(
         bi(
           language,
-          'পাসওয়ার্ড রিসেট লিংক আপনার ইমেইলে পাঠানো হয়েছে।',
-          'Password reset link sent! Check your email inbox.'
+          'পাসওয়ার্ড রিসেট লিংক আপনার ইমেইলে পাঠানো হয়েছে। ইনবক্স বা স্প্যাম ফোল্ডার দেখুন।',
+          'Password reset link sent! Check your email inbox or spam folder.'
         )
       );
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to send reset link');
+      setErrorMsg(formatFirebaseAuthError(err, language));
     } finally {
       setLoading(false);
     }
   };
 
-  const handleUpdateRecoveredPassword = async (e: React.FormEvent) => {
+  const handleUpdateRecoveredPassword = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!supabase || newPassword.length < 6) {
-      setErrorMsg(bi(language, 'নতুন পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে।', 'Password must be at least 6 characters.'));
-      return;
-    }
-    setLoading(true);
-    setErrorMsg(null);
-    try {
-      const { error } = await supabase.auth.updateUser({ password: newPassword });
-      if (error) throw error;
-      setNewPassword('');
-      onClearPasswordRecovery();
-      setSuccessMsg(bi(language, 'পাসওয়ার্ড সফলভাবে পরিবর্তন হয়েছে!', 'Password updated successfully!'));
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Password update failed');
-    } finally {
-      setLoading(false);
-    }
+    setNewPassword('');
+    onClearPasswordRecovery();
   };
 
   const handleAvatarUpload = async (file: File | null) => {
@@ -326,37 +297,39 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       setErrorMsg(bi(language, 'ছবির আকার ৩ MB-এর কম হতে হবে।', 'Avatar image must be under 3 MB.'));
       return;
     }
-    if (!isSupabaseUser || !supabase || !currentUser) {
-      setErrorMsg(
-        bi(
-          language,
-          'Supabase অ্যাকাউন্ট দিয়ে লগইন করলে সরাসরি ক্লাউড প্রোফাইল ছবি আপলোড করা যাবে।',
-          'Sign in with a Supabase account to upload profile avatars to cloud storage.'
-        )
-      );
-      return;
-    }
+    if (!currentUser) return;
 
     setUploadingAvatar(true);
     setErrorMsg(null);
     try {
-      const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg';
-      const path = `${currentUser.id}/avatar-${Date.now()}.${ext}`;
-      const { error: uploadErr } = await supabase.storage
-        .from('avatars')
-        .upload(path, file, { upsert: true, contentType: file.type });
-      if (uploadErr) throw uploadErr;
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const img = new Image();
+          img.onload = () => {
+            const maxDim = 256;
+            const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(img.width * scale));
+            canvas.height = Math.max(1, Math.round(img.height * scale));
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+              reject(new Error('Canvas unavailable'));
+              return;
+            }
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            resolve(canvas.toDataURL('image/jpeg', 0.82));
+          };
+          img.onerror = () => reject(new Error('Invalid image file'));
+          img.src = String(reader.result || '');
+        };
+        reader.onerror = () => reject(new Error('Could not read file'));
+        reader.readAsDataURL(file);
+      });
 
-      const { data: pub } = supabase.storage.from('avatars').getPublicUrl(path);
-      const nextUrl = pub.publicUrl;
-      setEditAvatarUrl(nextUrl);
-
-      await supabase
-        .from('profiles')
-        .update({ avatar_url: nextUrl, updated_at: new Date().toISOString() })
-        .eq('id', currentUser.id);
-
-      onAuthSuccess({ ...currentUser, avatarUrl: nextUrl });
+      const res = await apiClient.updateProfile({ avatarUrl: dataUrl });
+      setEditAvatarUrl(res.user.avatarUrl || dataUrl);
+      onAuthSuccess(res.user);
       setSuccessMsg(bi(language, 'প্রোফাইল ছবি আপডেট হয়েছে!', 'Profile photo updated!'));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Avatar upload failed');
@@ -372,57 +345,20 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setSuccessMsg(null);
     setLoading(true);
     try {
-      if (isSupabaseUser && supabase) {
-        const now = new Date().toISOString();
-        const { error } = await supabase.from('profiles').upsert({
-          id: currentUser.id,
-          email: currentUser.email,
-          full_name: editName.trim() || currentUser.fullName,
-          department: editDept,
-          semester: Number(editSem),
-          college_name: editCollege.trim(),
-          institute_name: editCollege.trim(),
-          roll_number: editRoll.trim(),
-          bio: editBio.trim().slice(0, 400),
-          gender: editGender,
-          show_gender: editShowGender,
-          profile_visibility: editVisibility,
-          avatar_url: editAvatarUrl,
-          updated_at: now,
-        });
-        if (error) throw error;
-
-        onAuthSuccess({
-          ...currentUser,
-          fullName: editName.trim() || currentUser.fullName,
-          department: editDept,
-          semester: Number(editSem),
-          collegeName: editCollege.trim(),
-          instituteName: editCollege.trim(),
-          rollNumber: editRoll.trim(),
-          bio: editBio.trim().slice(0, 400),
-          gender: editGender,
-          showGender: editShowGender,
-          profileVisibility: editVisibility,
-          avatarUrl: editAvatarUrl,
-          updatedAt: now,
-        });
-      } else {
-        const res = await apiClient.updateProfile({
-          fullName: editName,
-          department: editDept,
-          semester: Number(editSem),
-          collegeName: editCollege,
-          instituteName: editCollege,
-          rollNumber: editRoll,
-          bio: editBio,
-          gender: editGender,
-          showGender: editShowGender,
-          profileVisibility: editVisibility,
-          avatarUrl: editAvatarUrl,
-        });
-        onAuthSuccess(res.user);
-      }
+      const res = await apiClient.updateProfile({
+        fullName: editName,
+        department: editDept,
+        semester: Number(editSem),
+        collegeName: editCollege,
+        instituteName: editCollege,
+        rollNumber: editRoll,
+        bio: editBio,
+        gender: editGender,
+        showGender: editShowGender,
+        profileVisibility: editVisibility,
+        avatarUrl: editAvatarUrl,
+      });
+      onAuthSuccess(res.user);
 
       onUpdateLocalSettings({
         studentName: editName.trim() || currentUser.fullName,
@@ -473,8 +409,8 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
         <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
           {bi(
             language,
-            'Supabase Auth, Google Sign-in, প্রোফাইল ছবি, প্রাইভেসি নিয়ন্ত্রণ এবং অ্যাডমিন পোর্টাল',
-            'Supabase Auth, Google Sign-in, profile avatar, privacy controls & Admin access'
+            'Firebase Auth, Google Sign-in, প্রোফাইল ছবি, প্রাইভেসি নিয়ন্ত্রণ এবং অ্যাডমিন পোর্টাল',
+            'Firebase Auth, Google Sign-in, profile avatar, privacy controls & Admin access'
           )}
         </p>
       </div>
@@ -808,18 +744,48 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
             )}
           </div>
 
-          {/* Google OAuth Sign-In */}
-          {isSupabaseConfigured && (authTab === 'login' || authTab === 'register') && (
+          {/* Google OAuth Sign-In (Visible on both Sign In and Sign Up) */}
+          {(authTab === 'login' || authTab === 'register') && (
             <div className="space-y-3">
               <button
                 type="button"
                 disabled={loading}
                 onClick={() => void handleGoogleSignIn()}
-                className="w-full min-h-[44px] inline-flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-cyan-500/50 text-sm font-semibold text-slate-800 dark:text-white transition-colors"
+                className="w-full min-h-[46px] inline-flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 hover:border-cyan-500 text-sm font-semibold text-slate-800 dark:text-white shadow-xs transition-colors disabled:opacity-60"
               >
-                <span className="font-bold text-cyan-500">G</span>
-                <span>{bi(language, 'Google দিয়ে সাইন ইন করুন', 'Continue with Google')}</span>
+                <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0" aria-hidden="true">
+                  <path
+                    fill="#4285F4"
+                    d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                  />
+                </svg>
+                <span>
+                  {loading
+                    ? bi(language, 'Google-এ সংযুক্ত হচ্ছে...', 'Connecting with Google...')
+                    : bi(language, 'Google দিয়ে চালিয়ে যান', 'Continue with Google')}
+                </span>
               </button>
+              {!isFirebaseAuthConfigured && (
+                <p className="text-[11px] text-amber-600 dark:text-amber-300 text-center">
+                  {bi(
+                    language,
+                    'Google Sign-In সক্রিয় করতে Firebase Web Env Keys প্রয়োজন — নিচে ইমেইল ও পাসওয়ার্ড দিয়ে এখনই লগইন/সাইনআপ করা যাবে।',
+                    'Google Sign-In requires Firebase Web Env Keys; Email & Password login works immediately below.'
+                  )}
+                </p>
+              )}
               <div className="flex items-center gap-3 text-[11px] text-slate-400">
                 <div className="flex-1 h-px bg-slate-200 dark:bg-slate-800" />
                 <span>{bi(language, 'অথবা ইমেইল ব্যবহার করুন', 'OR USE EMAIL')}</span>

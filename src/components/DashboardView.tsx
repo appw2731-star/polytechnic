@@ -5,6 +5,7 @@ import {
   Bell,
   Bot,
   CalendarCheck2,
+  Check,
   CheckCircle2,
   Circle,
   Clock,
@@ -14,10 +15,13 @@ import {
   HelpCircle,
   MessageSquare,
   NotebookPen,
+  Pencil,
   Search,
   Sigma,
+  Target,
   Timer,
   Wrench,
+  X,
 } from 'lucide-react';
 import {
   DEPARTMENTS,
@@ -46,6 +50,7 @@ interface DashboardViewProps {
   formulas: FormulaItem[];
   onNavigate: (view: AppView) => void;
   onToggleTask: (taskId: string) => void;
+  onUpdateWeeklyGoal?: (hours: number) => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -55,6 +60,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   formulas,
   onNavigate,
   onToggleTask,
+  onUpdateWeeklyGoal,
 }) => {
   const lang = state.settings.language;
   const todayBn = getTodayDayBn();
@@ -62,6 +68,66 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const semesterSubjects = getSubjectsForUser(state.settings.department, state.settings.semester);
 
   const [globalSearch, setGlobalSearch] = useState('');
+  const weeklyGoalHours = Math.min(100, Math.max(1, state.settings.weeklyStudyGoalHours ?? 14));
+  const [isEditingGoal, setIsEditingGoal] = useState(false);
+  const [goalInput, setGoalInput] = useState(String(weeklyGoalHours));
+
+  const weeklyStudyStats = useMemo(() => {
+    // Compute start of current study week in Asia/Dhaka (Saturday 00:00:00 BDT = UTC+6)
+    const dhakaOffsetMs = 6 * 60 * 60 * 1000;
+    const nowDhaka = new Date(Date.now() + dhakaOffsetMs);
+    const dayOfWeek = nowDhaka.getUTCDay(); // 0=Sun ... 6=Sat
+    const daysSinceSaturday = (dayOfWeek + 1) % 7;
+    const weekStartDhaka = Date.UTC(
+      nowDhaka.getUTCFullYear(),
+      nowDhaka.getUTCMonth(),
+      nowDhaka.getUTCDate() - daysSinceSaturday,
+      0,
+      0,
+      0,
+      0
+    );
+    const weekStartUtcMs = weekStartDhaka - dhakaOffsetMs;
+
+    const timerMinutes = state.timerHistory.reduce((sum, session) => {
+      const completedMs = new Date(session.completedAt).getTime();
+      if (!Number.isNaN(completedMs) && completedMs >= weekStartUtcMs) {
+        return sum + (session.completedMinutes || 0);
+      }
+      return sum;
+    }, 0);
+
+    const taskMinutes = state.tasks.reduce(
+      (sum, task) => (task.completed ? sum + (task.durationMinutes || 0) : sum),
+      0
+    );
+
+    const totalMinutes = timerMinutes + taskMinutes;
+    const studiedHours = totalMinutes / 60;
+    const rawPercent = weeklyGoalHours > 0 ? Math.round((studiedHours / weeklyGoalHours) * 100) : 0;
+    const clampedPercent = Math.min(100, Math.max(0, rawPercent));
+    const remainingHours = Math.max(0, weeklyGoalHours - studiedHours);
+
+    return {
+      timerMinutes,
+      taskMinutes,
+      totalMinutes,
+      studiedHours,
+      rawPercent,
+      clampedPercent,
+      remainingHours,
+      goalReached: studiedHours >= weeklyGoalHours,
+    };
+  }, [state.timerHistory, state.tasks, weeklyGoalHours]);
+
+  const handleSaveWeeklyGoal = (e: React.FormEvent) => {
+    e.preventDefault();
+    const parsed = Math.round(Number(goalInput));
+    const nextGoal = Number.isFinite(parsed) ? Math.min(100, Math.max(1, parsed)) : weeklyGoalHours;
+    onUpdateWeeklyGoal?.(nextGoal);
+    setGoalInput(String(nextGoal));
+    setIsEditingGoal(false);
+  };
 
   const todaysTasks = state.tasks.filter((t) => t.day === todayBn);
   const completedTodayCount = todaysTasks.filter((t) => t.completed).length;
@@ -431,6 +497,232 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </p>
         </div>
       </section>
+
+      {/* Weekly Study Goal Card with Circular Progress Bar */}
+      {(() => {
+        const radius = 52;
+        const circumference = 2 * Math.PI * radius;
+        const dashOffset =
+          circumference - (weeklyStudyStats.clampedPercent / 100) * circumference;
+        const studiedHoursFormatted = weeklyStudyStats.studiedHours.toFixed(1);
+        const remainingFormatted = weeklyStudyStats.remainingHours.toFixed(1);
+
+        return (
+          <section
+            aria-label={bi(lang, 'সাপ্তাহিক অধ্যয়ন লক্ষ্য', 'Weekly Study Goal')}
+            className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 lg:p-6"
+          >
+            <div className="flex flex-col md:flex-row md:items-center gap-6">
+              {/* Circular Progress Ring */}
+              <div className="flex items-center justify-center shrink-0">
+                <div className="relative w-32 h-32 flex items-center justify-center">
+                  <svg
+                    viewBox="0 0 128 128"
+                    className="w-32 h-32 -rotate-90"
+                    role="img"
+                    aria-label={bi(
+                      lang,
+                      `সাপ্তাহিক অধ্যয়ন অগ্রগতি ${weeklyStudyStats.clampedPercent}%`,
+                      `Weekly study progress ${weeklyStudyStats.clampedPercent}%`
+                    )}
+                  >
+                    <defs>
+                      <linearGradient id="weeklyGoalGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" stopColor={weeklyStudyStats.goalReached ? '#10b981' : '#3b82f6'} />
+                        <stop offset="100%" stopColor={weeklyStudyStats.goalReached ? '#34d399' : '#06b6d4'} />
+                      </linearGradient>
+                    </defs>
+                    <circle
+                      cx="64"
+                      cy="64"
+                      r={radius}
+                      fill="none"
+                      strokeWidth="10"
+                      className="stroke-slate-200 dark:stroke-slate-800"
+                    />
+                    <circle
+                      cx="64"
+                      cy="64"
+                      r={radius}
+                      fill="none"
+                      strokeWidth="10"
+                      stroke="url(#weeklyGoalGrad)"
+                      strokeLinecap="round"
+                      strokeDasharray={circumference}
+                      strokeDashoffset={dashOffset}
+                      className="transition-[stroke-dashoffset] duration-500 ease-out"
+                    />
+                  </svg>
+                  <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
+                    <span
+                      className={`text-2xl font-bold tabular-nums leading-none ${
+                        weeklyStudyStats.goalReached
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-slate-900 dark:text-white'
+                      }`}
+                    >
+                      {lang === 'bn'
+                        ? `${toBnDigits(weeklyStudyStats.rawPercent)}%`
+                        : `${weeklyStudyStats.rawPercent}%`}
+                    </span>
+                    <span className="mt-1 text-[11px] font-medium text-slate-500 dark:text-slate-400 tabular-nums">
+                      {lang === 'bn'
+                        ? `${toBnDigits(studiedHoursFormatted)} / ${toBnDigits(weeklyGoalHours)} ঘঃ`
+                        : `${studiedHoursFormatted} / ${weeklyGoalHours}h`}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Goal Info & Controls */}
+              <div className="flex-1 min-w-0 space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Target className="w-4 h-4 text-cyan-500 shrink-0" />
+                      <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                        {bi(lang, 'সাপ্তাহিক অধ্যয়ন লক্ষ্য', 'Weekly Study Goal')}
+                      </h2>
+                      <span
+                        className={`text-[11px] font-semibold px-2 py-0.5 rounded-md ${
+                          weeklyStudyStats.goalReached
+                            ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                            : 'bg-cyan-500/15 text-cyan-600 dark:text-cyan-400'
+                        }`}
+                      >
+                        {weeklyStudyStats.goalReached
+                          ? bi(lang, 'লক্ষ্য অর্জিত!', 'Goal Achieved!')
+                          : bi(
+                              lang,
+                              `বাকি ${toBnDigits(remainingFormatted)} ঘণ্টা`,
+                              `${remainingFormatted}h left`
+                            )}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                      {bi(
+                        lang,
+                        'এই সপ্তাহে স্টাডি টাইমার এবং সম্পন্ন করা রুটিন টাস্ক থেকে মোট অধ্যয়ন সময় হিসাব করা হচ্ছে।',
+                        'Tracks your study hours logged this week across completed timer sessions and routine tasks.'
+                      )}
+                    </p>
+                  </div>
+
+                  {onUpdateWeeklyGoal && !isEditingGoal && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGoalInput(String(weeklyGoalHours));
+                        setIsEditingGoal(true);
+                      }}
+                      className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 hover:border-cyan-500/50 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors"
+                    >
+                      <Pencil className="w-3.5 h-3.5 text-cyan-500" />
+                      <span>{bi(lang, 'লক্ষ্য পরিবর্তন', 'Set Goal')}</span>
+                    </button>
+                  )}
+                </div>
+
+                {isEditingGoal ? (
+                  <form
+                    onSubmit={handleSaveWeeklyGoal}
+                    className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 space-y-3"
+                  >
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <label
+                        htmlFor="weekly-goal-hours-input"
+                        className="text-xs font-medium text-slate-700 dark:text-slate-300"
+                      >
+                        {bi(lang, 'সাপ্তাহিক লক্ষ্য (ঘণ্টা):', 'Target hours per week:')}
+                      </label>
+                      <input
+                        id="weekly-goal-hours-input"
+                        type="number"
+                        min={1}
+                        max={100}
+                        step={1}
+                        required
+                        value={goalInput}
+                        onChange={(e) => setGoalInput(e.target.value)}
+                        className="w-24 min-h-[38px] px-3 rounded-lg bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 text-sm font-semibold text-slate-900 dark:text-white tabular-nums focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                      />
+                      <div className="flex items-center gap-1.5">
+                        {[7, 14, 21, 28].map((preset) => (
+                          <button
+                            key={preset}
+                            type="button"
+                            onClick={() => setGoalInput(String(preset))}
+                            className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
+                              Number(goalInput) === preset
+                                ? 'bg-cyan-600 text-white border-cyan-600'
+                                : 'bg-white dark:bg-slate-950 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-cyan-500/40'
+                            }`}
+                          >
+                            {lang === 'bn' ? `${toBnDigits(preset)} ঘঃ` : `${preset}h`}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="submit"
+                        className="min-h-[36px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        <span>{bi(lang, 'সংরক্ষণ করুন', 'Save Goal')}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setIsEditingGoal(false)}
+                        className="min-h-[36px] inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>{bi(lang, 'বাতিল', 'Cancel')}</span>
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                    <div className="flex flex-wrap items-center gap-3 text-xs">
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 tabular-nums">
+                        {bi(
+                          lang,
+                          `লক্ষ্য: ${toBnDigits(weeklyGoalHours)} ঘণ্টা/সপ্তাহ`,
+                          `Target: ${weeklyGoalHours} hrs/week`
+                        )}
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 tabular-nums">
+                        {bi(
+                          lang,
+                          `টাইমার: ${toBnDigits(weeklyStudyStats.timerMinutes)} মিঃ`,
+                          `Timer: ${weeklyStudyStats.timerMinutes}m`
+                        )}
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 tabular-nums">
+                        {bi(
+                          lang,
+                          `রুটিন টাস্ক: ${toBnDigits(weeklyStudyStats.taskMinutes)} মিঃ`,
+                          `Tasks: ${weeklyStudyStats.taskMinutes}m`
+                        )}
+                      </span>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('timer')}
+                      className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-cyan-500/12 hover:bg-cyan-500/20 text-cyan-700 dark:text-cyan-300 text-xs font-bold transition-colors"
+                    >
+                      <Timer className="w-3.5 h-3.5" />
+                      <span>{bi(lang, 'অধ্যয়ন শুরু করুন', 'Log Study Session')}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+        );
+      })()}
 
       {/* Formula Hub Highlights + Recent Study Activity */}
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-4">

@@ -26,6 +26,8 @@ export interface DbUser {
   instituteName: string;
   rollNumber: string;
   profileVisibility: 'public' | 'department' | 'private';
+  firebaseUid?: string;
+  isDisabled?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -77,8 +79,25 @@ export interface DbSharedNote {
   subjectCode: string;
   summary: string;
   pdfUrl: string;
+  storagePath?: string;
+  fileSizeBytes?: number;
   downloadPermitted: boolean;
   createdAt: string;
+}
+
+export interface DbUserPdf {
+  id: string;
+  userId: string;
+  customTitle: string;
+  originalFilename: string;
+  storagePath: string;
+  fileSizeBytes: number;
+  mimeType: string;
+  department: string;
+  semester: number;
+  subjectName: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface DbMcq {
@@ -146,14 +165,109 @@ export interface DbAppConfig {
   updatedAt: string;
 }
 
+export type PushCategory = 'APP_UPDATE' | 'IMPORTANT' | 'EDUCATION' | 'EMERGENCY' | 'GENERAL';
+export type PushAudienceType = 'all' | 'selected_users' | 'department_semester';
+export type PushSoundMode = 'custom' | 'default' | 'silent';
+
+export interface DbDeviceToken {
+  id: string;
+  userId: string;
+  token: string;
+  platform: 'web' | 'android' | 'ios';
+  browserOrDevice: string;
+  appVersion: string;
+  isActive: boolean;
+  lastSeenAt: string;
+  createdAt: string;
+}
+
+export interface DbNotificationPreference {
+  userId: string;
+  pushEnabled: boolean;
+  soundEnabled: boolean;
+  soundStyle: 'chime' | 'alert' | 'soft' | 'bell' | 'system';
+  allowAppUpdate: boolean;
+  allowImportant: boolean;
+  allowEducation: boolean;
+  allowEmergency: boolean;
+  allowGeneral: boolean;
+  respectDnd: boolean;
+  updatedAt: string;
+}
+
+export interface DbNotificationCampaign {
+  id: string;
+  title: string;
+  body: string;
+  category: PushCategory;
+  imageUrl: string;
+  targetView: string;
+  actionUrl: string;
+  audienceType: PushAudienceType;
+  targetUserIds: string[];
+  targetDepartment: string;
+  targetSemester: number | null;
+  soundMode: PushSoundMode;
+  status: 'sent' | 'partial' | 'failed';
+  totalRecipients: number;
+  fcmSentCount: number;
+  fcmFailedCount: number;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface DbUserNotification {
+  id: string;
+  notificationId: string;
+  userId: string;
+  title: string;
+  body: string;
+  category: PushCategory;
+  imageUrl: string;
+  targetView: string;
+  actionUrl: string;
+  isRead: boolean;
+  readAt: string;
+  deliveredVia: 'fcm_and_in_app' | 'in_app' | 'web_push';
+  createdAt: string;
+}
+
+export interface DbScheduledNotification {
+  id: string;
+  title: string;
+  body: string;
+  category: PushCategory;
+  imageUrl: string;
+  targetView: string;
+  actionUrl: string;
+  audienceType: PushAudienceType;
+  targetUserIds: string[];
+  targetDepartment: string;
+  targetSemester: number | null;
+  soundMode: PushSoundMode;
+  scheduledFor: string;
+  status: 'pending' | 'processing' | 'sent' | 'cancelled' | 'failed';
+  sentNotificationId: string;
+  errorMessage: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DatabaseSchema {
   users: DbUser[];
   notices: DbNotice[];
   sharedNotes: DbSharedNote[];
+  userPdfs: DbUserPdf[];
   mcqs: DbMcq[];
   communityPosts: DbCommunityPost[];
   customFormulas: DbFormulaItem[];
   deletedFormulaIds: string[];
+  deviceTokens: DbDeviceToken[];
+  notificationPreferences: DbNotificationPreference[];
+  notifications: DbNotificationCampaign[];
+  userNotifications: DbUserNotification[];
+  scheduledNotifications: DbScheduledNotification[];
   aiConfig: DbAiConfig;
   usageStats: DbUsageStats;
   appConfig: DbAppConfig;
@@ -250,6 +364,7 @@ function createInitialDb(): DatabaseSchema {
       },
     ],
     sharedNotes: [],
+    userPdfs: [],
     mcqs: [],
     communityPosts: [
       {
@@ -271,8 +386,13 @@ function createInitialDb(): DatabaseSchema {
     ],
     customFormulas: [],
     deletedFormulaIds: [],
+    deviceTokens: [],
+    notificationPreferences: [],
+    notifications: [],
+    userNotifications: [],
+    scheduledNotifications: [],
     aiConfig: {
-      activeModel: 'gemini-3.1-flash-lite',
+      activeModel: 'gemini-4-hydrogen',
       thinkingLevel: 'LOW',
       conciseByDefault: false,
       maxHistoryTurns: 8,
@@ -376,12 +496,22 @@ class FileDatabase {
           : [],
         notices: Array.isArray(parsed.notices) ? parsed.notices : fallback.notices,
         sharedNotes: Array.isArray(parsed.sharedNotes) ? parsed.sharedNotes : [],
+        userPdfs: Array.isArray(parsed.userPdfs) ? parsed.userPdfs : [],
         mcqs: Array.isArray(parsed.mcqs) ? parsed.mcqs : [],
         communityPosts: Array.isArray(parsed.communityPosts)
           ? parsed.communityPosts
           : fallback.communityPosts,
         customFormulas: Array.isArray(parsed.customFormulas) ? parsed.customFormulas : [],
         deletedFormulaIds: Array.isArray(parsed.deletedFormulaIds) ? parsed.deletedFormulaIds : [],
+        deviceTokens: Array.isArray(parsed.deviceTokens) ? parsed.deviceTokens : [],
+        notificationPreferences: Array.isArray(parsed.notificationPreferences)
+          ? parsed.notificationPreferences
+          : [],
+        notifications: Array.isArray(parsed.notifications) ? parsed.notifications : [],
+        userNotifications: Array.isArray(parsed.userNotifications) ? parsed.userNotifications : [],
+        scheduledNotifications: Array.isArray(parsed.scheduledNotifications)
+          ? parsed.scheduledNotifications
+          : [],
         aiConfig: {
           ...fallback.aiConfig,
           ...(parsed.aiConfig ?? {}),

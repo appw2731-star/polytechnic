@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertTriangle,
+  BookOpen,
   Check,
   Download,
   Edit3,
   Eye,
   FileText,
+  Filter,
   HardDrive,
   Lock,
   LogIn,
@@ -16,24 +17,35 @@ import {
   WifiOff,
   X,
 } from 'lucide-react';
+import { DEPARTMENTS, SEMESTER_LABELS, SEMESTER_LABELS_EN } from '../data/curriculum';
 import { bi } from '../i18n/translations';
+import { apiClient } from '../services/apiClient';
 import {
-  getActiveAccessToken,
-  isSupabaseConfigured,
-  isSupabaseMissingRelationError,
-  SUPABASE_ANON_KEY,
-  SUPABASE_URL,
-  supabase,
-} from '../lib/supabaseClient';
+  deletePdfMetadataFromFirestore,
+  syncPdfMetadataToFirestore,
+} from '../services/firestoreService';
 import { offlineDb } from '../services/offlineDb';
-import { AppView, AuthUser, LanguageMode, OfflinePdfRecord, UserPdfRecord } from '../types/study';
+import {
+  AppView,
+  AuthUser,
+  DepartmentId,
+  LanguageMode,
+  OfflinePdfRecord,
+  SemesterNumber,
+  SharedPdfNote,
+  UserPdfRecord,
+} from '../types/study';
 import { formatDateBn, toBnDigits } from '../utils/formatBn';
+import { PdfReaderDocument, PdfReaderModal } from './PdfReaderModal';
 
 const MAX_PDF_BYTES = 50 * 1024 * 1024; // 50 MB
 
 interface PdfLibraryViewProps {
   language: LanguageMode;
   currentUser: AuthUser | null;
+  sharedNotes: SharedPdfNote[];
+  defaultDepartment: DepartmentId;
+  defaultSemester: SemesterNumber;
   isOnline: boolean;
   onNavigate: (view: AppView) => void;
   onTrackRecentPdf: (pdfId: string) => void;
@@ -57,6 +69,9 @@ async function verifyPdfMagicBytes(file: File): Promise<boolean> {
 export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
   language,
   currentUser,
+  sharedNotes,
+  defaultDepartment,
+  defaultSemester,
   isOnline,
   onNavigate,
   onTrackRecentPdf,
@@ -64,37 +79,34 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
   const [cloudPdfs, setCloudPdfs] = useState<UserPdfRecord[]>([]);
   const [offlinePdfs, setOfflinePdfs] = useState<OfflinePdfRecord[]>([]);
   const [loadingList, setLoadingList] = useState(false);
-  const [migrationMissing, setMigrationMissing] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState('');
+  const [filterDept, setFilterDept] = useState<string>('all');
+  const [filterSem, setFilterSem] = useState<string>('all');
   const [sortBy, setSortBy] = useState<'newest' | 'name' | 'size'>('newest');
 
   // Upload Drawer / Form State
   const [uploadOpen, setUploadOpen] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [customTitle, setCustomTitle] = useState('');
+  const [uploadDept, setUploadDept] = useState<string>(defaultDepartment);
+  const [uploadSem, setUploadSem] = useState<number>(defaultSemester);
+  const [uploadSubject, setUploadSubject] = useState('');
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Rename State
-  const [renamingId, setRenamingId] = useState<string | null>(null);
-  const [renameValue, setRenameValue] = useState('');
+  // Inline Rename & Metadata Edit State
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editDept, setEditDept] = useState<string>(defaultDepartment);
+  const [editSem, setEditSem] = useState<number>(defaultSemester);
 
   // Reader Modal State
-  const [readerDoc, setReaderDoc] = useState<{
-    title: string;
-    url: string;
-    isBlobUrl: boolean;
-    filename: string;
-  } | null>(null);
+  const [readerDoc, setReaderDoc] = useState<PdfReaderDocument | null>(null);
   const [openingId, setOpeningId] = useState<string | null>(null);
-
-  const isSupabaseUser = Boolean(
-    isSupabaseConfigured && supabase && currentUser && !currentUser.id.startsWith('usr-')
-  );
 
   const showToast = (msg: string) => {
     setErrorMsg(null);
@@ -108,55 +120,25 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
   }, []);
 
   const loadCloudPdfs = useCallback(async () => {
-    if (!isSupabaseUser || !supabase || !currentUser || !isOnline) return;
+    if (!currentUser || !isOnline) {
+      setCloudPdfs([]);
+      return;
+    }
     setLoadingList(true);
-    setMigrationMissing(false);
     try {
-      const { data, error } = await supabase
-        .from('user_pdfs')
-        .select('id, user_id, custom_title, original_filename, storage_path, file_size_bytes, mime_type, created_at, updated_at')
-        .eq('user_id', currentUser.id)
-        .order('created_at', { ascending: false });
-
-      if (error) {
-        if (isSupabaseMissingRelationError(error)) {
-          setMigrationMissing(true);
-        } else {
-          setErrorMsg(error.message);
-        }
-        return;
-      }
-
-      const mapped: UserPdfRecord[] = (data ?? []).map((row) => ({
-        id: String(row.id),
-        userId: String(row.user_id),
-        customTitle: String(row.custom_title),
-        originalFilename: String(row.original_filename),
-        storagePath: String(row.storage_path),
-        fileSizeBytes: Number(row.file_size_bytes),
-        mimeType: String(row.mime_type || 'application/pdf'),
-        createdAt: String(row.created_at),
-        updatedAt: String(row.updated_at),
-      }));
-      setCloudPdfs(mapped);
+      const res = await apiClient.getPdfs();
+      setCloudPdfs(res.pdfs);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to load PDFs');
     } finally {
       setLoadingList(false);
     }
-  }, [currentUser, isOnline, isSupabaseUser]);
+  }, [currentUser, isOnline]);
 
   useEffect(() => {
     void loadOfflineVault();
     void loadCloudPdfs();
   }, [loadOfflineVault, loadCloudPdfs]);
-
-  // Cleanup blob URL when reader closes
-  useEffect(() => {
-    return () => {
-      if (readerDoc?.isBlobUrl) {
-        URL.revokeObjectURL(readerDoc.url);
-      }
-    };
-  }, [readerDoc]);
 
   const handleFilePicked = async (file: File | null) => {
     setErrorMsg(null);
@@ -168,7 +150,11 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     const lower = file.name.toLowerCase();
     if (file.type !== 'application/pdf' && !lower.endsWith('.pdf')) {
       setErrorMsg(
-        bi(language, 'শুধুমাত্র বৈধ PDF (.pdf) ফাইল আপলোড করা যাবে।', 'Only valid PDF (.pdf) files are allowed.')
+        bi(
+          language,
+          'শুধুমাত্র বৈধ PDF (.pdf) ফাইল আপলোড করা যাবে।',
+          'Only valid PDF (.pdf) files are allowed.'
+        )
       );
       setSelectedFile(null);
       return;
@@ -205,51 +191,6 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     }
   };
 
-  const uploadPdfWithProgress = (
-    storagePath: string,
-    file: File,
-    accessToken: string
-  ): Promise<void> => {
-    return new Promise((resolve, reject) => {
-      const encodedPath = storagePath
-        .split('/')
-        .map((segment) => encodeURIComponent(segment))
-        .join('/');
-      const endpoint = `${SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/user-pdfs/${encodedPath}`;
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', endpoint, true);
-      xhr.setRequestHeader('apikey', SUPABASE_ANON_KEY);
-      xhr.setRequestHeader('Authorization', `Bearer ${accessToken}`);
-      xhr.setRequestHeader('Content-Type', 'application/pdf');
-      xhr.setRequestHeader('x-upsert', 'false');
-
-      xhr.upload.onprogress = (ev) => {
-        if (ev.lengthComputable && ev.total > 0) {
-          setUploadProgress(Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
-        }
-      };
-
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          setUploadProgress(100);
-          resolve();
-        } else {
-          let detail = `Upload failed (${xhr.status})`;
-          try {
-            const parsed = JSON.parse(xhr.responseText) as { message?: string; error?: string };
-            detail = parsed.message || parsed.error || detail;
-          } catch {
-            // keep default message
-          }
-          reject(new Error(detail));
-        }
-      };
-
-      xhr.onerror = () => reject(new Error('Network error during PDF upload.'));
-      xhr.send(file);
-    });
-  };
-
   const handleUploadSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
@@ -267,70 +208,58 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     setUploadProgress(0);
 
     try {
-      // If signed into Supabase Cloud, upload to private Storage bucket `user-pdfs` + `user_pdfs` table
-      if (isSupabaseUser && supabase && currentUser) {
-        if (!isOnline) {
-          throw new Error(
-            bi(
-              language,
-              'ক্লাউডে PDF আপলোড করতে ইন্টারনেট সংযোগ প্রয়োজন।',
-              'Internet connection is required for private cloud PDF upload.'
-            )
-          );
-        }
-        const token = await getActiveAccessToken();
-        if (!token) {
-          throw new Error('Authentication session expired. Please sign in again.');
-        }
-
-        const safeName = selectedFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-        const storagePath = `${currentUser.id}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}-${safeName}`;
-
-        await uploadPdfWithProgress(storagePath, selectedFile, token);
-
-        const { error: insertError } = await supabase.from('user_pdfs').insert({
-          user_id: currentUser.id,
-          custom_title: cleanTitle,
-          original_filename: selectedFile.name,
-          storage_path: storagePath,
-          file_size_bytes: selectedFile.size,
-          mime_type: 'application/pdf',
+      if (currentUser && isOnline) {
+        const upRes = await apiClient.uploadPdfWithProgress(
+          selectedFile,
+          {
+            customTitle: cleanTitle,
+            originalFilename: selectedFile.name,
+            department: uploadDept,
+            semester: uploadSem,
+            subjectName: uploadSubject.trim(),
+          },
+          (pct) => setUploadProgress(pct)
+        );
+        void syncPdfMetadataToFirestore(upRes.pdf).catch((err) => {
+          console.warn('Firestore PDF metadata sync notice:', err instanceof Error ? err.message : err);
         });
-
-        if (insertError) {
-          // Roll back storage file on metadata failure
-          await supabase.storage.from('user-pdfs').remove([storagePath]);
-          throw new Error(insertError.message);
-        }
-
         await loadCloudPdfs();
-        showToast(bi(language, 'PDF নিরাপদে ক্লাউড লাইব্রেরিতে সংরক্ষিত হয়েছে।', 'PDF uploaded to your private cloud library.'));
+        showToast(
+          bi(
+            language,
+            'PDF নিরাপদে আপনার ব্যক্তিগত লাইব্রেরিতে সংরক্ষিত হয়েছে।',
+            'PDF uploaded to your private cloud library.'
+          )
+        );
       } else {
-        // Offline / Local Vault fallback when user hasn't signed into Supabase yet
         const record: OfflinePdfRecord = {
           id: `local-pdf-${Date.now()}`,
           title: cleanTitle,
+          department: uploadDept,
+          semester: uploadSem,
+          subjectCode: uploadSubject.trim() || undefined,
           sourceType: 'pdf-blob',
           mimeType: 'application/pdf',
           sizeBytes: selectedFile.size,
           blob: selectedFile,
           savedAt: new Date().toISOString(),
         };
-        setUploadProgress(80);
+        setUploadProgress(75);
         await offlineDb.saveOfflinePdf(record);
         setUploadProgress(100);
         await loadOfflineVault();
         showToast(
           bi(
             language,
-            'PDF এই ডিভাইসের অফলাইন ভল্টে সেভ হয়েছে। ক্লাউড সিঙ্কের জন্য Supabase অ্যাকাউন্টে লগইন করুন।',
-            'Saved to device Offline Vault. Sign in with Supabase for cross-device private cloud storage.'
+            'PDF এই ডিভাইসের অফলাইন ভল্টে সেভ হয়েছে।',
+            'Saved to your device Offline Vault.'
           )
         );
       }
 
       setSelectedFile(null);
       setCustomTitle('');
+      setUploadSubject('');
       setUploadOpen(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     } catch (err) {
@@ -341,37 +270,31 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
   };
 
   const handleOpenCloudPdf = async (pdf: UserPdfRecord) => {
-    if (!supabase) return;
     setOpeningId(pdf.id);
     setErrorMsg(null);
     try {
       const offlineCached = await offlineDb.getOfflinePdf(pdf.id);
       if (!isOnline && offlineCached?.blob) {
-        const blobUrl = URL.createObjectURL(offlineCached.blob);
+        const bytes = new Uint8Array(await offlineCached.blob.arrayBuffer());
         onTrackRecentPdf(pdf.id);
         setReaderDoc({
           title: pdf.customTitle,
-          url: blobUrl,
-          isBlobUrl: true,
-          filename: `${pdf.customTitle}.pdf`,
+          filename: pdf.originalFilename || `${pdf.customTitle}.pdf`,
+          bytes,
+          canDownload: true,
         });
         return;
       }
 
-      const { data, error } = await supabase.storage
-        .from('user-pdfs')
-        .createSignedUrl(pdf.storagePath, 3600);
-
-      if (error || !data?.signedUrl) {
-        throw new Error(error?.message || 'Unable to generate secure PDF link.');
-      }
-
+      const bytes = await apiClient.fetchAuthenticatedPdfBytes(
+        `/api/pdfs/${encodeURIComponent(pdf.id)}/file`
+      );
       onTrackRecentPdf(pdf.id);
       setReaderDoc({
         title: pdf.customTitle,
-        url: data.signedUrl,
-        isBlobUrl: false,
-        filename: `${pdf.customTitle}.pdf`,
+        filename: pdf.originalFilename || `${pdf.customTitle}.pdf`,
+        bytes,
+        canDownload: true,
       });
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Unable to open PDF');
@@ -381,15 +304,14 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
   };
 
   const handleDownloadCloudPdf = async (pdf: UserPdfRecord) => {
-    if (!supabase) return;
     setOpeningId(pdf.id);
     setErrorMsg(null);
     try {
-      const { data, error } = await supabase.storage.from('user-pdfs').download(pdf.storagePath);
-      if (error || !data) {
-        throw new Error(error?.message || 'Download failed.');
-      }
-      const url = URL.createObjectURL(data);
+      const bytes = await apiClient.fetchAuthenticatedPdfBytes(
+        `/api/pdfs/${encodeURIComponent(pdf.id)}/file`
+      );
+      const blob = new Blob([new Uint8Array(bytes)], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `${pdf.customTitle.replace(/[\\/:*?"<>|]/g, '_')}.pdf`;
@@ -405,23 +327,28 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
   };
 
   const handleCacheOfflineCloudPdf = async (pdf: UserPdfRecord) => {
-    if (!supabase) return;
     setOpeningId(pdf.id);
     setErrorMsg(null);
     try {
-      const { data, error } = await supabase.storage.from('user-pdfs').download(pdf.storagePath);
-      if (error || !data) throw new Error(error?.message || 'Unable to cache offline.');
+      const bytes = await apiClient.fetchAuthenticatedPdfBytes(
+        `/api/pdfs/${encodeURIComponent(pdf.id)}/file`
+      );
+      const blob = new Blob([new Uint8Array(bytes)], { type: 'application/pdf' });
       await offlineDb.saveOfflinePdf({
         id: pdf.id,
         title: pdf.customTitle,
+        department: pdf.department,
+        semester: pdf.semester,
         sourceType: 'pdf-blob',
         mimeType: 'application/pdf',
-        sizeBytes: pdf.fileSizeBytes,
-        blob: data,
+        sizeBytes: pdf.fileSizeBytes || bytes.byteLength,
+        blob,
         savedAt: new Date().toISOString(),
       });
       await loadOfflineVault();
-      showToast(bi(language, 'অফলাইন পড়ার জন্য ডিভাইসে সেভ হয়েছে।', 'Saved for offline reading on this device.'));
+      showToast(
+        bi(language, 'অফলাইন পড়ার জন্য ডিভাইসে সেভ হয়েছে।', 'Saved for offline reading on this device.')
+      );
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to save offline copy');
     } finally {
@@ -429,34 +356,32 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     }
   };
 
-  const handleRenameCloudPdf = async (pdf: UserPdfRecord) => {
-    const trimmed = renameValue.trim();
-    if (!supabase || !currentUser || trimmed.length < 2) return;
+  const handleSavePdfEdit = async (pdf: UserPdfRecord) => {
+    const trimmed = editTitle.trim();
+    if (trimmed.length < 2) return;
     try {
-      const { error } = await supabase
-        .from('user_pdfs')
-        .update({ custom_title: trimmed, updated_at: new Date().toISOString() })
-        .eq('id', pdf.id)
-        .eq('user_id', currentUser.id);
-      if (error) throw new Error(error.message);
-      setRenamingId(null);
+      const updatedRes = await apiClient.updatePdfMeta(pdf.id, {
+        customTitle: trimmed,
+        department: editDept,
+        semester: editSem,
+      });
+      void syncPdfMetadataToFirestore(updatedRes.pdf).catch((err) => {
+        console.warn('Firestore PDF edit sync notice:', err instanceof Error ? err.message : err);
+      });
+      setEditingId(null);
       await loadCloudPdfs();
-      showToast(bi(language, 'PDF নাম পরিবর্তন করা হয়েছে।', 'PDF renamed.'));
+      showToast(bi(language, 'PDF তথ্য আপডেট করা হয়েছে।', 'PDF details updated.'));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Rename failed');
     }
   };
 
   const handleDeleteCloudPdf = async (pdf: UserPdfRecord) => {
-    if (!supabase || !currentUser) return;
     try {
-      await supabase.storage.from('user-pdfs').remove([pdf.storagePath]);
-      const { error } = await supabase
-        .from('user_pdfs')
-        .delete()
-        .eq('id', pdf.id)
-        .eq('user_id', currentUser.id);
-      if (error) throw new Error(error.message);
+      await apiClient.deletePdf(pdf.id);
+      void deletePdfMetadataFromFirestore(pdf.id).catch((err) => {
+        console.warn('Firestore PDF delete sync notice:', err instanceof Error ? err.message : err);
+      });
       await offlineDb.deleteOfflinePdf(pdf.id).catch(() => {});
       await Promise.all([loadCloudPdfs(), loadOfflineVault()]);
       showToast(bi(language, 'PDF মুছে ফেলা হয়েছে।', 'PDF deleted permanently.'));
@@ -465,15 +390,49 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     }
   };
 
-  const handleOpenOfflineRecord = (rec: OfflinePdfRecord) => {
+  const handleOpenSharedNote = async (sn: SharedPdfNote) => {
+    if (!sn.pdfUrl) {
+      setErrorMsg(
+        bi(language, 'এই বইয়ের জন্য কোনো PDF লিংক বা ফাইল যুক্ত নেই।', 'No PDF file attached to this book.')
+      );
+      return;
+    }
+    setOpeningId(sn.id);
+    setErrorMsg(null);
+    try {
+      onTrackRecentPdf(sn.id);
+      if (sn.pdfUrl.startsWith('/')) {
+        const bytes = await apiClient.fetchAuthenticatedPdfBytes(sn.pdfUrl);
+        setReaderDoc({
+          title: sn.title,
+          filename: `${sn.title}.pdf`,
+          bytes,
+          canDownload: sn.downloadPermitted,
+        });
+      } else {
+        setReaderDoc({
+          title: sn.title,
+          filename: `${sn.title}.pdf`,
+          url: sn.pdfUrl,
+          canDownload: sn.downloadPermitted,
+        });
+      }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to open PDF book');
+    } finally {
+      setOpeningId(null);
+    }
+  };
+
+  const handleOpenOfflineRecord = async (rec: OfflinePdfRecord) => {
     if (!rec.blob) return;
-    const url = URL.createObjectURL(rec.blob);
+    const bytes = new Uint8Array(await rec.blob.arrayBuffer());
     onTrackRecentPdf(rec.id);
     setReaderDoc({
       title: rec.title,
-      url,
-      isBlobUrl: true,
       filename: `${rec.title}.pdf`,
+      bytes,
+      canDownload: true,
     });
   };
 
@@ -491,12 +450,16 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
 
   const filteredCloudPdfs = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    const list = cloudPdfs.filter(
-      (p) =>
+    const list = cloudPdfs.filter((p) => {
+      const matchText =
         !q ||
         p.customTitle.toLowerCase().includes(q) ||
-        p.originalFilename.toLowerCase().includes(q)
-    );
+        p.originalFilename.toLowerCase().includes(q) ||
+        (p.subjectName || '').toLowerCase().includes(q);
+      const matchDept = filterDept === 'all' || (p.department || 'power') === filterDept;
+      const matchSem = filterSem === 'all' || Number(p.semester || 4) === Number(filterSem);
+      return matchText && matchDept && matchSem;
+    });
     if (sortBy === 'name') {
       return [...list].sort((a, b) => a.customTitle.localeCompare(b.customTitle));
     }
@@ -504,15 +467,33 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
       return [...list].sort((a, b) => b.fileSizeBytes - a.fileSizeBytes);
     }
     return [...list].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  }, [cloudPdfs, searchQuery, sortBy]);
+  }, [cloudPdfs, searchQuery, filterDept, filterSem, sortBy]);
+
+  const filteredSharedBooks = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return sharedNotes.filter((sn) => {
+      const matchText =
+        !q ||
+        sn.title.toLowerCase().includes(q) ||
+        sn.subjectCode.toLowerCase().includes(q) ||
+        sn.summary.toLowerCase().includes(q);
+      const matchDept = filterDept === 'all' || sn.department === filterDept;
+      const matchSem = filterSem === 'all' || sn.semester === Number(filterSem);
+      return matchText && matchDept && matchSem;
+    });
+  }, [sharedNotes, searchQuery, filterDept, filterSem]);
 
   const localOnlyOfflinePdfs = useMemo(() => {
     const cloudIds = new Set(cloudPdfs.map((c) => c.id));
     const q = searchQuery.trim().toLowerCase();
-    return offlinePdfs.filter(
-      (o) => (!cloudIds.has(o.id) || !isOnline) && (!q || o.title.toLowerCase().includes(q))
-    );
-  }, [cloudPdfs, offlinePdfs, isOnline, searchQuery]);
+    return offlinePdfs.filter((o) => {
+      const matchCloud = !cloudIds.has(o.id) || !isOnline;
+      const matchText = !q || o.title.toLowerCase().includes(q);
+      const matchDept = filterDept === 'all' || !o.department || o.department === filterDept;
+      const matchSem = filterSem === 'all' || !o.semester || o.semester === Number(filterSem);
+      return matchCloud && matchText && matchDept && matchSem;
+    });
+  }, [cloudPdfs, offlinePdfs, isOnline, searchQuery, filterDept, filterSem]);
 
   const offlineIdsSet = useMemo(() => new Set(offlinePdfs.map((o) => o.id)), [offlinePdfs]);
 
@@ -524,7 +505,7 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
           <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-cyan-600 dark:text-cyan-400">
             <Lock className="w-3.5 h-3.5" />
             <span>
-              {bi(language, 'ব্যক্তিগত এনক্রিপ্টেড লাইব্রেরি', 'Private Per-User Cloud Library')}
+              {bi(language, 'ব্যক্তিগত ও ডিপার্টমেন্ট PDF লাইব্রেরি', 'Personal & Department PDF Library')}
             </span>
           </div>
           <h1 className="text-xl lg:text-2xl font-bold text-slate-900 dark:text-white mt-0.5">
@@ -533,8 +514,8 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
             {bi(
               language,
-              `ক্লাউড ফাইল: ${toBnDigits(cloudPdfs.length)}টি · অফলাইন কপি: ${toBnDigits(offlinePdfs.length)}টি · সর্বোচ্চ ৫০ MB/ফাইল`,
-              `${cloudPdfs.length} cloud files · ${offlinePdfs.length} offline copies · Max 50 MB per PDF`
+              `ক্লাউড ফাইল: ${toBnDigits(cloudPdfs.length)}টি · পাবলিক বই: ${toBnDigits(sharedNotes.length)}টি · অফলাইন কপি: ${toBnDigits(offlinePdfs.length)}টি`,
+              `${cloudPdfs.length} private cloud PDFs · ${sharedNotes.length} department books · ${offlinePdfs.length} offline copies`
             )}
           </p>
         </div>
@@ -552,22 +533,22 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
         </button>
       </div>
 
-      {/* Supabase Auth / Migration Status Notice */}
-      {!isSupabaseUser && (
+      {/* Sign-in Prompt for Unauthenticated Users */}
+      {!currentUser && (
         <div className="p-4 rounded-2xl bg-cyan-500/8 border border-cyan-500/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="space-y-1">
             <p className="text-sm font-bold text-slate-900 dark:text-white">
               {bi(
                 language,
                 'ব্যক্তিগত ক্লাউড PDF সিঙ্ক চালু করতে সাইন ইন করুন',
-                'Sign in to sync your private PDFs to Supabase Cloud'
+                'Sign in to save & sync your private PDFs across devices'
               )}
             </p>
             <p className="text-xs text-slate-600 dark:text-slate-300">
               {bi(
                 language,
-                'লগইন ছাড়াই আপনি এখন ডিভাইসের অফলাইন ভল্টে PDF সংরক্ষণ ও পড়তে পারবেন। লগইন করলে আপনার PDF গুলো শুধু আপনার অ্যাকাউন্টেই নিরাপদ থাকবে।',
-                'You can store and read PDFs in your device Offline Vault right now, or sign in to save them privately in your Supabase Cloud account.'
+                'লগইন ছাড়াই আপনি ডিপার্টমেন্টের পাবলিক বই পড়তে এবং এই ডিভাইসে অফলাইন PDF সেভ করতে পারবেন।',
+                'You can browse public Department PDF Books and save offline PDFs on this device right now, or sign in for private cloud backup.'
               )}
             </p>
           </div>
@@ -579,20 +560,6 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
             <LogIn className="w-4 h-4" />
             <span>{bi(language, 'সাইন ইন / অ্যাকাউন্ট', 'Sign In')}</span>
           </button>
-        </div>
-      )}
-
-      {migrationMissing && (
-        <div className="p-4 rounded-2xl bg-amber-500/12 border border-amber-500/40 flex items-start gap-3">
-          <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-          <div className="space-y-1 text-xs">
-            <p className="font-bold text-amber-700 dark:text-amber-300">
-              Supabase Database Migration Required
-            </p>
-            <p className="text-slate-700 dark:text-slate-300">
-              Run <code className="font-mono">supabase/migrations/002_polytechnic_hub_v2_upgrade.sql</code> in your Supabase SQL Editor to create the <code className="font-mono">user_pdfs</code> table, <code className="font-mono">user-pdfs</code> storage bucket, and RLS policies.
-            </p>
-          </div>
         </div>
       )}
 
@@ -670,7 +637,7 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
 
             <div>
               <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
-                {bi(language, '২. কাস্টম বই / ডকুমেন্টের নাম দিন', '2. Custom Book / Document Title')}
+                {bi(language, '২. বই / ডকুমেন্টের নাম দিন', '2. Book / Document Title')}
               </label>
               <input
                 type="text"
@@ -685,6 +652,60 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
                 )}
                 className="w-full min-h-[42px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm text-slate-900 dark:text-white"
               />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
+                {bi(language, '৩. ডিপার্টমেন্ট / টেকনোলজি', '3. Department / Technology')}
+              </label>
+              <select
+                value={uploadDept}
+                disabled={uploading}
+                onChange={(e) => setUploadDept(e.target.value)}
+                className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm"
+              >
+                <option value="common">
+                  {bi(language, 'সকল ডিপার্টমেন্ট (Common)', 'All Departments (Common)')}
+                </option>
+                {DEPARTMENTS.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {language === 'en' ? `${d.shortName} — ${d.nameEn}` : `${d.shortName} — ${d.nameBn}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
+                  {bi(language, '৪. সেমিস্টার', '4. Semester')}
+                </label>
+                <select
+                  value={uploadSem}
+                  disabled={uploading}
+                  onChange={(e) => setUploadSem(Number(e.target.value))}
+                  className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm"
+                >
+                  {([1, 2, 3, 4, 5, 6, 7, 8] as SemesterNumber[]).map((s) => (
+                    <option key={s} value={s}>
+                      {language === 'en' ? SEMESTER_LABELS_EN[s] : SEMESTER_LABELS[s]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
+                  {bi(language, 'বিষয়ের নাম (ঐচ্ছিক)', 'Subject (Optional)')}
+                </label>
+                <input
+                  type="text"
+                  disabled={uploading}
+                  value={uploadSubject}
+                  onChange={(e) => setUploadSubject(e.target.value)}
+                  placeholder="67141 / Math-2"
+                  className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm"
+                />
+              </div>
             </div>
           </div>
 
@@ -732,35 +753,133 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
         </form>
       )}
 
-      {/* Search & Sort */}
-      <div className="flex flex-col sm:flex-row gap-3">
-        <div className="relative flex-1">
+      {/* Search & Department/Semester Filter Bar */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-2.5">
+        <div className="relative lg:col-span-5">
           <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
           <input
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder={bi(language, 'আপনার PDF খুঁজুন...', 'Search your uploaded PDFs...')}
+            placeholder={bi(language, 'বই বা PDF খুঁজুন...', 'Search books, titles, or subject codes...')}
             className="w-full min-h-[42px] pl-10 pr-3.5 py-2 rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-sm"
           />
         </div>
+
+        <div className="lg:col-span-3 relative">
+          <Filter className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <select
+            value={filterDept}
+            onChange={(e) => setFilterDept(e.target.value)}
+            className="w-full min-h-[42px] pl-8 pr-3 py-2 rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-xs font-semibold"
+          >
+            <option value="all">{bi(language, 'সকল ডিপার্টমেন্ট', 'All Departments')}</option>
+            <option value="common">{bi(language, 'কমন বিষয়', 'Common Subjects')}</option>
+            {DEPARTMENTS.map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.shortName} · {language === 'en' ? d.nameEn : d.nameBn}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <select
+          value={filterSem}
+          onChange={(e) => setFilterSem(e.target.value)}
+          className="lg:col-span-2 min-h-[42px] px-3 py-2 rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-xs font-semibold"
+        >
+          <option value="all">{bi(language, 'সকল সেমিস্টার', 'All Semesters')}</option>
+          {([1, 2, 3, 4, 5, 6, 7, 8] as SemesterNumber[]).map((s) => (
+            <option key={s} value={String(s)}>
+              {language === 'en' ? SEMESTER_LABELS_EN[s] : SEMESTER_LABELS[s]}
+            </option>
+          ))}
+        </select>
+
         <select
           value={sortBy}
           onChange={(e) => setSortBy(e.target.value as 'newest' | 'name' | 'size')}
-          className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-xs font-semibold"
+          className="lg:col-span-2 min-h-[42px] px-3 py-2 rounded-xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-xs font-semibold"
         >
           <option value="newest">{bi(language, 'সর্বশেষ আপলোড', 'Newest First')}</option>
-          <option value="name">{bi(language, 'নাম অনুযায়ী (A-Z)', 'Title (A-Z)')}</option>
-          <option value="size">{bi(language, 'ফাইল সাইজ অনুযায়ী', 'Largest First')}</option>
+          <option value="name">{bi(language, 'নাম (A-Z)', 'Title (A-Z)')}</option>
+          <option value="size">{bi(language, 'ফাইল সাইজ', 'Largest First')}</option>
         </select>
       </div>
 
+      {/* Department & Admin PDF Books Section */}
+      {filteredSharedBooks.length > 0 && (
+        <section className="space-y-3">
+          <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+            <BookOpen className="w-4 h-4 text-cyan-500" />
+            <span>
+              {bi(language, 'ডিপার্টমেন্ট ও অ্যাডমিন PDF বইসমূহ', 'Department & Curated PDF Books')}
+            </span>
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredSharedBooks.map((sn) => {
+              const dept = DEPARTMENTS.find((d) => d.id === sn.department);
+              return (
+                <article
+                  key={sn.id}
+                  className="p-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 flex flex-col justify-between gap-3"
+                >
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-2 text-[11px] font-mono text-cyan-600 dark:text-cyan-400">
+                      <span>
+                        {dept?.shortName || sn.department.toUpperCase()} · Sem {sn.semester}
+                      </span>
+                      {sn.subjectCode && <span>#{sn.subjectCode}</span>}
+                    </div>
+                    <h3 className="text-base font-bold text-slate-900 dark:text-white leading-snug line-clamp-2">
+                      {sn.title}
+                    </h3>
+                    {sn.summary && (
+                      <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-2">
+                        {sn.summary}
+                      </p>
+                    )}
+                  </div>
+                  <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={openingId === sn.id || !sn.pdfUrl}
+                      onClick={() => void handleOpenSharedNote(sn)}
+                      className="flex-1 min-h-[38px] inline-flex items-center justify-center gap-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold disabled:opacity-50"
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                      <span>
+                        {openingId === sn.id
+                          ? bi(language, 'খুলছে...', 'Opening...')
+                          : bi(language, 'অ্যাপে পড়ুন', 'Read In-App')}
+                      </span>
+                    </button>
+                    {sn.downloadPermitted && sn.pdfUrl && (
+                      <a
+                        href={sn.pdfUrl}
+                        download={`${sn.title}.pdf`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        title={bi(language, 'ডাউনলোড', 'Download')}
+                      >
+                        <Download className="w-4 h-4" />
+                      </a>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
       {/* Private Cloud PDFs Grid */}
-      {isSupabaseUser && (
+      {currentUser && (
         <section className="space-y-3">
           <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
             <FileText className="w-4 h-4 text-cyan-500" />
-            <span>{bi(language, 'আমার ক্লাউড PDF সমূহ', 'My Cloud PDFs')}</span>
+            <span>{bi(language, 'আমার ব্যক্তিগত ক্লাউড PDF', 'My Private Cloud PDFs')}</span>
           </h2>
 
           {loadingList ? (
@@ -771,8 +890,8 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
             <div className="p-8 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-center space-y-3">
               <FileText className="w-9 h-9 text-slate-400 mx-auto" />
               <p className="text-sm text-slate-600 dark:text-slate-300">
-                {searchQuery
-                  ? bi(language, 'খোঁজা নাম অনুযায়ী কোনো PDF পাওয়া যায়নি।', 'No PDFs matched your search.')
+                {searchQuery || filterDept !== 'all' || filterSem !== 'all'
+                  ? bi(language, 'ফিল্টার অনুযায়ী কোনো PDF পাওয়া যায়নি।', 'No PDFs matched your filter.')
                   : bi(
                       language,
                       'আপনার ব্যক্তিগত লাইব্রেরিতে এখনো কোনো PDF আপলোড করা হয়নি।',
@@ -793,8 +912,11 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {filteredCloudPdfs.map((pdf) => {
-                const isRenaming = renamingId === pdf.id;
+                const isEditing = editingId === pdf.id;
                 const isCachedOffline = offlineIdsSet.has(pdf.id);
+                const deptLabel =
+                  DEPARTMENTS.find((d) => d.id === pdf.department)?.shortName ||
+                  (pdf.department || 'Common').toUpperCase();
                 return (
                   <article
                     key={pdf.id}
@@ -805,33 +927,65 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
                         <div className="w-10 h-10 rounded-xl bg-cyan-500/12 text-cyan-600 dark:text-cyan-400 flex items-center justify-center shrink-0">
                           <FileText className="w-5 h-5" />
                         </div>
-                        <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
-                          {formatBytes(pdf.fileSizeBytes)} · {formatDateBn(pdf.createdAt)}
-                        </span>
+                        <div className="text-right">
+                          <p className="text-[11px] font-mono text-cyan-600 dark:text-cyan-400">
+                            {deptLabel} · Sem {pdf.semester || 4}
+                          </p>
+                          <p className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                            {formatBytes(pdf.fileSizeBytes)} · {formatDateBn(pdf.createdAt)}
+                          </p>
+                        </div>
                       </div>
 
-                      {isRenaming ? (
-                        <div className="flex items-center gap-1.5 pt-1">
+                      {isEditing ? (
+                        <div className="space-y-2 pt-1">
                           <input
                             type="text"
-                            value={renameValue}
-                            onChange={(e) => setRenameValue(e.target.value)}
-                            className="flex-1 min-h-[36px] px-2.5 rounded-lg bg-slate-50 dark:bg-slate-900 border border-cyan-500 text-xs"
+                            value={editTitle}
+                            onChange={(e) => setEditTitle(e.target.value)}
+                            className="w-full min-h-[36px] px-2.5 rounded-lg bg-slate-50 dark:bg-slate-900 border border-cyan-500 text-xs"
                           />
-                          <button
-                            type="button"
-                            onClick={() => void handleRenameCloudPdf(pdf)}
-                            className="min-h-[36px] px-2.5 rounded-lg bg-cyan-600 text-white text-xs font-semibold"
-                          >
-                            Save
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setRenamingId(null)}
-                            className="min-h-[36px] px-2 rounded-lg text-slate-400"
-                          >
-                            <X className="w-4 h-4" />
-                          </button>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            <select
+                              value={editDept}
+                              onChange={(e) => setEditDept(e.target.value)}
+                              className="min-h-[34px] px-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs"
+                            >
+                              <option value="common">Common</option>
+                              {DEPARTMENTS.map((d) => (
+                                <option key={d.id} value={d.id}>
+                                  {d.shortName}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              value={editSem}
+                              onChange={(e) => setEditSem(Number(e.target.value))}
+                              className="min-h-[34px] px-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs"
+                            >
+                              {[1, 2, 3, 4, 5, 6, 7, 8].map((s) => (
+                                <option key={s} value={s}>
+                                  Sem {s}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => void handleSavePdfEdit(pdf)}
+                              className="flex-1 min-h-[34px] px-2.5 rounded-lg bg-cyan-600 text-white text-xs font-semibold"
+                            >
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingId(null)}
+                              className="min-h-[34px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs text-slate-500"
+                            >
+                              Cancel
+                            </button>
+                          </div>
                         </div>
                       ) : (
                         <h3 className="text-base font-bold text-slate-900 dark:text-white leading-snug line-clamp-2">
@@ -840,6 +994,7 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
                       )}
 
                       <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                        {pdf.subjectName ? `${pdf.subjectName} · ` : ''}
                         {pdf.originalFilename}
                         {isCachedOffline ? ' · Offline Ready' : ''}
                       </p>
@@ -885,11 +1040,13 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
                       <button
                         type="button"
                         onClick={() => {
-                          setRenamingId(pdf.id);
-                          setRenameValue(pdf.customTitle);
+                          setEditingId(pdf.id);
+                          setEditTitle(pdf.customTitle);
+                          setEditDept(pdf.department || defaultDepartment);
+                          setEditSem(pdf.semester || defaultSemester);
                         }}
-                        aria-label="Rename PDF"
-                        title={bi(language, 'নাম পরিবর্তন', 'Rename')}
+                        aria-label="Edit PDF details"
+                        title={bi(language, 'তথ্য ও নাম পরিবর্তন', 'Rename & Edit')}
                         className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
                       >
                         <Edit3 className="w-4 h-4" />
@@ -949,7 +1106,7 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
                   <button
                     type="button"
                     disabled={!rec.blob}
-                    onClick={() => handleOpenOfflineRecord(rec)}
+                    onClick={() => void handleOpenOfflineRecord(rec)}
                     className="flex-1 min-h-[38px] inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-50"
                   >
                     <Eye className="w-3.5 h-3.5" />
@@ -979,51 +1136,13 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
         )}
       </section>
 
-      {/* In-App PDF Reader Modal */}
+      {/* Canvas-Based PDF.js In-App Reader Modal */}
       {readerDoc && (
-        <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4"
-          onClick={() => setReaderDoc(null)}
-        >
-          <div
-            className="w-full max-w-5xl h-[90vh] rounded-2xl bg-white dark:bg-[#0D1426] border border-slate-200 dark:border-slate-800 flex flex-col overflow-hidden"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3 shrink-0">
-              <div className="min-w-0">
-                <p className="text-sm font-bold text-slate-900 dark:text-white truncate">
-                  {readerDoc.title}
-                </p>
-                <p className="text-[11px] text-slate-500 truncate">{readerDoc.filename}</p>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <a
-                  href={readerDoc.url}
-                  download={readerDoc.filename}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>{bi(language, 'ডাউনলোড', 'Download')}</span>
-                </a>
-                <button
-                  type="button"
-                  onClick={() => setReaderDoc(null)}
-                  aria-label="Close reader"
-                  className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-slate-900 dark:hover:text-white"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-            <iframe
-              src={readerDoc.url}
-              title={readerDoc.title}
-              className="flex-1 w-full bg-slate-950"
-            />
-          </div>
-        </div>
+        <PdfReaderModal
+          doc={readerDoc}
+          language={language}
+          onClose={() => setReaderDoc(null)}
+        />
       )}
     </div>
   );

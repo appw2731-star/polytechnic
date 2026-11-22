@@ -13,7 +13,15 @@ export default defineConfig(() => {
       VitePWA({
         registerType: 'prompt',
         injectRegister: 'auto',
-        includeAssets: ['favicon.svg', 'icon.svg', 'apple-touch-icon.png'],
+        includeAssets: [
+          'favicon.svg',
+          'icon.svg',
+          'apple-touch-icon.png',
+          'sw-push.js',
+          'sounds/polytechnic-chime.wav',
+          'sounds/polytechnic-alert.wav',
+          'sounds/polytechnic-soft.wav',
+        ],
         manifest: {
           id: '/',
           name: 'Polytechnic Hub — Learn • Practice • Achieve',
@@ -50,7 +58,8 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2,jpg}'],
+          importScripts: ['/sw-push.js'],
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2,jpg,wav}'],
           maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
           cleanupOutdatedCaches: true,
           clientsClaim: true,

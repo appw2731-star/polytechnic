@@ -10,11 +10,18 @@
         { "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" },
         { "key": "Service-Worker-Allowed", "value": "/" }
       ]
+    },
+    {
+      "source": "/sw-push.js",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" },
+        { "key": "Service-Worker-Allowed", "value": "/" }
+      ]
     }
   ],
   "rewrites": [
     {
-      "source": "/((?!api/|assets/|sw\\.js|manifest\\.webmanifest|pwa-.*|favicon\\.svg|icon\\.svg|apple-touch-icon\\.png).*)",
+      "source": "/((?!api/|assets/|sounds/|sw\\.js|sw-push\\.js|manifest\\.webmanifest|pwa-.*|favicon\\.svg|icon\\.svg|apple-touch-icon\\.png).*)",
       "destination": "/index.html"
     }
   ]

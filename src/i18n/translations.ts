@@ -11,6 +11,12 @@ export const VIEW_TITLES: Record<string, { bn: string; en: string; subBn: string
     subBn: 'আজকের পড়াশোনা, ব্যক্তিগত PDF, ফর্মুলা ও বোর্ড আপডেট',
     subEn: 'Daily study progress, personal PDFs, formulas & notices',
   },
+  notifications: {
+    bn: 'নোটিফিকেশন সেন্টার',
+    en: 'Notification Center',
+    subBn: 'পুশ নোটিফিকেশন ইনবক্স, সাউন্ড ও ক্যাটাগরি প্রেফারেন্স',
+    subEn: 'Push notification inbox, sound settings & category preferences',
+  },
   'pdf-library': {
     bn: 'আমার PDF লাইব্রেরি',
     en: 'My PDF Library',

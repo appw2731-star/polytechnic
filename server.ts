@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'crypto';
+import fs from 'fs';
 import http from 'http';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import path from 'path';
@@ -14,14 +15,23 @@ import {
   verifyPassword,
   type DbAiConfig,
   type DbCommunityPost,
+  type DbDeviceToken,
   type DbFormulaItem,
   type DbMcq,
   type DbNotice,
+  type DbNotificationCampaign,
+  type DbNotificationPreference,
+  type DbScheduledNotification,
   type DbSharedNote,
   type DbUser,
+  type DbUserNotification,
   type PublicUser,
+  type PushAudienceType,
+  type PushCategory,
+  type PushSoundMode,
   type UserRole,
 } from './server/database.ts';
+import { dispatchFcmMessage, isFcmAdminConfigured } from './server/fcmAdmin.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +42,42 @@ const SERVER_STARTED_AT = Date.now();
 
 const SUPABASE_URL = (process.env.VITE_SUPABASE_URL || '').trim().replace(/\/+$/, '');
 const SUPABASE_ANON_KEY = (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const FIREBASE_APPLET_CONFIG = (() => {
+  try {
+    const cfgPath = path.resolve(__dirname, 'firebase-applet-config.json');
+    if (fs.existsSync(cfgPath)) {
+      return JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as {
+        projectId?: string;
+        apiKey?: string;
+      };
+    }
+  } catch {
+    // ignore invalid config json
+  }
+  return {};
+})();
+const FIREBASE_PROJECT_ID = (() => {
+  const direct = (process.env.VITE_FIREBASE_PROJECT_ID || process.env.FIREBASE_PROJECT_ID || '').trim();
+  if (direct) return direct;
+  if (FIREBASE_APPLET_CONFIG.projectId) {
+    return String(FIREBASE_APPLET_CONFIG.projectId).trim();
+  }
+  try {
+    const rawSa = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+    if (rawSa) {
+      const parsed = JSON.parse(rawSa) as { project_id?: string };
+      return String(parsed.project_id || '').trim();
+    }
+  } catch {
+    // ignore malformed json
+  }
+  return '';
+})();
+const FIREBASE_API_KEY =
+  (process.env.VITE_FIREBASE_API_KEY || '').trim() ||
+  String(FIREBASE_APPLET_CONFIG.apiKey || '').trim();
+const PDF_FILES_DIR = path.resolve(__dirname, '.data', 'pdfs');
 
 type AiMode = 'general' | 'explain' | 'math' | 'power' | 'recommend';
 type LanguageCode = 'bn' | 'en';
@@ -218,6 +264,111 @@ async function verifySupabaseToken(token: string): Promise<PublicUser | null> {
   }
 }
 
+let cachedFirebaseCerts: { certs: Record<string, string>; expiresAtMs: number } | null = null;
+
+async function getFirebasePublicCerts(): Promise<Record<string, string>> {
+  if (cachedFirebaseCerts && Date.now() < cachedFirebaseCerts.expiresAtMs) {
+    return cachedFirebaseCerts.certs;
+  }
+  const resp = await fetch(
+    'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com'
+  );
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch Firebase public keys (${resp.status})`);
+  }
+  const cacheControl = resp.headers.get('cache-control') || '';
+  const maxAgeMatch = cacheControl.match(/max-age=(\d+)/i);
+  const ttlSec = maxAgeMatch ? Math.max(60, Number(maxAgeMatch[1])) : 3600;
+  const certs = (await resp.json()) as Record<string, string>;
+  cachedFirebaseCerts = {
+    certs,
+    expiresAtMs: Date.now() + ttlSec * 1000,
+  };
+  return certs;
+}
+
+interface VerifiedFirebaseClaims {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  name: string;
+  picture: string;
+}
+
+async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFirebaseClaims | null> {
+  if (!FIREBASE_PROJECT_ID) {
+    throw new Error(
+      'Server VITE_FIREBASE_PROJECT_ID (or FIREBASE_PROJECT_ID) is not configured for Firebase token verification.'
+    );
+  }
+  const parts = idToken.split('.');
+  if (parts.length !== 3) return null;
+  const [headerB64, payloadB64, sigB64] = parts;
+  let header: { alg?: string; kid?: string };
+  let payload: Record<string, unknown>;
+  try {
+    header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8')) as {
+      alg?: string;
+      kid?: string;
+    };
+    payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return null;
+  }
+
+  if (header.alg !== 'RS256' || !header.kid) {
+    return null;
+  }
+
+  const certs = await getFirebasePublicCerts();
+  const certPem = certs[header.kid];
+  if (!certPem) {
+    return null;
+  }
+
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${headerB64}.${payloadB64}`);
+  verifier.end();
+  const isValidSig = verifier.verify(certPem, Buffer.from(sigB64, 'base64url'));
+  if (!isValidSig) {
+    return null;
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const exp = Number(payload.exp || 0);
+  const iat = Number(payload.iat || 0);
+  const aud = String(payload.aud || '');
+  const iss = String(payload.iss || '');
+  const sub = String(payload.sub || '');
+
+  if (!sub || sub.length > 128) return null;
+  if (aud !== FIREBASE_PROJECT_ID) return null;
+  if (iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) return null;
+  if (exp <= nowSec || iat > nowSec + 300) return null;
+
+  return {
+    uid: sub,
+    email: String(payload.email || '').trim().toLowerCase(),
+    emailVerified: Boolean(payload.email_verified),
+    name: String(payload.name || ''),
+    picture: String(payload.picture || ''),
+  };
+}
+
+function deterministicUuidFromFirebaseUid(uid: string): string {
+  const hash = crypto.createHash('sha256').update(`polytechnic-hub-firebase:${uid}`).digest('hex');
+  const p1 = hash.slice(0, 8);
+  const p2 = hash.slice(8, 12);
+  const p3 = `5${hash.slice(13, 16)}`;
+  const variantNibble = ['8', '9', 'a', 'b'][parseInt(hash[16], 16) % 4];
+  const p4 = `${variantNibble}${hash.slice(17, 20)}`;
+  const p5 = hash.slice(20, 32);
+  return `${p1}-${p2}-${p3}-${p4}-${p5}`;
+}
+
 async function resolveBearerUser(
   req: Request
 ): Promise<{ user: PublicUser; supabaseAccessToken?: string } | null> {
@@ -232,7 +383,7 @@ async function resolveBearerUser(
   if (localPayload) {
     const db = dbStore.load();
     const localUser = db.users.find((u) => u.id === localPayload.sub);
-    if (localUser) {
+    if (localUser && !localUser.isDisabled) {
       return { user: toPublicUser(localUser) };
     }
   }
@@ -328,6 +479,8 @@ async function createServer() {
         process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
       ),
       supabaseConfigured: Boolean(SUPABASE_URL && SUPABASE_ANON_KEY),
+      firebaseAuthConfigured: Boolean(FIREBASE_PROJECT_ID && FIREBASE_API_KEY),
+      fcmConfigured: isFcmAdminConfigured(),
       timestamp: new Date().toISOString(),
     });
   });
@@ -434,10 +587,239 @@ async function createServer() {
       res.status(401).json({ error: 'ইমেইল অথবা পাসওয়ার্ড সঠিক নয়।' });
       return;
     }
+    if (user.isDisabled) {
+      res.status(403).json({ error: 'এই অ্যাকাউন্টটি অ্যাডমিন কর্তৃক সাময়িকভাবে স্থগিত করা হয়েছে।' });
+      return;
+    }
     const token = signAuthToken(user);
     res.json({
       token,
       user: toPublicUser(user),
+    });
+  });
+
+  // Unified Firebase Authentication -> Canonical Profile & Supabase Sync
+  app.post('/api/auth/firebase-sync', async (req: Request, res: Response) => {
+    const { idToken, fullName, department, semester, collegeName, rollNumber } = req.body ?? {};
+    if (typeof idToken !== 'string' || idToken.trim().length < 20) {
+      res.status(400).json({ error: 'Valid Firebase ID token is required.' });
+      return;
+    }
+
+    let claims: VerifiedFirebaseClaims | null = null;
+    try {
+      claims = await verifyFirebaseIdToken(idToken.trim());
+    } catch (err) {
+      res.status(503).json({
+        error: err instanceof Error ? err.message : 'Firebase token verification failed.',
+      });
+      return;
+    }
+
+    if (!claims || !claims.email) {
+      res.status(401).json({ error: 'Invalid or expired Firebase session. Please sign in again.' });
+      return;
+    }
+
+    const normalizedEmail = claims.email;
+    const adminEnvEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+    const now = new Date().toISOString();
+
+    let supabaseProfile: Record<string, unknown> | null = null;
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        const headers = {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        };
+        const byUidRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/profiles?firebase_uid=eq.${encodeURIComponent(claims.uid)}&select=*`,
+          { headers }
+        );
+        if (byUidRes.ok) {
+          const rows = (await byUidRes.json()) as Record<string, unknown>[];
+          if (rows[0]) supabaseProfile = rows[0];
+        }
+        if (!supabaseProfile) {
+          const byEmailRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/profiles?email=eq.${encodeURIComponent(normalizedEmail)}&select=*`,
+            { headers }
+          );
+          if (byEmailRes.ok) {
+            const rows = (await byEmailRes.json()) as Record<string, unknown>[];
+            if (rows[0]) supabaseProfile = rows[0];
+          }
+        }
+      } catch {
+        // fallback cleanly to local profile store
+      }
+    }
+
+    let syncedUser: DbUser | null = null;
+    let disabledAccount = false;
+
+    dbStore.mutate((draft) => {
+      let existing =
+        draft.users.find((u) => u.firebaseUid === claims!.uid) ??
+        draft.users.find((u) => u.email.toLowerCase() === normalizedEmail);
+
+      if (existing?.isDisabled || supabaseProfile?.is_disabled === true) {
+        disabledAccount = true;
+        return;
+      }
+
+      const canonicalId = String(
+        supabaseProfile?.id || existing?.id || deterministicUuidFromFirebaseUid(claims!.uid)
+      );
+      const resolvedRole: UserRole =
+        adminEnvEmail && normalizedEmail === adminEnvEmail
+          ? 'admin'
+          : supabaseProfile?.role === 'admin' || existing?.role === 'admin'
+            ? 'admin'
+            : 'student';
+
+      const cleanDisplayName =
+        (typeof fullName === 'string' && fullName.trim()) ||
+        (supabaseProfile?.full_name ? String(supabaseProfile.full_name) : '') ||
+        existing?.fullName ||
+        claims!.name ||
+        normalizedEmail.split('@')[0];
+
+      const cleanAvatar =
+        (supabaseProfile?.avatar_url ? String(supabaseProfile.avatar_url) : '') ||
+        existing?.avatarUrl ||
+        claims!.picture ||
+        '';
+
+      const cleanDept =
+        (typeof department === 'string' && department.trim()) ||
+        (supabaseProfile?.department ? String(supabaseProfile.department) : '') ||
+        existing?.department ||
+        'power';
+
+      const cleanSem = Math.min(
+        8,
+        Math.max(
+          1,
+          Number(semester || supabaseProfile?.semester || existing?.semester || 4) || 4
+        )
+      );
+
+      const cleanCollege =
+        (typeof collegeName === 'string' && collegeName.trim()) ||
+        (supabaseProfile?.college_name ? String(supabaseProfile.college_name) : '') ||
+        existing?.collegeName ||
+        '';
+
+      const cleanRoll =
+        (typeof rollNumber === 'string' && rollNumber.trim()) ||
+        (supabaseProfile?.roll_number ? String(supabaseProfile.roll_number) : '') ||
+        existing?.rollNumber ||
+        '';
+
+      if (existing) {
+        existing.id = canonicalId;
+        existing.firebaseUid = claims!.uid;
+        existing.fullName = cleanDisplayName;
+        existing.role = resolvedRole;
+        if (!existing.avatarUrl && cleanAvatar) existing.avatarUrl = cleanAvatar;
+        if (!existing.collegeName && cleanCollege) {
+          existing.collegeName = cleanCollege;
+          existing.instituteName = cleanCollege;
+        }
+        if (!existing.rollNumber && cleanRoll) existing.rollNumber = cleanRoll;
+        existing.updatedAt = now;
+        syncedUser = existing;
+      } else {
+        const created: DbUser = {
+          id: canonicalId,
+          firebaseUid: claims!.uid,
+          fullName: cleanDisplayName,
+          email: normalizedEmail,
+          passwordHash: '',
+          role: resolvedRole,
+          avatarUrl: cleanAvatar,
+          gender: (supabaseProfile?.gender === 'male' || supabaseProfile?.gender === 'female'
+            ? supabaseProfile.gender
+            : '') as '' | 'male' | 'female',
+          showGender: Boolean(supabaseProfile?.show_gender),
+          bio: String(supabaseProfile?.bio || ''),
+          department: cleanDept,
+          semester: cleanSem,
+          collegeName: cleanCollege,
+          instituteName: cleanCollege,
+          rollNumber: cleanRoll,
+          profileVisibility:
+            supabaseProfile?.profile_visibility === 'public' ||
+            supabaseProfile?.profile_visibility === 'private'
+              ? supabaseProfile.profile_visibility
+              : 'department',
+          isDisabled: false,
+          createdAt: String(supabaseProfile?.created_at || now),
+          updatedAt: now,
+        };
+        draft.users.push(created);
+        syncedUser = created;
+      }
+    });
+
+    if (disabledAccount) {
+      res.status(403).json({
+        error: 'This account has been disabled by an administrator.',
+      });
+      return;
+    }
+
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && syncedUser) {
+      try {
+        const u = syncedUser as DbUser;
+        const upsertPayload: Record<string, unknown> = {
+          id: u.id,
+          firebase_uid: claims.uid,
+          full_name: u.fullName,
+          email: u.email,
+          role: u.role,
+          avatar_url: u.avatarUrl,
+          department: u.department,
+          semester: u.semester,
+          college_name: u.collegeName,
+          institute_name: u.instituteName,
+          roll_number: u.rollNumber,
+          updated_at: now,
+        };
+        const upsertRes = await fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=id`, {
+          method: 'POST',
+          headers: {
+            apikey: SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'resolution=merge-duplicates',
+          },
+          body: JSON.stringify(upsertPayload),
+        });
+        if (!upsertRes.ok) {
+          // Retry without firebase_uid if migration 004 hasn't been applied yet
+          delete upsertPayload.firebase_uid;
+          await fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=id`, {
+            method: 'POST',
+            headers: {
+              apikey: SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'resolution=merge-duplicates',
+            },
+            body: JSON.stringify(upsertPayload),
+          }).catch(() => {});
+        }
+      } catch {
+        // non-blocking fallback to local dbStore
+      }
+    }
+
+    const token = signAuthToken(syncedUser!);
+    res.json({
+      token,
+      user: toPublicUser(syncedUser!),
     });
   });
 
@@ -974,15 +1356,15 @@ async function createServer() {
       subjectCode = '',
       summary = '',
       pdfUrl = '',
-      downloadPermitted = false,
+      downloadPermitted = true,
     } = req.body ?? {};
-    if (!title) {
-      res.status(400).json({ error: 'Title is required.' });
+    if (!title || typeof title !== 'string' || title.trim().length < 2) {
+      res.status(400).json({ error: 'Book/Note title is required.' });
       return;
     }
     const sharedNote: DbSharedNote = {
       id: `snote-${crypto.randomUUID()}`,
-      title: String(title).trim(),
+      title: title.trim(),
       department: String(department),
       semester: Math.min(8, Math.max(1, Number(semester) || 4)),
       subjectCode: String(subjectCode).trim(),
@@ -997,10 +1379,471 @@ async function createServer() {
     res.status(201).json({ sharedNote });
   });
 
+  app.post(
+    '/api/admin/shared-notes/upload',
+    requireAuth,
+    requireAdmin,
+    express.raw({ type: 'application/pdf', limit: '52mb' }),
+    (req: Request, res: Response) => {
+      const fileBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (fileBuffer.length < 16 || fileBuffer.length > 50 * 1024 * 1024) {
+        res.status(400).json({ error: 'PDF file must be between 16 bytes and 50 MB.' });
+        return;
+      }
+      if (fileBuffer.subarray(0, 5).toString('ascii') !== '%PDF-') {
+        res.status(400).json({ error: 'Invalid PDF signature (%PDF- header missing).' });
+        return;
+      }
+
+      let meta: Record<string, unknown> = {};
+      try {
+        const rawMeta = String(req.headers['x-pdf-meta'] || '');
+        if (rawMeta) {
+          meta = JSON.parse(decodeURIComponent(rawMeta)) as Record<string, unknown>;
+        }
+      } catch {
+        // ignore invalid metadata header
+      }
+
+      const title = String(meta.title || 'Department PDF Book').trim();
+      const department = String(meta.department || 'power').trim();
+      const semester = Math.min(8, Math.max(1, Number(meta.semester) || 4));
+      const subjectCode = String(meta.subjectCode || '').trim();
+      const summary = String(meta.summary || '').trim();
+      const downloadPermitted = meta.downloadPermitted !== false;
+
+      const id = `snote-${crypto.randomUUID()}`;
+      const catalogDir = path.join(PDF_FILES_DIR, 'catalog');
+      fs.mkdirSync(catalogDir, { recursive: true });
+      const storagePath = `catalog/${id}.pdf`;
+      fs.writeFileSync(path.join(PDF_FILES_DIR, storagePath), fileBuffer);
+
+      const sharedNote: DbSharedNote = {
+        id,
+        title,
+        department,
+        semester,
+        subjectCode,
+        summary,
+        pdfUrl: `/api/catalog-pdfs/${encodeURIComponent(id)}/file`,
+        storagePath,
+        fileSizeBytes: fileBuffer.length,
+        downloadPermitted,
+        createdAt: new Date().toISOString(),
+      };
+
+      dbStore.mutate((draft) => {
+        draft.sharedNotes.unshift(sharedNote);
+      });
+
+      res.status(201).json({ sharedNote });
+    }
+  );
+
+  app.patch('/api/admin/shared-notes/:id', requireAuth, requireAdmin, (req: Request, res: Response) => {
+    const { title, department, semester, subjectCode, summary, pdfUrl, downloadPermitted } =
+      req.body ?? {};
+    const updated = dbStore.mutate((draft) => {
+      const target = draft.sharedNotes.find((s) => s.id === req.params.id);
+      if (!target) return null;
+      if (typeof title === 'string' && title.trim().length >= 2) target.title = title.trim();
+      if (typeof department === 'string' && department.trim()) target.department = department.trim();
+      if (semester !== undefined) {
+        target.semester = Math.min(8, Math.max(1, Number(semester) || target.semester));
+      }
+      if (typeof subjectCode === 'string') target.subjectCode = subjectCode.trim();
+      if (typeof summary === 'string') target.summary = summary.trim();
+      if (typeof pdfUrl === 'string' && pdfUrl.trim()) target.pdfUrl = pdfUrl.trim();
+      if (typeof downloadPermitted === 'boolean') target.downloadPermitted = downloadPermitted;
+      return target;
+    });
+    if (!updated) {
+      res.status(404).json({ error: 'PDF Book / Note not found.' });
+      return;
+    }
+    res.json({ sharedNote: updated });
+  });
+
+  app.get('/api/catalog-pdfs/:id/file', (req: Request, res: Response) => {
+    const db = dbStore.load();
+    const note = db.sharedNotes.find((s) => s.id === req.params.id);
+    if (!note || !note.storagePath) {
+      res.status(404).json({ error: 'Catalog PDF file not found.' });
+      return;
+    }
+    const fullPath = path.resolve(PDF_FILES_DIR, note.storagePath);
+    if (!fullPath.startsWith(PDF_FILES_DIR) || !fs.existsSync(fullPath)) {
+      res.status(404).json({ error: 'PDF binary missing on server.' });
+      return;
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${note.id}.pdf"`);
+    res.sendFile(fullPath);
+  });
+
   app.delete('/api/admin/shared-notes/:id', requireAuth, requireAdmin, (req: Request, res: Response) => {
+    let removedPath: string | undefined;
     dbStore.mutate((draft) => {
+      const target = draft.sharedNotes.find((s) => s.id === req.params.id);
+      removedPath = target?.storagePath;
       draft.sharedNotes = draft.sharedNotes.filter((s) => s.id !== req.params.id);
     });
+    if (removedPath) {
+      const fullPath = path.resolve(PDF_FILES_DIR, removedPath);
+      if (fullPath.startsWith(PDF_FILES_DIR) && fs.existsSync(fullPath)) {
+        fs.unlinkSync(fullPath);
+      }
+    }
+    res.json({ deleted: true });
+  });
+
+  // =========================================================================
+  // PERSONAL & CLOUD PDF LIBRARY ROUTES (Unified for Firebase & Local Auth)
+  // =========================================================================
+  app.get('/api/pdfs', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const db = dbStore.load();
+    const mergedMap = new Map<string, typeof db.userPdfs[number] & { sourceBackend?: 'supabase' | 'server' }>();
+
+    for (const p of db.userPdfs) {
+      if (p.userId === auth.id) {
+        mergedMap.set(p.id, { ...p, sourceBackend: 'server' });
+      }
+    }
+
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        const sbRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/user_pdfs?user_id=eq.${encodeURIComponent(auth.id)}&order=created_at.desc`,
+          {
+            headers: {
+              apikey: SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            },
+          }
+        );
+        if (sbRes.ok) {
+          const rows = (await sbRes.json()) as Record<string, unknown>[];
+          for (const row of rows) {
+            const id = String(row.id);
+            if (!mergedMap.has(id)) {
+              mergedMap.set(id, {
+                id,
+                userId: String(row.user_id),
+                customTitle: String(row.custom_title),
+                originalFilename: String(row.original_filename),
+                storagePath: String(row.storage_path),
+                fileSizeBytes: Number(row.file_size_bytes),
+                mimeType: String(row.mime_type || 'application/pdf'),
+                department: String(row.department || 'power'),
+                semester: Number(row.semester || 4),
+                subjectName: String(row.subject_name || ''),
+                sourceBackend: 'supabase',
+                createdAt: String(row.created_at),
+                updatedAt: String(row.updated_at),
+              });
+            }
+          }
+        }
+      } catch {
+        // local store fallback intact
+      }
+    }
+
+    const pdfs = Array.from(mergedMap.values()).sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt)
+    );
+    res.json({ pdfs });
+  });
+
+  app.post(
+    '/api/pdfs/upload',
+    requireAuth,
+    express.raw({ type: 'application/pdf', limit: '52mb' }),
+    async (req: AuthenticatedRequest, res: Response) => {
+      const auth = req.authUser!;
+      const fileBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (fileBuffer.length < 16 || fileBuffer.length > 50 * 1024 * 1024) {
+        res.status(400).json({ error: 'PDF file must be between 16 bytes and 50 MB.' });
+        return;
+      }
+      if (fileBuffer.subarray(0, 5).toString('ascii') !== '%PDF-') {
+        res.status(400).json({ error: 'Invalid PDF signature (%PDF- header missing).' });
+        return;
+      }
+
+      let meta: Record<string, unknown> = {};
+      try {
+        const rawMeta = String(req.headers['x-pdf-meta'] || '');
+        if (rawMeta) {
+          meta = JSON.parse(decodeURIComponent(rawMeta)) as Record<string, unknown>;
+        }
+      } catch {
+        // ignore invalid metadata header
+      }
+
+      const customTitle = String(meta.customTitle || 'Untitled Document').trim().slice(0, 140);
+      const originalFilename = String(meta.originalFilename || 'document.pdf').trim().slice(0, 180);
+      const department = String(meta.department || auth.department || 'power').trim();
+      const semester = Math.min(8, Math.max(1, Number(meta.semester) || auth.semester || 4));
+      const subjectName = String(meta.subjectName || '').trim().slice(0, 120);
+
+      if (customTitle.length < 2) {
+        res.status(400).json({ error: 'Please enter a valid book or document title.' });
+        return;
+      }
+
+      const id = crypto.randomUUID();
+      const safeName = originalFilename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const storagePath = `${auth.id}/${id}-${safeName}`;
+      const userDir = path.join(PDF_FILES_DIR, auth.id);
+      fs.mkdirSync(userDir, { recursive: true });
+      const diskPath = path.resolve(PDF_FILES_DIR, storagePath);
+      if (!diskPath.startsWith(PDF_FILES_DIR)) {
+        res.status(400).json({ error: 'Invalid storage path.' });
+        return;
+      }
+      fs.writeFileSync(diskPath, fileBuffer);
+
+      const now = new Date().toISOString();
+      const record = {
+        id,
+        userId: auth.id,
+        customTitle,
+        originalFilename,
+        storagePath,
+        fileSizeBytes: fileBuffer.length,
+        mimeType: 'application/pdf',
+        department,
+        semester,
+        subjectName,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      dbStore.mutate((draft) => {
+        draft.userPdfs.unshift(record);
+      });
+
+      let sourceBackend: 'supabase' | 'server' = 'server';
+      if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+        try {
+          const encodedStorage = storagePath
+            .split('/')
+            .map((seg) => encodeURIComponent(seg))
+            .join('/');
+          const upRes = await fetch(`${SUPABASE_URL}/storage/v1/object/user-pdfs/${encodedStorage}`, {
+            method: 'POST',
+            headers: {
+              apikey: SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/pdf',
+              'x-upsert': 'true',
+            },
+            body: new Uint8Array(fileBuffer),
+          });
+          if (upRes.ok) {
+            const dbRes = await fetch(`${SUPABASE_URL}/rest/v1/user_pdfs`, {
+              method: 'POST',
+              headers: {
+                apikey: SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                id: record.id,
+                user_id: record.userId,
+                custom_title: record.customTitle,
+                original_filename: record.originalFilename,
+                storage_path: record.storagePath,
+                file_size_bytes: record.fileSizeBytes,
+                mime_type: record.mimeType,
+                department: record.department,
+                semester: record.semester,
+                subject_name: record.subjectName,
+                created_at: now,
+                updated_at: now,
+              }),
+            });
+            if (dbRes.ok) sourceBackend = 'supabase';
+          }
+        } catch {
+          // local server disk + dbStore already saved cleanly
+        }
+      }
+
+      res.status(201).json({ pdf: { ...record, sourceBackend } });
+    }
+  );
+
+  app.get('/api/pdfs/:id/file', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const db = dbStore.load();
+    const found = db.userPdfs.find((p) => p.id === req.params.id);
+
+    if (found) {
+      if (found.userId !== auth.id && auth.role !== 'admin') {
+        res.status(403).json({ error: 'You do not have access to this private PDF.' });
+        return;
+      }
+      const diskPath = path.resolve(PDF_FILES_DIR, found.storagePath);
+      if (diskPath.startsWith(PDF_FILES_DIR) && fs.existsSync(diskPath)) {
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader(
+          'Content-Disposition',
+          `inline; filename="${found.originalFilename.replace(/["\\]/g, '_')}"`
+        );
+        res.sendFile(diskPath);
+        return;
+      }
+    }
+
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        const metaRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/user_pdfs?id=eq.${encodeURIComponent(req.params.id)}&select=*`,
+          {
+            headers: {
+              apikey: SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            },
+          }
+        );
+        if (metaRes.ok) {
+          const rows = (await metaRes.json()) as Record<string, unknown>[];
+          const row = rows[0];
+          if (row) {
+            if (String(row.user_id) !== auth.id && auth.role !== 'admin') {
+              res.status(403).json({ error: 'Access denied.' });
+              return;
+            }
+            const encodedStorage = String(row.storage_path)
+              .split('/')
+              .map((seg) => encodeURIComponent(seg))
+              .join('/');
+            const fileRes = await fetch(
+              `${SUPABASE_URL}/storage/v1/object/authenticated/user-pdfs/${encodedStorage}`,
+              {
+                headers: {
+                  apikey: SUPABASE_SERVICE_ROLE_KEY,
+                  Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                },
+              }
+            );
+            if (fileRes.ok) {
+              const arrayBuf = await fileRes.arrayBuffer();
+              res.setHeader('Content-Type', 'application/pdf');
+              res.send(Buffer.from(arrayBuf));
+              return;
+            }
+          }
+        }
+      } catch {
+        // fall through to 404
+      }
+    }
+
+    res.status(404).json({ error: 'PDF file not found.' });
+  });
+
+  app.patch('/api/pdfs/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const { customTitle, department, semester, subjectName } = req.body ?? {};
+    const now = new Date().toISOString();
+
+    const updated = dbStore.mutate((draft) => {
+      const target = draft.userPdfs.find((p) => p.id === req.params.id && p.userId === auth.id);
+      if (!target) return null;
+      if (typeof customTitle === 'string' && customTitle.trim().length >= 2) {
+        target.customTitle = customTitle.trim().slice(0, 140);
+      }
+      if (typeof department === 'string' && department.trim()) {
+        target.department = department.trim();
+      }
+      if (semester !== undefined) {
+        target.semester = Math.min(8, Math.max(1, Number(semester) || target.semester));
+      }
+      if (typeof subjectName === 'string') {
+        target.subjectName = subjectName.trim().slice(0, 120);
+      }
+      target.updatedAt = now;
+      return target;
+    });
+
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      const patchPayload: Record<string, unknown> = { updated_at: now };
+      if (typeof customTitle === 'string' && customTitle.trim().length >= 2) {
+        patchPayload.custom_title = customTitle.trim().slice(0, 140);
+      }
+      if (typeof department === 'string' && department.trim()) patchPayload.department = department.trim();
+      if (semester !== undefined) patchPayload.semester = Math.min(8, Math.max(1, Number(semester) || 4));
+      if (typeof subjectName === 'string') patchPayload.subject_name = subjectName.trim().slice(0, 120);
+
+      await fetch(
+        `${SUPABASE_URL}/rest/v1/user_pdfs?id=eq.${encodeURIComponent(req.params.id)}&user_id=eq.${encodeURIComponent(auth.id)}`,
+        {
+          method: 'PATCH',
+          headers: {
+            apikey: SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(patchPayload),
+        }
+      ).catch(() => {});
+    }
+
+    if (!updated) {
+      res.status(404).json({ error: 'PDF record not found.' });
+      return;
+    }
+    res.json({ pdf: updated });
+  });
+
+  app.delete('/api/pdfs/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    let removedPath: string | null = null;
+    dbStore.mutate((draft) => {
+      const idx = draft.userPdfs.findIndex(
+        (p) => p.id === req.params.id && (p.userId === auth.id || auth.role === 'admin')
+      );
+      if (idx >= 0) {
+        removedPath = draft.userPdfs[idx].storagePath;
+        draft.userPdfs.splice(idx, 1);
+      }
+    });
+
+    if (removedPath) {
+      const diskPath = path.resolve(PDF_FILES_DIR, removedPath);
+      if (diskPath.startsWith(PDF_FILES_DIR) && fs.existsSync(diskPath)) {
+        fs.unlinkSync(diskPath);
+      }
+    }
+
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      if (removedPath) {
+        await fetch(`${SUPABASE_URL}/storage/v1/object/user-pdfs`, {
+          method: 'DELETE',
+          headers: {
+            apikey: SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ prefixes: [removedPath] }),
+        }).catch(() => {});
+      }
+      await fetch(
+        `${SUPABASE_URL}/rest/v1/user_pdfs?id=eq.${encodeURIComponent(req.params.id)}&user_id=eq.${encodeURIComponent(auth.id)}`,
+        {
+          method: 'DELETE',
+          headers: {
+            apikey: SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          },
+        }
+      ).catch(() => {});
+    }
+
     res.json({ deleted: true });
   });
 
@@ -1139,15 +1982,17 @@ async function createServer() {
         updatedUser = toPublicUser(user);
       });
 
-      if (SUPABASE_URL && SUPABASE_ANON_KEY && req.supabaseAccessToken) {
+      const sbKey = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+      const sbAuth = SUPABASE_SERVICE_ROLE_KEY || req.supabaseAccessToken;
+      if (SUPABASE_URL && sbKey && sbAuth) {
         try {
           const patchRes = await fetch(
             `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(req.params.id)}`,
             {
               method: 'PATCH',
               headers: {
-                apikey: SUPABASE_ANON_KEY,
-                Authorization: `Bearer ${req.supabaseAccessToken}`,
+                apikey: sbKey,
+                Authorization: `Bearer ${sbAuth}`,
                 'Content-Type': 'application/json',
                 Prefer: 'return=representation',
               },
@@ -1163,6 +2008,53 @@ async function createServer() {
         } catch {
           // ignore
         }
+      }
+
+      if (!updatedUser) {
+        res.status(404).json({ error: 'User not found.' });
+        return;
+      }
+      res.json({ user: updatedUser });
+    }
+  );
+
+  app.patch(
+    '/api/admin/users/:id/status',
+    requireAuth,
+    requireAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const { isDisabled } = req.body ?? {};
+      if (typeof isDisabled !== 'boolean') {
+        res.status(400).json({ error: 'isDisabled boolean is required.' });
+        return;
+      }
+      if (req.params.id === req.authUser?.id && isDisabled) {
+        res.status(400).json({ error: 'You cannot disable your own admin account.' });
+        return;
+      }
+
+      let updatedUser: PublicUser | null = null;
+      dbStore.mutate((draft) => {
+        const user = draft.users.find((u) => u.id === req.params.id);
+        if (!user) return;
+        user.isDisabled = isDisabled;
+        user.updatedAt = new Date().toISOString();
+        updatedUser = toPublicUser(user);
+      });
+
+      if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+        await fetch(
+          `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(req.params.id)}`,
+          {
+            method: 'PATCH',
+            headers: {
+              apikey: SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ is_disabled: isDisabled, updated_at: new Date().toISOString() }),
+          }
+        ).catch(() => {});
       }
 
       if (!updatedUser) {
@@ -1190,8 +2082,944 @@ async function createServer() {
   });
 
   // =========================================================================
+  // ADVANCED PUSH NOTIFICATIONS (STUDENT INBOX, PREFERENCES, DEVICE TOKENS & ADMIN)
+  // =========================================================================
+  const VALID_PUSH_CATEGORIES: PushCategory[] = [
+    'APP_UPDATE',
+    'IMPORTANT',
+    'EDUCATION',
+    'EMERGENCY',
+    'GENERAL',
+  ];
+
+  const rateLimitBuckets = new Map<string, number[]>();
+  function checkRateLimit(key: string, maxHits: number, windowMs: number): boolean {
+    const now = Date.now();
+    const hits = (rateLimitBuckets.get(key) ?? []).filter((ts) => now - ts < windowMs);
+    if (hits.length >= maxHits) {
+      rateLimitBuckets.set(key, hits);
+      return false;
+    }
+    hits.push(now);
+    rateLimitBuckets.set(key, hits);
+    return true;
+  }
+
+  function defaultPreferencesForUser(userId: string): DbNotificationPreference {
+    return {
+      userId,
+      pushEnabled: true,
+      soundEnabled: true,
+      soundStyle: 'chime',
+      allowAppUpdate: true,
+      allowImportant: true,
+      allowEducation: true,
+      allowEmergency: true,
+      allowGeneral: true,
+      respectDnd: true,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  function prefAllowsPush(
+    pref: DbNotificationPreference | undefined,
+    category: PushCategory
+  ): { allowPush: boolean; allowSound: boolean } {
+    if (!pref) return { allowPush: true, allowSound: true };
+    const catAllowed =
+      category === 'APP_UPDATE'
+        ? pref.allowAppUpdate
+        : category === 'IMPORTANT'
+          ? pref.allowImportant
+          : category === 'EDUCATION'
+            ? pref.allowEducation
+            : category === 'EMERGENCY'
+              ? pref.allowEmergency
+              : pref.allowGeneral;
+    return {
+      allowPush: pref.pushEnabled && catAllowed,
+      allowSound: pref.pushEnabled && catAllowed && pref.soundEnabled,
+    };
+  }
+
+  async function resolveAudienceRecipients(
+    audienceType: PushAudienceType,
+    targetUserIds: string[],
+    targetDepartment: string,
+    targetSemester: number | null,
+    supabaseAuthToken?: string
+  ): Promise<{ id: string; department: string; semester: number }[]> {
+    const db = dbStore.load();
+    const userMap = new Map<string, { id: string; department: string; semester: number }>();
+
+    for (const u of db.users) {
+      userMap.set(u.id, { id: u.id, department: u.department, semester: u.semester });
+    }
+
+    const sbKey = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+    const sbAuth = SUPABASE_SERVICE_ROLE_KEY || supabaseAuthToken;
+    if (SUPABASE_URL && sbKey && sbAuth) {
+      try {
+        const profRes = await fetch(`${SUPABASE_URL}/rest/v1/profiles?select=id,department,semester`, {
+          headers: {
+            apikey: sbKey,
+            Authorization: `Bearer ${sbAuth}`,
+          },
+        });
+        if (profRes.ok) {
+          const rows = (await profRes.json()) as {
+            id: string;
+            department?: string;
+            semester?: number;
+          }[];
+          for (const r of rows) {
+            userMap.set(String(r.id), {
+              id: String(r.id),
+              department: String(r.department || 'power'),
+              semester: Number(r.semester || 4),
+            });
+          }
+        }
+      } catch {
+        // fallback to local users
+      }
+    }
+
+    const all = Array.from(userMap.values());
+    if (audienceType === 'selected_users') {
+      const targetSet = new Set(targetUserIds);
+      return all.filter((u) => targetSet.has(u.id));
+    }
+    if (audienceType === 'department_semester') {
+      return all.filter((u) => {
+        if (targetDepartment && u.department !== targetDepartment) return false;
+        if (targetSemester && Number(u.semester) !== Number(targetSemester)) return false;
+        return true;
+      });
+    }
+    return all;
+  }
+
+  async function executeNotificationDispatch(input: {
+    title: string;
+    body: string;
+    category: PushCategory;
+    imageUrl: string;
+    targetView: string;
+    actionUrl: string;
+    audienceType: PushAudienceType;
+    targetUserIds: string[];
+    targetDepartment: string;
+    targetSemester: number | null;
+    soundMode: PushSoundMode;
+    createdBy: string;
+    supabaseAccessToken?: string;
+  }): Promise<{
+    campaign: DbNotificationCampaign;
+    fcmConfigured: boolean;
+    invalidTokensCleaned: number;
+  }> {
+    const recipients = await resolveAudienceRecipients(
+      input.audienceType,
+      input.targetUserIds,
+      input.targetDepartment,
+      input.targetSemester,
+      input.supabaseAccessToken
+    );
+
+    const db = dbStore.load();
+    const recipientIds = recipients.map((r) => r.id);
+    const recipientSet = new Set(recipientIds);
+    const activeTokens = db.deviceTokens.filter(
+      (dt) => dt.isActive && recipientSet.has(dt.userId)
+    );
+
+    const notificationId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const fcmConfigured = isFcmAdminConfigured();
+
+    let fcmSentCount = 0;
+    let fcmFailedCount = 0;
+    const invalidTokenIds: string[] = [];
+
+    if (fcmConfigured && activeTokens.length > 0) {
+      for (const dev of activeTokens) {
+        const pref = db.notificationPreferences.find((p) => p.userId === dev.userId);
+        const { allowPush, allowSound } = prefAllowsPush(pref, input.category);
+        if (!allowPush) continue;
+
+        const effectiveSound: PushSoundMode =
+          input.soundMode === 'silent' || !allowSound
+            ? 'silent'
+            : input.soundMode === 'default'
+              ? 'default'
+              : 'custom';
+
+        try {
+          const result = await dispatchFcmMessage({
+            token: dev.token,
+            platform: dev.platform,
+            title: input.title,
+            body: input.body,
+            category: input.category,
+            notificationId,
+            targetView: input.targetView,
+            actionUrl: input.actionUrl,
+            imageUrl: input.imageUrl,
+            soundMode: effectiveSound,
+          });
+          if (result.ok) {
+            fcmSentCount += 1;
+          } else {
+            fcmFailedCount += 1;
+            if (result.invalidToken) invalidTokenIds.push(dev.id);
+          }
+        } catch {
+          fcmFailedCount += 1;
+        }
+      }
+    }
+
+    const finalStatus: DbNotificationCampaign['status'] =
+      fcmFailedCount > 0 && fcmSentCount === 0 && activeTokens.length > 0 ? 'partial' : 'sent';
+
+    const campaign: DbNotificationCampaign = {
+      id: notificationId,
+      title: input.title,
+      body: input.body,
+      category: input.category,
+      imageUrl: input.imageUrl,
+      targetView: input.targetView,
+      actionUrl: input.actionUrl,
+      audienceType: input.audienceType,
+      targetUserIds: input.targetUserIds,
+      targetDepartment: input.targetDepartment,
+      targetSemester: input.targetSemester,
+      soundMode: input.soundMode,
+      status: finalStatus,
+      totalRecipients: recipientIds.length,
+      fcmSentCount,
+      fcmFailedCount,
+      createdBy: input.createdBy,
+      createdAt: now,
+    };
+
+    dbStore.mutate((draft) => {
+      if (invalidTokenIds.length > 0) {
+        const invalidSet = new Set(invalidTokenIds);
+        for (const dt of draft.deviceTokens) {
+          if (invalidSet.has(dt.id)) dt.isActive = false;
+        }
+      }
+
+      draft.notifications.unshift(campaign);
+
+      for (const uid of recipientIds) {
+        const inboxItem: DbUserNotification = {
+          id: crypto.randomUUID(),
+          notificationId,
+          userId: uid,
+          title: input.title,
+          body: input.body,
+          category: input.category,
+          imageUrl: input.imageUrl,
+          targetView: input.targetView,
+          actionUrl: input.actionUrl,
+          isRead: false,
+          readAt: '',
+          deliveredVia: fcmSentCount > 0 ? 'fcm_and_in_app' : 'in_app',
+          createdAt: now,
+        };
+        draft.userNotifications.unshift(inboxItem);
+      }
+      // Keep local inbox store bounded reasonably
+      if (draft.userNotifications.length > 5000) {
+        draft.userNotifications = draft.userNotifications.slice(0, 5000);
+      }
+    });
+
+    // Optional mirror into Supabase tables when service role or admin token is present
+    const sbKey = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+    const sbAuth = SUPABASE_SERVICE_ROLE_KEY || input.supabaseAccessToken;
+    if (SUPABASE_URL && sbKey && sbAuth) {
+      try {
+        await fetch(`${SUPABASE_URL}/rest/v1/notifications`, {
+          method: 'POST',
+          headers: {
+            apikey: sbKey,
+            Authorization: `Bearer ${sbAuth}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            id: campaign.id,
+            title: campaign.title,
+            body: campaign.body,
+            category: campaign.category,
+            image_url: campaign.imageUrl,
+            target_view: campaign.targetView,
+            action_url: campaign.actionUrl,
+            audience_type: campaign.audienceType,
+            target_user_ids: campaign.targetUserIds,
+            target_department: campaign.targetDepartment,
+            target_semester: campaign.targetSemester,
+            sound_mode: campaign.soundMode,
+            status: campaign.status,
+            total_recipients: campaign.totalRecipients,
+            fcm_sent_count: campaign.fcmSentCount,
+            fcm_failed_count: campaign.fcmFailedCount,
+            created_by: campaign.createdBy.startsWith('usr-') ? null : campaign.createdBy,
+            created_at: campaign.createdAt,
+          }),
+        });
+
+        const uuidRecipients = recipientIds.filter((id) => !id.startsWith('usr-'));
+        if (uuidRecipients.length > 0) {
+          await fetch(`${SUPABASE_URL}/rest/v1/user_notifications`, {
+            method: 'POST',
+            headers: {
+              apikey: sbKey,
+              Authorization: `Bearer ${sbAuth}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(
+              uuidRecipients.map((uid) => ({
+                notification_id: campaign.id,
+                user_id: uid,
+                title: campaign.title,
+                body: campaign.body,
+                category: campaign.category,
+                image_url: campaign.imageUrl,
+                target_view: campaign.targetView,
+                action_url: campaign.actionUrl,
+                delivered_via: fcmSentCount > 0 ? 'fcm_and_in_app' : 'in_app',
+              }))
+            ),
+          });
+        }
+      } catch {
+        // Local storage remains authoritative fallback if Supabase migration isn't applied yet
+      }
+    }
+
+    return {
+      campaign,
+      fcmConfigured,
+      invalidTokensCleaned: invalidTokenIds.length,
+    };
+  }
+
+  // Register or refresh a device FCM token (Web / Android / iOS)
+  app.post('/api/notifications/device-token', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    if (!checkRateLimit(`token:${auth.id}`, 25, 5 * 60 * 1000)) {
+      res.status(429).json({ error: 'Too many device token requests. Try again shortly.' });
+      return;
+    }
+
+    const { token, platform = 'web', browserOrDevice = '', appVersion = '2.0.0' } = req.body ?? {};
+    if (typeof token !== 'string' || token.trim().length < 20 || token.trim().length > 4096) {
+      res.status(400).json({ error: 'Valid FCM device token is required.' });
+      return;
+    }
+    const cleanPlatform: 'web' | 'android' | 'ios' =
+      platform === 'android' || platform === 'ios' ? platform : 'web';
+    const cleanToken = token.trim();
+    const now = new Date().toISOString();
+
+    const saved = dbStore.mutate((draft) => {
+      const existing = draft.deviceTokens.find((dt) => dt.token === cleanToken);
+      if (existing) {
+        existing.userId = auth.id;
+        existing.platform = cleanPlatform;
+        existing.browserOrDevice = String(browserOrDevice || existing.browserOrDevice).slice(0, 120);
+        existing.appVersion = String(appVersion || existing.appVersion).slice(0, 32);
+        existing.isActive = true;
+        existing.lastSeenAt = now;
+        return existing;
+      }
+      const created: DbDeviceToken = {
+        id: crypto.randomUUID(),
+        userId: auth.id,
+        token: cleanToken,
+        platform: cleanPlatform,
+        browserOrDevice: String(browserOrDevice || '').slice(0, 120),
+        appVersion: String(appVersion || '2.0.0').slice(0, 32),
+        isActive: true,
+        lastSeenAt: now,
+        createdAt: now,
+      };
+      draft.deviceTokens.unshift(created);
+      return created;
+    });
+
+    if (SUPABASE_URL && SUPABASE_ANON_KEY && req.supabaseAccessToken && !auth.id.startsWith('usr-')) {
+      try {
+        await fetch(`${SUPABASE_URL}/rest/v1/device_tokens?on_conflict=token`, {
+          method: 'POST',
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${req.supabaseAccessToken}`,
+            'Content-Type': 'application/json',
+            Prefer: 'resolution=merge-duplicates',
+          },
+          body: JSON.stringify({
+            user_id: auth.id,
+            token: cleanToken,
+            platform: cleanPlatform,
+            browser_or_device: saved.browserOrDevice,
+            app_version: saved.appVersion,
+            is_active: true,
+            last_seen_at: now,
+          }),
+        });
+      } catch {
+        // ignore
+      }
+    }
+
+    res.status(201).json({ deviceToken: saved });
+  });
+
+  app.delete('/api/notifications/device-token', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const { token } = req.body ?? {};
+    if (typeof token !== 'string' || !token.trim()) {
+      res.status(400).json({ error: 'Token is required.' });
+      return;
+    }
+    const cleanToken = token.trim();
+    dbStore.mutate((draft) => {
+      for (const dt of draft.deviceTokens) {
+        if (dt.token === cleanToken && dt.userId === auth.id) {
+          dt.isActive = false;
+        }
+      }
+    });
+
+    if (SUPABASE_URL && SUPABASE_ANON_KEY && req.supabaseAccessToken) {
+      try {
+        await fetch(
+          `${SUPABASE_URL}/rest/v1/device_tokens?token=eq.${encodeURIComponent(cleanToken)}&user_id=eq.${encodeURIComponent(auth.id)}`,
+          {
+            method: 'PATCH',
+            headers: {
+              apikey: SUPABASE_ANON_KEY,
+              Authorization: `Bearer ${req.supabaseAccessToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ is_active: false }),
+          }
+        );
+      } catch {
+        // ignore
+      }
+    }
+    res.json({ deactivated: true });
+  });
+
+  app.get('/api/notifications/inbox', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const db = dbStore.load();
+    const notifications = db.userNotifications
+      .filter((n) => n.userId === auth.id)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const preferences =
+      db.notificationPreferences.find((p) => p.userId === auth.id) ??
+      defaultPreferencesForUser(auth.id);
+    const devices = db.deviceTokens.filter((dt) => dt.userId === auth.id && dt.isActive);
+    const unreadCount = notifications.filter((n) => !n.isRead).length;
+
+    res.json({
+      notifications,
+      unreadCount,
+      preferences,
+      devices,
+      fcmConfigured: isFcmAdminConfigured(),
+    });
+  });
+
+  app.patch('/api/notifications/inbox/:id/read', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const now = new Date().toISOString();
+    const updated = dbStore.mutate((draft) => {
+      const item = draft.userNotifications.find(
+        (n) => n.id === req.params.id && n.userId === auth.id
+      );
+      if (!item) return null;
+      item.isRead = true;
+      item.readAt = now;
+      return item;
+    });
+    if (!updated) {
+      res.status(404).json({ error: 'Notification not found.' });
+      return;
+    }
+    res.json({ notification: updated });
+  });
+
+  app.post('/api/notifications/inbox/read-all', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const now = new Date().toISOString();
+    let count = 0;
+    dbStore.mutate((draft) => {
+      for (const n of draft.userNotifications) {
+        if (n.userId === auth.id && !n.isRead) {
+          n.isRead = true;
+          n.readAt = now;
+          count += 1;
+        }
+      }
+    });
+    res.json({ markedCount: count });
+  });
+
+  app.delete('/api/notifications/inbox/:id', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    dbStore.mutate((draft) => {
+      draft.userNotifications = draft.userNotifications.filter(
+        (n) => !(n.id === req.params.id && n.userId === auth.id)
+      );
+    });
+    res.json({ deleted: true });
+  });
+
+  app.get('/api/notifications/preferences', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const db = dbStore.load();
+    const preferences =
+      db.notificationPreferences.find((p) => p.userId === auth.id) ??
+      defaultPreferencesForUser(auth.id);
+    res.json({ preferences });
+  });
+
+  app.put('/api/notifications/preferences', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const body = req.body ?? {};
+    const now = new Date().toISOString();
+
+    const updated = dbStore.mutate((draft) => {
+      let pref = draft.notificationPreferences.find((p) => p.userId === auth.id);
+      if (!pref) {
+        pref = defaultPreferencesForUser(auth.id);
+        draft.notificationPreferences.push(pref);
+      }
+      if (typeof body.pushEnabled === 'boolean') pref.pushEnabled = body.pushEnabled;
+      if (typeof body.soundEnabled === 'boolean') pref.soundEnabled = body.soundEnabled;
+      if (
+        body.soundStyle === 'chime' ||
+        body.soundStyle === 'alert' ||
+        body.soundStyle === 'soft' ||
+        body.soundStyle === 'bell' ||
+        body.soundStyle === 'system'
+      ) {
+        pref.soundStyle = body.soundStyle;
+      }
+      if (typeof body.allowAppUpdate === 'boolean') pref.allowAppUpdate = body.allowAppUpdate;
+      if (typeof body.allowImportant === 'boolean') pref.allowImportant = body.allowImportant;
+      if (typeof body.allowEducation === 'boolean') pref.allowEducation = body.allowEducation;
+      if (typeof body.allowEmergency === 'boolean') pref.allowEmergency = body.allowEmergency;
+      if (typeof body.allowGeneral === 'boolean') pref.allowGeneral = body.allowGeneral;
+      if (typeof body.respectDnd === 'boolean') pref.respectDnd = body.respectDnd;
+      pref.updatedAt = now;
+      return pref;
+    });
+
+    const sbKey = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+    const sbAuth = SUPABASE_SERVICE_ROLE_KEY || req.supabaseAccessToken;
+    if (SUPABASE_URL && sbKey && sbAuth && !auth.id.startsWith('usr-')) {
+      try {
+        await fetch(`${SUPABASE_URL}/rest/v1/notification_preferences?on_conflict=user_id`, {
+          method: 'POST',
+          headers: {
+            apikey: sbKey,
+            Authorization: `Bearer ${sbAuth}`,
+            'Content-Type': 'application/json',
+            Prefer: 'resolution=merge-duplicates',
+          },
+          body: JSON.stringify({
+            user_id: auth.id,
+            push_enabled: updated.pushEnabled,
+            sound_enabled: updated.soundEnabled,
+            sound_style: updated.soundStyle,
+            allow_app_update: updated.allowAppUpdate,
+            allow_important: updated.allowImportant,
+            allow_education: updated.allowEducation,
+            allow_emergency: updated.allowEmergency,
+            allow_general: updated.allowGeneral,
+            respect_dnd: updated.respectDnd,
+            updated_at: now,
+          }),
+        });
+      } catch {
+        // ignore if migration not yet applied
+      }
+    }
+
+    res.json({ preferences: updated });
+  });
+
+  // Admin Push Notification Management Endpoints
+  app.get('/api/admin/notifications', requireAuth, requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
+    const db = dbStore.load();
+    const activeDevices = db.deviceTokens.filter((dt) => dt.isActive);
+    const totalReadCount = db.userNotifications.filter((n) => n.isRead).length;
+    const totalDeliveredInbox = db.userNotifications.length;
+
+    res.json({
+      fcmConfigured: isFcmAdminConfigured(),
+      supabaseServiceConfigured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
+      history: [...db.notifications].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      scheduled: [...db.scheduledNotifications].sort((a, b) =>
+        a.scheduledFor.localeCompare(b.scheduledFor)
+      ),
+      stats: {
+        totalCampaigns: db.notifications.length,
+        totalPendingScheduled: db.scheduledNotifications.filter((s) => s.status === 'pending').length,
+        totalRecipientsReached: db.notifications.reduce((sum, n) => sum + n.totalRecipients, 0),
+        totalFcmSent: db.notifications.reduce((sum, n) => sum + n.fcmSentCount, 0),
+        totalFcmFailed: db.notifications.reduce((sum, n) => sum + n.fcmFailedCount, 0),
+        totalInboxRead: totalReadCount,
+        totalInboxDelivered: totalDeliveredInbox,
+        activeWebDevices: activeDevices.filter((d) => d.platform === 'web').length,
+        activeAndroidDevices: activeDevices.filter((d) => d.platform === 'android').length,
+      },
+    });
+  });
+
+  app.post('/api/admin/notifications/send', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    if (!checkRateLimit(`admin-send:${auth.id}`, 25, 5 * 60 * 1000)) {
+      res.status(429).json({
+        error: 'Rate limit reached (max 25 notification campaigns per 5 minutes).',
+      });
+      return;
+    }
+
+    const {
+      title,
+      body,
+      category = 'GENERAL',
+      imageUrl = '',
+      targetView = 'notifications',
+      actionUrl = '',
+      audienceType = 'all',
+      targetUserIds = [],
+      targetDepartment = '',
+      targetSemester = null,
+      soundMode = 'custom',
+      scheduledFor = null,
+    } = req.body ?? {};
+
+    const cleanTitle = typeof title === 'string' ? title.trim() : '';
+    const cleanBody = typeof body === 'string' ? body.trim() : '';
+    if (cleanTitle.length < 2 || cleanTitle.length > 140) {
+      res.status(400).json({ error: 'Notification title must be 2–140 characters.' });
+      return;
+    }
+    if (cleanBody.length < 2 || cleanBody.length > 1000) {
+      res.status(400).json({ error: 'Notification message must be 2–1000 characters.' });
+      return;
+    }
+    if (!VALID_PUSH_CATEGORIES.includes(category)) {
+      res.status(400).json({ error: 'Invalid notification category.' });
+      return;
+    }
+
+    const cleanImage = typeof imageUrl === 'string' ? imageUrl.trim() : '';
+    if (cleanImage && !/^https?:\/\//i.test(cleanImage) && !cleanImage.startsWith('/')) {
+      res.status(400).json({ error: 'Optional image URL must start with https:// or /' });
+      return;
+    }
+
+    const cleanAudience: PushAudienceType =
+      audienceType === 'selected_users' || audienceType === 'department_semester'
+        ? audienceType
+        : 'all';
+    const cleanUserIds = Array.isArray(targetUserIds) ? targetUserIds.map(String) : [];
+    if (cleanAudience === 'selected_users' && cleanUserIds.length === 0) {
+      res.status(400).json({ error: 'Select at least one recipient user.' });
+      return;
+    }
+
+    const cleanSemester =
+      targetSemester !== null && targetSemester !== '' && Number(targetSemester) >= 1 && Number(targetSemester) <= 8
+        ? Number(targetSemester)
+        : null;
+    const cleanSound: PushSoundMode =
+      soundMode === 'default' || soundMode === 'silent' ? soundMode : 'custom';
+
+    // Schedule for later if scheduledFor is provided
+    if (scheduledFor) {
+      const dt = new Date(scheduledFor);
+      if (Number.isNaN(dt.getTime()) || dt.getTime() <= Date.now() + 10000) {
+        res.status(400).json({ error: 'Scheduled time must be at least 10 seconds in the future.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const scheduledItem: DbScheduledNotification = {
+        id: crypto.randomUUID(),
+        title: cleanTitle,
+        body: cleanBody,
+        category,
+        imageUrl: cleanImage,
+        targetView: String(targetView || 'notifications').trim() || 'notifications',
+        actionUrl: String(actionUrl || '').trim(),
+        audienceType: cleanAudience,
+        targetUserIds: cleanUserIds,
+        targetDepartment: String(targetDepartment || '').trim(),
+        targetSemester: cleanSemester,
+        soundMode: cleanSound,
+        scheduledFor: dt.toISOString(),
+        status: 'pending',
+        sentNotificationId: '',
+        errorMessage: '',
+        createdBy: auth.id,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      dbStore.mutate((draft) => {
+        draft.scheduledNotifications.unshift(scheduledItem);
+      });
+
+      res.status(201).json({ scheduled: true, scheduledNotification: scheduledItem });
+      return;
+    }
+
+    const result = await executeNotificationDispatch({
+      title: cleanTitle,
+      body: cleanBody,
+      category,
+      imageUrl: cleanImage,
+      targetView: String(targetView || 'notifications').trim() || 'notifications',
+      actionUrl: String(actionUrl || '').trim(),
+      audienceType: cleanAudience,
+      targetUserIds: cleanUserIds,
+      targetDepartment: String(targetDepartment || '').trim(),
+      targetSemester: cleanSemester,
+      soundMode: cleanSound,
+      createdBy: auth.id,
+      supabaseAccessToken: req.supabaseAccessToken,
+    });
+
+    res.status(201).json({
+      scheduled: false,
+      fcmConfigured: result.fcmConfigured,
+      campaign: result.campaign,
+      invalidTokensCleaned: result.invalidTokensCleaned,
+    });
+  });
+
+  app.patch('/api/admin/notifications/scheduled/:id', requireAuth, requireAdmin, (req: Request, res: Response) => {
+    const {
+      title,
+      body,
+      category,
+      imageUrl,
+      targetView,
+      audienceType,
+      targetUserIds,
+      targetDepartment,
+      targetSemester,
+      soundMode,
+      scheduledFor,
+      status,
+    } = req.body ?? {};
+
+    const updated = dbStore.mutate((draft) => {
+      const found = draft.scheduledNotifications.find((s) => s.id === req.params.id);
+      if (!found || found.status === 'sent') return null;
+
+      if (typeof title === 'string' && title.trim().length >= 2) found.title = title.trim().slice(0, 140);
+      if (typeof body === 'string' && body.trim().length >= 2) found.body = body.trim().slice(0, 1000);
+      if (VALID_PUSH_CATEGORIES.includes(category)) found.category = category;
+      if (typeof imageUrl === 'string') found.imageUrl = imageUrl.trim();
+      if (typeof targetView === 'string' && targetView.trim()) found.targetView = targetView.trim();
+      if (audienceType === 'all' || audienceType === 'selected_users' || audienceType === 'department_semester') {
+        found.audienceType = audienceType;
+      }
+      if (Array.isArray(targetUserIds)) found.targetUserIds = targetUserIds.map(String);
+      if (typeof targetDepartment === 'string') found.targetDepartment = targetDepartment.trim();
+      if (targetSemester !== undefined) {
+        found.targetSemester =
+          targetSemester !== null && targetSemester !== '' && Number(targetSemester) >= 1 && Number(targetSemester) <= 8
+            ? Number(targetSemester)
+            : null;
+      }
+      if (soundMode === 'custom' || soundMode === 'default' || soundMode === 'silent') {
+        found.soundMode = soundMode;
+      }
+      if (scheduledFor) {
+        const dt = new Date(scheduledFor);
+        if (!Number.isNaN(dt.getTime())) found.scheduledFor = dt.toISOString();
+      }
+      if (status === 'pending' || status === 'cancelled') {
+        found.status = status;
+      }
+      found.updatedAt = new Date().toISOString();
+      return found;
+    });
+
+    if (!updated) {
+      res.status(404).json({ error: 'Editable scheduled notification not found.' });
+      return;
+    }
+    res.json({ scheduledNotification: updated });
+  });
+
+  app.delete('/api/admin/notifications/scheduled/:id', requireAuth, requireAdmin, (req: Request, res: Response) => {
+    dbStore.mutate((draft) => {
+      draft.scheduledNotifications = draft.scheduledNotifications.filter((s) => s.id !== req.params.id);
+    });
+    res.json({ deleted: true });
+  });
+
+  // Periodic background processor for due scheduled notifications (Node server mode)
+  let schedulerRunning = false;
+  const schedulerInterval = setInterval(async () => {
+    if (schedulerRunning) return;
+    schedulerRunning = true;
+    try {
+      const nowMs = Date.now();
+      const db = dbStore.load();
+      const dueJobs = db.scheduledNotifications.filter(
+        (s) => s.status === 'pending' && new Date(s.scheduledFor).getTime() <= nowMs
+      );
+      for (const job of dueJobs) {
+        dbStore.mutate((draft) => {
+          const target = draft.scheduledNotifications.find((s) => s.id === job.id);
+          if (target) target.status = 'processing';
+        });
+        try {
+          const result = await executeNotificationDispatch({
+            title: job.title,
+            body: job.body,
+            category: job.category,
+            imageUrl: job.imageUrl,
+            targetView: job.targetView,
+            actionUrl: job.actionUrl,
+            audienceType: job.audienceType,
+            targetUserIds: job.targetUserIds,
+            targetDepartment: job.targetDepartment,
+            targetSemester: job.targetSemester,
+            soundMode: job.soundMode,
+            createdBy: job.createdBy,
+          });
+          dbStore.mutate((draft) => {
+            const target = draft.scheduledNotifications.find((s) => s.id === job.id);
+            if (target) {
+              target.status = 'sent';
+              target.sentNotificationId = result.campaign.id;
+              target.updatedAt = new Date().toISOString();
+            }
+          });
+        } catch (err) {
+          dbStore.mutate((draft) => {
+            const target = draft.scheduledNotifications.find((s) => s.id === job.id);
+            if (target) {
+              target.status = 'failed';
+              target.errorMessage = err instanceof Error ? err.message : String(err);
+              target.updatedAt = new Date().toISOString();
+            }
+          });
+        }
+      }
+    } finally {
+      schedulerRunning = false;
+    }
+  }, 20000);
+  schedulerInterval.unref?.();
+
+  // =========================================================================
   // FAST STREAMING AI TUTOR (SSE) + NON-STREAMING FALLBACK
   // =========================================================================
+  function resolveThinkingLevelForModel(
+    modelName: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite',
+    concise: boolean | undefined,
+    mode: AiMode,
+    aiConfig: DbAiConfig
+  ): ThinkingLevel {
+    if (modelName === 'gemini-3.1-flash-lite') {
+      return ThinkingLevel.MINIMAL;
+    }
+    if (concise || aiConfig.thinkingLevel === 'LOW') {
+      return ThinkingLevel.LOW;
+    }
+    return mode === 'math' || mode === 'power' ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW;
+  }
+
+  function formatGeminiErrorForClient(err: unknown, language: LanguageCode, modelName: string): {
+    status: number;
+    code: string;
+    message: string;
+  } {
+    const raw = err instanceof Error ? err.message : String(err);
+    if (
+      raw.includes('403') ||
+      raw.includes('PERMISSION_DENIED') ||
+      raw.includes('API_KEY_INVALID') ||
+      raw.includes('API key not valid')
+    ) {
+      return {
+        status: 403,
+        code: 'API_KEY_INVALID',
+        message:
+          language === 'en'
+            ? 'Gemini API Key is invalid or lacks permission. Please verify GEMINI_API_KEY in Settings > Secrets.'
+            : 'GEMINI_API_KEY সঠিক নয় বা অনুমতি পাওয়া যায়নি। Settings > Secrets প্যানেল থেকে কী যাচাই করুন।',
+      };
+    }
+    if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
+      return {
+        status: 429,
+        code: 'RATE_LIMIT',
+        message:
+          language === 'en'
+            ? 'AI rate limit reached. Please wait a few seconds and retry.'
+            : 'অনুরোধের সীমা অতিক্রম করেছে। কিছুক্ষণ পর আবার চেষ্টা করুন।',
+      };
+    }
+    if (raw.includes('404') || raw.includes('NOT_FOUND')) {
+      return {
+        status: 404,
+        code: 'MODEL_NOT_FOUND',
+        message:
+          language === 'en'
+            ? `Selected Gemini model (${modelName}) is unavailable for this API key.`
+            : `নির্বাচিত মডেল (${modelName}) এই API Key-এর জন্য পাওয়া যায়নি। Admin প্যানেল থেকে মডেল পরিবর্তন করুন।`,
+      };
+    }
+    if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+      return {
+        status: 503,
+        code: 'MODEL_BUSY',
+        message:
+          language === 'en'
+            ? 'AI servers are temporarily busy due to high demand. Please retry in a few seconds.'
+            : 'অতিরিক্ত চাপের কারণে এআই সার্ভার সাময়িকভাবে ব্যস্ত রয়েছে। কয়েক সেকেন্ড পর আবার চেষ্টা করুন।',
+      };
+    }
+    return {
+      status: 502,
+      code: 'UPSTREAM_ERROR',
+      message:
+        language === 'en'
+          ? 'Could not reach AI Tutor right now. Please try again.'
+          : 'এআই টিউটরের সাথে সংযোগ করা যায়নি। অনুগ্রহ করে আবার চেষ্টা করুন।',
+    };
+  }
+
+  function isFallbackEligibleAiError(msg: string): boolean {
+    return (
+      msg.includes('404') ||
+      msg.includes('NOT_FOUND') ||
+      msg.includes('503') ||
+      msg.includes('UNAVAILABLE') ||
+      msg.includes('high demand')
+    );
+  }
+
   app.post('/api/ai/stream', async (req: Request<unknown, unknown, AiAskBody>, res: Response) => {
     const startedAt = Date.now();
     const {
@@ -1235,19 +3063,12 @@ async function createServer() {
       ? `Previous Conversation:\n${formattedHistory}\n\nCurrent Question:\n${message.trim()}`
       : message.trim();
 
-    const modelName =
-      aiConfig.activeModel === 'gemini-4-hydrogen'
-        ? 'gemini-4-hydrogen'
-        : 'gemini-3.1-flash-lite';
-
-    const thinkingLevel =
-      modelName === 'gemini-4-hydrogen'
-        ? concise || aiConfig.thinkingLevel === 'LOW'
-          ? ThinkingLevel.LOW
-          : mode === 'math' || mode === 'power'
-            ? ThinkingLevel.MEDIUM
-            : ThinkingLevel.LOW
-        : ThinkingLevel.MINIMAL;
+    const primaryModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' =
+      aiConfig.activeModel === 'gemini-3.1-flash-lite'
+        ? 'gemini-3.1-flash-lite'
+        : 'gemini-4-hydrogen';
+    const fallbackModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' =
+      primaryModel === 'gemini-4-hydrogen' ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen';
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -1262,34 +3083,86 @@ async function createServer() {
       }
     });
 
+    const systemInstruction = buildSystemInstruction(
+      mode,
+      language,
+      departmentName,
+      semesterLabel,
+      aiConfig,
+      concise
+    );
+
+    const openStreamWithCandidate = async (candidateModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite') => {
+      const thinkingLevel = resolveThinkingLevelForModel(candidateModel, concise, mode, aiConfig);
+      try {
+        return {
+          model: candidateModel,
+          stream: await ai.models.generateContentStream({
+            model: candidateModel,
+            contents: promptText,
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel },
+            },
+          }),
+        };
+      } catch (innerErr: unknown) {
+        const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+        // Retry without thinkingConfig if model rejects thinkingConfig enum
+        if (msg.includes('thinking') || msg.includes('INVALID_ARGUMENT')) {
+          return {
+            model: candidateModel,
+            stream: await ai.models.generateContentStream({
+              model: candidateModel,
+              contents: promptText,
+              config: { systemInstruction },
+            }),
+          };
+        }
+        throw innerErr;
+      }
+    };
+
+    let hasEmittedChunk = false;
+    const runStreamWithCandidate = async (candidateModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite') => {
+      const attempt = await openStreamWithCandidate(candidateModel);
+      for await (const chunk of attempt.stream) {
+        if (clientAborted) break;
+        const delta = chunk.text;
+        if (delta) {
+          hasEmittedChunk = true;
+          res.write(`data: ${JSON.stringify({ type: 'chunk', text: delta })}\n\n`);
+        }
+      }
+      return attempt.model;
+    };
+
     try {
-      const stream = await ai.models.generateContentStream({
-        model: modelName,
-        contents: promptText,
-        config: {
-          systemInstruction: buildSystemInstruction(
-            mode,
-            language,
-            departmentName,
-            semesterLabel,
-            aiConfig,
-            concise
-          ),
-          thinkingConfig: { thinkingLevel },
-        },
-      });
+      let streamModel: string = primaryModel;
+      try {
+        streamModel = await runStreamWithCandidate(primaryModel);
+      } catch (primaryErr: unknown) {
+        const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+        if (!hasEmittedChunk && isFallbackEligibleAiError(msg)) {
+          try {
+            streamModel = await runStreamWithCandidate(fallbackModel);
+          } catch (fallbackErr: unknown) {
+            const fMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+            if (!hasEmittedChunk && (fMsg.includes('503') || fMsg.includes('UNAVAILABLE') || fMsg.includes('high demand'))) {
+              await new Promise((r) => setTimeout(r, 900));
+              streamModel = await runStreamWithCandidate(fallbackModel);
+            } else {
+              throw fallbackErr;
+            }
+          }
+        } else {
+          throw primaryErr;
+        }
+      }
 
       if (clientAborted) {
         if (!res.writableEnded) res.end();
         return;
-      }
-
-      for await (const chunk of stream) {
-        if (clientAborted) break;
-        const delta = chunk.text;
-        if (delta) {
-          res.write(`data: ${JSON.stringify({ type: 'chunk', text: delta })}\n\n`);
-        }
       }
 
       if (!clientAborted) {
@@ -1298,7 +3171,7 @@ async function createServer() {
           `data: ${JSON.stringify({
             type: 'done',
             mode,
-            model: modelName,
+            model: streamModel,
             timestamp: new Date().toISOString(),
           })}\n\n`
         );
@@ -1309,21 +3182,10 @@ async function createServer() {
       recordAiUsage(mode, Date.now() - startedAt, true);
 
       if (!clientAborted && !res.writableEnded) {
-        const friendly =
-          errorMessage.includes('403') ||
-          errorMessage.includes('PERMISSION_DENIED') ||
-          errorMessage.includes('API_KEY_INVALID') ||
-          errorMessage.includes('400')
-            ? 'API Key সঠিক নয় বা অনুমতি পাওয়া যায়নি। Settings > Secrets প্যানেল থেকে কী যাচাই করুন।'
-            : errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')
-              ? 'অনুরোধের সীমা অতিক্রম করেছে। কিছুক্ষণ পর আবার চেষ্টা করুন।'
-              : errorMessage.includes('404') || errorMessage.includes('NOT_FOUND')
-                ? `নির্বাচিত মডেল (${modelName}) পাওয়া যায়নি। Admin প্যানেল থেকে মডেল পরিবর্তন করুন।`
-                : language === 'en'
-                  ? 'Connection issue while streaming response. Please retry.'
-                  : 'এআই টিউটরের সাথে সংযোগে সমস্যা হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।';
-
-        res.write(`data: ${JSON.stringify({ type: 'error', error: friendly })}\n\n`);
+        const mapped = formatGeminiErrorForClient(err, language, primaryModel);
+        res.write(
+          `data: ${JSON.stringify({ type: 'error', error: mapped.message, code: mapped.code })}\n\n`
+        );
       }
     } finally {
       if (!res.writableEnded) {
@@ -1334,75 +3196,109 @@ async function createServer() {
 
   app.post('/api/ai/ask', async (req: Request<unknown, unknown, AiAskBody>, res: Response) => {
     const startedAt = Date.now();
-    try {
-      const {
-        message,
-        mode = 'explain',
-        language = 'bn',
-        departmentName,
-        semesterLabel,
-        concise,
-        history = [],
-      } = req.body ?? {};
+    const {
+      message,
+      mode = 'explain',
+      language = 'bn',
+      departmentName,
+      semesterLabel,
+      concise,
+      history = [],
+    } = req.body ?? {};
 
-      if (!message || typeof message !== 'string' || message.trim().length === 0) {
-        res.status(400).json({
-          error: language === 'en' ? 'Please write a question.' : 'অনুগ্রহ করে একটি প্রশ্ন লিখুন।',
-        });
-        return;
-      }
-
-      const ai = getGeminiClient();
-      if (!ai) {
-        res.status(503).json({
-          error:
-            language === 'en'
-              ? 'GEMINI_API_KEY is not configured on the server. Set it in Settings > Secrets.'
-              : 'সার্ভারে GEMINI_API_KEY কনফিগার করা নেই। AI Studio Secrets প্যানেল অথবা .env ফাইলে GEMINI_API_KEY সেট করুন।',
-          code: 'API_KEY_MISSING',
-        });
-        return;
-      }
-
-      const db = dbStore.load();
-      const aiConfig = db.aiConfig;
-      const historyLimit = Math.min(20, Math.max(2, aiConfig.maxHistoryTurns || 8));
-      const recentHistory = Array.isArray(history) ? history.slice(-historyLimit) : [];
-      const formattedHistory = recentHistory
-        .map((turn) => `${turn.role === 'user' ? 'Student' : 'Polytechnic Hub AI'}: ${turn.text}`)
-        .join('\n\n');
-
-      const promptText = formattedHistory
-        ? `Previous Conversation:\n${formattedHistory}\n\nCurrent Question:\n${message.trim()}`
-        : message.trim();
-
-      const modelName =
-        aiConfig.activeModel === 'gemini-4-hydrogen'
-          ? 'gemini-4-hydrogen'
-          : 'gemini-3.1-flash-lite';
-
-      const thinkingLevel =
-        modelName === 'gemini-4-hydrogen'
-          ? concise || aiConfig.thinkingLevel === 'LOW'
-            ? ThinkingLevel.LOW
-            : ThinkingLevel.MEDIUM
-          : ThinkingLevel.MINIMAL;
-
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: promptText,
-        config: {
-          systemInstruction: buildSystemInstruction(
-            mode,
-            language,
-            departmentName,
-            semesterLabel,
-            aiConfig,
-            concise
-          ),
-          thinkingConfig: { thinkingLevel },
-        },
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      res.status(400).json({
+        error: language === 'en' ? 'Please write a question.' : 'অনুগ্রহ করে একটি প্রশ্ন লিখুন।',
       });
+      return;
+    }
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      res.status(503).json({
+        error:
+          language === 'en'
+            ? 'GEMINI_API_KEY is not configured on the server. Set it in Settings > Secrets.'
+            : 'সার্ভারে GEMINI_API_KEY কনফিগার করা নেই। AI Studio Secrets প্যানেল অথবা .env ফাইলে GEMINI_API_KEY সেট করুন।',
+        code: 'API_KEY_MISSING',
+      });
+      return;
+    }
+
+    const db = dbStore.load();
+    const aiConfig = db.aiConfig;
+    const historyLimit = Math.min(20, Math.max(2, aiConfig.maxHistoryTurns || 8));
+    const recentHistory = Array.isArray(history) ? history.slice(-historyLimit) : [];
+    const formattedHistory = recentHistory
+      .map((turn) => `${turn.role === 'user' ? 'Student' : 'Polytechnic Hub AI'}: ${turn.text}`)
+      .join('\n\n');
+
+    const promptText = formattedHistory
+      ? `Previous Conversation:\n${formattedHistory}\n\nCurrent Question:\n${message.trim()}`
+      : message.trim();
+
+    const primaryModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' =
+      aiConfig.activeModel === 'gemini-3.1-flash-lite'
+        ? 'gemini-3.1-flash-lite'
+        : 'gemini-4-hydrogen';
+    const fallbackModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' =
+      primaryModel === 'gemini-4-hydrogen' ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen';
+
+    const systemInstruction = buildSystemInstruction(
+      mode,
+      language,
+      departmentName,
+      semesterLabel,
+      aiConfig,
+      concise
+    );
+
+    const askWithModel = async (candidateModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite') => {
+      const thinkingLevel = resolveThinkingLevelForModel(candidateModel, concise, mode, aiConfig);
+      try {
+        return await ai.models.generateContent({
+          model: candidateModel,
+          contents: promptText,
+          config: {
+            systemInstruction,
+            thinkingConfig: { thinkingLevel },
+          },
+        });
+      } catch (innerErr: unknown) {
+        const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+        if (msg.includes('thinking') || msg.includes('INVALID_ARGUMENT')) {
+          return await ai.models.generateContent({
+            model: candidateModel,
+            contents: promptText,
+            config: { systemInstruction },
+          });
+        }
+        throw innerErr;
+      }
+    };
+
+    try {
+      let response;
+      try {
+        response = await askWithModel(primaryModel);
+      } catch (primaryErr: unknown) {
+        const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+        if (isFallbackEligibleAiError(msg)) {
+          try {
+            response = await askWithModel(fallbackModel);
+          } catch (fallbackErr: unknown) {
+            const fMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+            if (fMsg.includes('503') || fMsg.includes('UNAVAILABLE') || fMsg.includes('high demand')) {
+              await new Promise((r) => setTimeout(r, 900));
+              response = await askWithModel(fallbackModel);
+            } else {
+              throw fallbackErr;
+            }
+          }
+        } else {
+          throw primaryErr;
+        }
+      }
 
       const answerText = response.text?.trim();
       if (!answerText) {
@@ -1426,29 +3322,9 @@ async function createServer() {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error('AI Ask Error:', errorMessage);
-      recordAiUsage('general', Date.now() - startedAt, true);
-
-      if (
-        errorMessage.includes('403') ||
-        errorMessage.includes('PERMISSION_DENIED') ||
-        errorMessage.includes('API_KEY_INVALID')
-      ) {
-        res.status(403).json({
-          error: 'API Key সঠিক নয় বা অনুমতি পাওয়া যায়নি। Secrets প্যানেল থেকে কী যাচাই করুন।',
-        });
-        return;
-      }
-
-      if (errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
-        res.status(429).json({
-          error: 'অনুরোধের সীমা অতিক্রম করেছে। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।',
-        });
-        return;
-      }
-
-      res.status(500).json({
-        error: 'এআই টিউটরের সাথে সংযোগে সমস্যা হয়েছে। অনুগ্রহ করে পুনরায় চেষ্টা করুন।',
-      });
+      recordAiUsage(mode, Date.now() - startedAt, true);
+      const mapped = formatGeminiErrorForClient(err, language, primaryModel);
+      res.status(mapped.status).json({ error: mapped.message, code: mapped.code });
     }
   });
 
