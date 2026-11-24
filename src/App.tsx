@@ -1174,6 +1174,22 @@ export default function App() {
     await refreshNotificationInbox();
   };
 
+  const handleProfileUpdated = (updatedUser: AuthUser) => {
+    setCachedAuthUser(updatedUser);
+    setCurrentUser(updatedUser);
+    handleUpdateSettings({
+      studentName: updatedUser.fullName,
+      collegeName: updatedUser.collegeName || updatedUser.instituteName || state.settings.collegeName,
+      avatarDataUrl: updatedUser.avatarUrl || state.settings.avatarDataUrl,
+      coverDataUrl: updatedUser.coverUrl || state.settings.coverDataUrl,
+      department: (updatedUser.department as DepartmentId) || state.settings.department,
+      semester: (updatedUser.semester as SemesterNumber) || state.settings.semester,
+    });
+    void syncUserProfileToFirestore(updatedUser).catch((err) => {
+      console.warn('Firestore profile mirror notice:', err instanceof Error ? err.message : err);
+    });
+  };
+
   const handleAuthSuccess = (user: AuthUser) => {
     setCachedAuthUser(user);
     setCurrentUser(user);
@@ -1439,6 +1455,7 @@ export default function App() {
               isPasswordRecovery={isPasswordRecovery}
               onClearPasswordRecovery={() => setIsPasswordRecovery(false)}
               onAuthSuccess={handleAuthSuccess}
+              onProfileUpdated={handleProfileUpdated}
               onLogout={handleLogout}
               onUpdateLocalSettings={handleUpdateSettings}
               onNavigate={setActiveView}

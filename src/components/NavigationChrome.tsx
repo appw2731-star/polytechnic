@@ -153,6 +153,11 @@ export const DesktopSidebar: React.FC<DesktopSidebarProps> = ({
             <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
               {currentUser?.fullName || studentName}
             </p>
+            {currentUser?.email && (
+              <p className="text-[11px] text-cyan-600 dark:text-cyan-400 truncate">
+                {currentUser.email}
+              </p>
+            )}
             <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
               {deptInfo?.shortName ?? 'PT'} ·{' '}
               {language === 'en' ? SEMESTER_LABELS_EN[semester] : SEMESTER_LABELS[semester]}

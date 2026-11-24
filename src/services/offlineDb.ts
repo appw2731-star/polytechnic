@@ -28,13 +28,52 @@ function openDb(): Promise<IDBDatabase> {
 
 export const offlineDb = {
   async saveOfflinePdf(record: OfflinePdfRecord): Promise<void> {
+    let persistedBytes = record.bytes;
+    if (!persistedBytes && record.blob) {
+      try {
+        persistedBytes = await record.blob.arrayBuffer();
+      } catch {
+        // Keep original blob if arrayBuffer fails
+      }
+    }
+    const cleanMime = record.mimeType || 'application/pdf';
+    const cleanBlob = persistedBytes
+      ? new Blob([persistedBytes], { type: cleanMime })
+      : record.blob;
+    const normalizedRecord: OfflinePdfRecord = {
+      ...record,
+      mimeType: cleanMime,
+      sizeBytes: persistedBytes?.byteLength || record.sizeBytes || cleanBlob?.size || 0,
+      bytes: persistedBytes,
+      blob: cleanBlob,
+    };
+
     const db = await openDb();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_PDFS, 'readwrite');
-      tx.objectStore(STORE_PDFS).put(record);
+      tx.objectStore(STORE_PDFS).put(normalizedRecord);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error ?? new Error('Failed to save offline PDF'));
     });
+  },
+
+  async readOfflinePdfBytes(record: OfflinePdfRecord): Promise<Uint8Array | null> {
+    try {
+      if (record.bytes instanceof ArrayBuffer && record.bytes.byteLength > 0) {
+        return new Uint8Array(record.bytes.slice(0));
+      }
+      if (record.bytes && ArrayBuffer.isView(record.bytes)) {
+        const view = record.bytes as unknown as ArrayBufferView;
+        return new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+      }
+      if (record.blob && typeof record.blob.arrayBuffer === 'function') {
+        const buf = await record.blob.arrayBuffer();
+        if (buf.byteLength > 0) return new Uint8Array(buf);
+      }
+    } catch {
+      return null;
+    }
+    return null;
   },
 
   async listOfflinePdfs(): Promise<OfflinePdfRecord[]> {

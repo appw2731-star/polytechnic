@@ -435,6 +435,7 @@ export interface OfflinePdfRecord {
   mimeType: string;
   sizeBytes: number;
   blob?: Blob;
+  bytes?: ArrayBuffer;
   textContent?: string;
   savedAt: string;
 }

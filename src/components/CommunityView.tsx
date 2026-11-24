@@ -73,6 +73,7 @@ export const CommunityView: React.FC<CommunityViewProps> = ({
 
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [reportedIds, setReportedIds] = useState<Set<string>>(new Set());
 
   // Public Student Profile Viewer Modal (Facebook-style)
@@ -165,12 +166,23 @@ export const CommunityView: React.FC<CommunityViewProps> = ({
 
   const handleCreatePost = async (e: React.FormEvent) => {
     e.preventDefault();
+    setErrorMsg(null);
     if (!currentUser) {
       onNavigate('profile');
       return;
     }
+    if (!isOnline) {
+      setErrorMsg(
+        bi(
+          language,
+          'কমিউনিটিতে পোস্ট করতে ইন্টারনেট সংযোগ চালু করুন।',
+          'Please connect to the internet to publish a community post.'
+        )
+      );
+      return;
+    }
     if (!body.trim() && !postImage) {
-      showNotice(bi(language, 'পোস্টের লেখা বা একটি ছবি যোগ করুন।', 'Write something or attach a photo.'));
+      setErrorMsg(bi(language, 'পোস্টের লেখা বা একটি ছবি যোগ করুন।', 'Write something or attach a photo.'));
       return;
     }
 
@@ -180,11 +192,25 @@ export const CommunityView: React.FC<CommunityViewProps> = ({
         title: title.trim() || undefined,
         body: body.trim(),
         imageUrl: postImage || undefined,
-        department: postDept,
-        semester: postSem,
+        department: postDept || currentUser.department || defaultDepartment,
+        semester: postSem || currentUser.semester || defaultSemester,
         subjectTag: subjectTag.trim(),
       });
       setPosts((prev) => [res.post, ...prev]);
+      setAuthorProfiles((prev) => ({
+        ...prev,
+        [res.post.authorId]: {
+          id: currentUser.id,
+          fullName: currentUser.fullName,
+          department: currentUser.department || defaultDepartment,
+          semester: currentUser.semester || defaultSemester,
+          collegeName: currentUser.collegeName || currentUser.instituteName || '',
+          avatarUrl: currentUser.avatarUrl || '',
+          bio: currentUser.bio || '',
+          role: currentUser.role,
+          source: 'server',
+        },
+      }));
       setTitle('');
       setBody('');
       setSubjectTag('');
@@ -192,7 +218,11 @@ export const CommunityView: React.FC<CommunityViewProps> = ({
       setShowAdvancedTags(false);
       showNotice(bi(language, 'আপনার পোস্ট সফলভাবে প্রকাশিত হয়েছে!', 'Post published successfully!'));
     } catch (err) {
-      showNotice(err instanceof Error ? err.message : 'Failed to publish post');
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : bi(language, 'পোস্ট প্রকাশ করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।', 'Failed to publish post')
+      );
     } finally {
       setPublishing(false);
     }
@@ -319,8 +349,17 @@ export const CommunityView: React.FC<CommunityViewProps> = ({
         </div>
       )}
 
+      {errorMsg && (
+        <div className="p-3.5 rounded-xl bg-red-500/12 border border-red-500/30 text-xs font-medium text-red-700 dark:text-red-300 flex items-center justify-between gap-2">
+          <span>{errorMsg}</span>
+          <button type="button" onClick={() => setErrorMsg(null)} aria-label="Close error">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {feedback && (
-        <div className="p-3 rounded-xl bg-cyan-500/12 border border-cyan-500/30 text-xs font-medium text-cyan-800 dark:text-cyan-200">
+        <div className="p-3 rounded-xl bg-emerald-500/12 border border-emerald-500/30 text-xs font-medium text-emerald-700 dark:text-emerald-300">
           {feedback}
         </div>
       )}

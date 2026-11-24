@@ -17,9 +17,45 @@ import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { bi } from '../i18n/translations';
 import { apiClient } from '../services/apiClient';
+import { offlineDb } from '../services/offlineDb';
 import { LanguageMode } from '../types/study';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+const PDF_WORKER_CACHE_KEY = 'pdfjs_worker_script_v1';
+let cachedBlobWorkerUrl: string | null = null;
+let workerPrefetchStarted = false;
+
+export async function prefetchPdfWorkerForOffline(): Promise<void> {
+  if (workerPrefetchStarted || typeof window === 'undefined' || !navigator.onLine) return;
+  workerPrefetchStarted = true;
+  try {
+    const existing = await offlineDb.getCachedValue<string>(PDF_WORKER_CACHE_KEY);
+    if (existing && existing.length > 1000) return;
+    const res = await fetch(pdfWorkerUrl, { cache: 'force-cache' });
+    if (!res.ok) return;
+    const scriptText = await res.text();
+    if (scriptText && scriptText.length > 1000) {
+      await offlineDb.setCachedValue(PDF_WORKER_CACHE_KEY, scriptText);
+    }
+  } catch {
+    workerPrefetchStarted = false;
+  }
+}
+
+async function resolveOfflineWorkerBlobUrl(): Promise<string | null> {
+  if (cachedBlobWorkerUrl) return cachedBlobWorkerUrl;
+  try {
+    const scriptText = await offlineDb.getCachedValue<string>(PDF_WORKER_CACHE_KEY);
+    if (!scriptText || scriptText.length < 1000) return null;
+    const blob = new Blob([scriptText], { type: 'text/javascript' });
+    cachedBlobWorkerUrl = URL.createObjectURL(blob);
+    pdfjsLib.GlobalWorkerOptions.workerSrc = cachedBlobWorkerUrl;
+    return cachedBlobWorkerUrl;
+  } catch {
+    return null;
+  }
+}
 
 export interface PdfReaderDocument {
   title: string;
@@ -47,6 +83,7 @@ export const PdfReaderModal: React.FC<PdfReaderModalProps> = ({ doc, language, o
   const [loadingDoc, setLoadingDoc] = useState(true);
   const [renderingPage, setRenderingPage] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [fallbackBlobUrl, setFallbackBlobUrl] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
   const [pageNumber, setPageNumber] = useState(1);
   const [scale, setScale] = useState(1.1);
@@ -61,12 +98,19 @@ export const PdfReaderModal: React.FC<PdfReaderModalProps> = ({ doc, language, o
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
+  useEffect(() => {
+    void prefetchPdfWorkerForOffline();
+  }, []);
+
   // Load PDF document from bytes or URL
   useEffect(() => {
     let cancelled = false;
+    let activeFallbackUrl: string | null = null;
+
     const loadDocument = async () => {
       setLoadingDoc(true);
       setLoadError(null);
+      setFallbackBlobUrl(null);
       setNumPages(0);
       setPageNumber(1);
 
@@ -83,14 +127,55 @@ export const PdfReaderModal: React.FC<PdfReaderModalProps> = ({ doc, language, o
         if (cancelled) return;
         rawBytesRef.current = new Uint8Array(dataBytes);
 
-        const loadingTask = pdfjsLib.getDocument({
-          data: dataBytes,
-          useWorkerFetch: false,
-        });
-        loadingTaskRef.current = loadingTask;
-        const loadedPdf = await loadingTask.promise;
+        // If currently offline and we have a cached local Blob worker script, use it immediately
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          await resolveOfflineWorkerBlobUrl();
+        }
+
+        const openWithPdfJs = async (): Promise<pdfjsLib.PDFDocumentProxy> => {
+          const copy = new Uint8Array(rawBytesRef.current ?? dataBytes);
+          const loadingTask = pdfjsLib.getDocument({
+            data: copy,
+            useWorkerFetch: false,
+          });
+          loadingTaskRef.current = loadingTask;
+          return loadingTask.promise;
+        };
+
+        let loadedPdf: pdfjsLib.PDFDocumentProxy;
+        try {
+          loadedPdf = await openWithPdfJs();
+        } catch (firstErr) {
+          // Retry with locally cached Blob worker script (for offline resilience)
+          const blobWorker = await resolveOfflineWorkerBlobUrl();
+          if (blobWorker && !cancelled) {
+            try {
+              loadedPdf = await openWithPdfJs();
+            } catch {
+              // Seamless fallback to native browser PDF viewer via Blob URL
+              const pdfBlob = new Blob([new Uint8Array(rawBytesRef.current)], {
+                type: 'application/pdf',
+              });
+              activeFallbackUrl = URL.createObjectURL(pdfBlob);
+              if (!cancelled) {
+                setFallbackBlobUrl(activeFallbackUrl);
+              }
+              return;
+            }
+          } else if (rawBytesRef.current && rawBytesRef.current.byteLength > 0 && !cancelled) {
+            const pdfBlob = new Blob([new Uint8Array(rawBytesRef.current)], {
+              type: 'application/pdf',
+            });
+            activeFallbackUrl = URL.createObjectURL(pdfBlob);
+            setFallbackBlobUrl(activeFallbackUrl);
+            return;
+          } else {
+            throw firstErr;
+          }
+        }
+
         if (cancelled) {
-          await loadingTask.destroy().catch(() => {});
+          await loadingTaskRef.current?.destroy().catch(() => {});
           return;
         }
         pdfDocRef.current = loadedPdf;
@@ -127,6 +212,9 @@ export const PdfReaderModal: React.FC<PdfReaderModalProps> = ({ doc, language, o
 
     return () => {
       cancelled = true;
+      if (activeFallbackUrl) {
+        URL.revokeObjectURL(activeFallbackUrl);
+      }
       if (renderTaskRef.current) {
         try {
           renderTaskRef.current.cancel();
@@ -362,7 +450,9 @@ export const PdfReaderModal: React.FC<PdfReaderModalProps> = ({ doc, language, o
         {/* Viewport */}
         <div
           ref={scrollAreaRef}
-          className="flex-1 overflow-auto bg-slate-200/80 dark:bg-[#050A14] p-3 sm:p-5 flex justify-center items-start"
+          className={`flex-1 overflow-auto bg-slate-200/80 dark:bg-[#050A14] ${
+            fallbackBlobUrl ? 'p-0' : 'p-3 sm:p-5 flex justify-center items-start'
+          }`}
         >
           {loadingDoc ? (
             <div className="my-auto flex flex-col items-center gap-3 text-slate-600 dark:text-slate-300">
@@ -371,6 +461,12 @@ export const PdfReaderModal: React.FC<PdfReaderModalProps> = ({ doc, language, o
                 {bi(language, 'PDF ডকুমেন্ট লোড হচ্ছে...', 'Rendering PDF document...')}
               </p>
             </div>
+          ) : fallbackBlobUrl ? (
+            <iframe
+              src={fallbackBlobUrl}
+              title={doc.title}
+              className="w-full h-full min-h-[75vh] border-0 bg-white"
+            />
           ) : loadError ? (
             <div className="my-auto max-w-md rounded-2xl bg-white dark:bg-[#111827] border border-red-500/30 p-6 text-center space-y-3">
               <AlertTriangle className="w-8 h-8 text-amber-500 mx-auto" />

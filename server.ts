@@ -385,9 +385,110 @@ async function resolveBearerUser(
   const localPayload = verifyAuthToken(token);
   if (localPayload) {
     const db = dbStore.load();
-    const localUser = db.users.find((u) => u.id === localPayload.sub);
-    if (localUser && !localUser.isDisabled) {
+    let localUser =
+      db.users.find((u) => u.id === localPayload.sub) ??
+      (localPayload.firebaseUid
+        ? db.users.find((u) => u.firebaseUid === localPayload.firebaseUid)
+        : undefined) ??
+      (localPayload.email
+        ? db.users.find((u) => u.email.toLowerCase() === localPayload.email!.toLowerCase())
+        : undefined);
+
+    if (localUser) {
+      if (localUser.isDisabled) return null;
       return { user: toPublicUser(localUser) };
+    }
+
+    // Re-hydrate user cleanly when the token signature is valid (e.g., after container restart)
+    if (localPayload.email) {
+      const now = new Date().toISOString();
+      const hydrated = dbStore.mutate((draft) => {
+        const existing = draft.users.find(
+          (u) =>
+            u.id === localPayload.sub ||
+            u.email.toLowerCase() === localPayload.email!.toLowerCase()
+        );
+        if (existing) return existing;
+        const created: DbUser = {
+          id: localPayload.sub,
+          firebaseUid: localPayload.firebaseUid,
+          fullName: localPayload.fullName?.trim() || localPayload.email!.split('@')[0] || 'Student',
+          email: localPayload.email!.trim().toLowerCase(),
+          passwordHash: '',
+          role: localPayload.role === 'admin' ? 'admin' : 'student',
+          avatarUrl: '',
+          coverUrl: '',
+          gender: '',
+          showGender: false,
+          bio: '',
+          department: localPayload.department || 'power',
+          semester: Math.min(8, Math.max(1, Number(localPayload.semester || 4) || 4)),
+          collegeName: '',
+          instituteName: '',
+          rollNumber: '',
+          profileVisibility: 'public',
+          isDisabled: false,
+          createdAt: now,
+          updatedAt: now,
+        };
+        draft.users.push(created);
+        return created;
+      });
+      if (hydrated && !hydrated.isDisabled) {
+        return { user: toPublicUser(hydrated) };
+      }
+    }
+  }
+
+  // Direct Firebase ID token support (eliminates 401s for Gmail/Firebase users across refreshes or restarts)
+  if (token.split('.').length === 3 && FIREBASE_PROJECT_ID) {
+    try {
+      const fbClaims = await verifyFirebaseIdToken(token);
+      if (fbClaims && fbClaims.email) {
+        const adminEnvEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+        const now = new Date().toISOString();
+        const fbUser = dbStore.mutate((draft) => {
+          let existing =
+            draft.users.find((u) => u.firebaseUid === fbClaims.uid) ??
+            draft.users.find((u) => u.email.toLowerCase() === fbClaims.email);
+          if (existing) {
+            if (!existing.firebaseUid) existing.firebaseUid = fbClaims.uid;
+            if (!existing.email) existing.email = fbClaims.email;
+            if (!existing.avatarUrl && fbClaims.picture) existing.avatarUrl = fbClaims.picture;
+            return existing;
+          }
+          const canonicalId = deterministicUuidFromFirebaseUid(fbClaims.uid);
+          const created: DbUser = {
+            id: canonicalId,
+            firebaseUid: fbClaims.uid,
+            fullName: fbClaims.name?.trim() || fbClaims.email.split('@')[0] || 'Student',
+            email: fbClaims.email,
+            passwordHash: '',
+            role: adminEnvEmail && fbClaims.email === adminEnvEmail ? 'admin' : 'student',
+            avatarUrl: fbClaims.picture || '',
+            coverUrl: '',
+            gender: '',
+            showGender: false,
+            bio: '',
+            department: 'power',
+            semester: 4,
+            collegeName: '',
+            instituteName: '',
+            rollNumber: '',
+            profileVisibility: 'public',
+            isDisabled: false,
+            createdAt: now,
+            updatedAt: now,
+          };
+          draft.users.push(created);
+          return created;
+        });
+        if (fbUser && !fbUser.isDisabled) {
+          return { user: toPublicUser(fbUser) };
+        }
+      }
+    } catch {
+      // Fall through to Supabase token check
     }
   }
 
@@ -470,7 +571,7 @@ function mapSupabaseProfileRow(row: Record<string, unknown>): PublicUser {
 
 async function createServer() {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '5mb' }));
 
   dbStore.load();
 
@@ -686,56 +787,72 @@ async function createServer() {
             : 'student';
 
       const cleanDisplayName =
+        existing?.fullName?.trim() ||
+        (supabaseProfile?.full_name ? String(supabaseProfile.full_name).trim() : '') ||
         (typeof fullName === 'string' && fullName.trim()) ||
-        (supabaseProfile?.full_name ? String(supabaseProfile.full_name) : '') ||
-        existing?.fullName ||
         claims!.name ||
         normalizedEmail.split('@')[0];
 
       const cleanAvatar =
-        (supabaseProfile?.avatar_url ? String(supabaseProfile.avatar_url) : '') ||
         existing?.avatarUrl ||
+        (supabaseProfile?.avatar_url ? String(supabaseProfile.avatar_url) : '') ||
         claims!.picture ||
         '';
 
       const cleanDept =
-        (typeof department === 'string' && department.trim()) ||
-        (supabaseProfile?.department ? String(supabaseProfile.department) : '') ||
         existing?.department ||
+        (supabaseProfile?.department ? String(supabaseProfile.department) : '') ||
+        (typeof department === 'string' && department.trim()) ||
         'power';
 
       const cleanSem = Math.min(
         8,
         Math.max(
           1,
-          Number(semester || supabaseProfile?.semester || existing?.semester || 4) || 4
+          Number(existing?.semester || supabaseProfile?.semester || semester || 4) || 4
         )
       );
 
       const cleanCollege =
-        (typeof collegeName === 'string' && collegeName.trim()) ||
-        (supabaseProfile?.college_name ? String(supabaseProfile.college_name) : '') ||
         existing?.collegeName ||
+        existing?.instituteName ||
+        (supabaseProfile?.college_name ? String(supabaseProfile.college_name) : '') ||
+        (typeof collegeName === 'string' && collegeName.trim()) ||
         '';
 
       const cleanRoll =
-        (typeof rollNumber === 'string' && rollNumber.trim()) ||
-        (supabaseProfile?.roll_number ? String(supabaseProfile.roll_number) : '') ||
         existing?.rollNumber ||
+        (supabaseProfile?.roll_number ? String(supabaseProfile.roll_number) : '') ||
+        (typeof rollNumber === 'string' && rollNumber.trim()) ||
         '';
 
       if (existing) {
+        const previousId = existing.id;
         existing.id = canonicalId;
         existing.firebaseUid = claims!.uid;
-        existing.fullName = cleanDisplayName;
+        existing.email = normalizedEmail;
+        if (!existing.fullName?.trim()) existing.fullName = cleanDisplayName;
         existing.role = resolvedRole;
         if (!existing.avatarUrl && cleanAvatar) existing.avatarUrl = cleanAvatar;
+        if (!existing.department && cleanDept) existing.department = cleanDept;
+        if (!existing.semester && cleanSem) existing.semester = cleanSem;
         if (!existing.collegeName && cleanCollege) {
           existing.collegeName = cleanCollege;
           existing.instituteName = cleanCollege;
         }
         if (!existing.rollNumber && cleanRoll) existing.rollNumber = cleanRoll;
         existing.updatedAt = now;
+        if (previousId !== canonicalId) {
+          for (const p of draft.communityPosts) {
+            if (p.authorId === previousId) p.authorId = canonicalId;
+            for (const r of p.replies || []) {
+              if (r.authorId === previousId) r.authorId = canonicalId;
+            }
+          }
+          for (const pdf of draft.userPdfs) {
+            if (pdf.userId === previousId) pdf.userId = canonicalId;
+          }
+        }
         syncedUser = existing;
       } else {
         const created: DbUser = {
@@ -1156,8 +1273,8 @@ async function createServer() {
         };
         draft.users.push(target);
       }
-      if (typeof fullName === 'string' && fullName.trim().length >= 2) {
-        target.fullName = fullName.trim();
+      if (typeof fullName === 'string' && fullName.trim().length >= 1) {
+        target.fullName = fullName.trim().slice(0, 100);
       }
       if (typeof department === 'string' && department.trim()) {
         target.department = department.trim();
@@ -1196,7 +1313,7 @@ async function createServer() {
         if (
           cleanAvatar === '' ||
           ((cleanAvatar.startsWith('data:image/') || cleanAvatar.startsWith('https://')) &&
-            cleanAvatar.length <= 1_200_000)
+            cleanAvatar.length <= 2_500_000)
         ) {
           target.avatarUrl = cleanAvatar;
         }
@@ -1206,7 +1323,7 @@ async function createServer() {
         if (
           cleanCover === '' ||
           ((cleanCover.startsWith('data:image/') || cleanCover.startsWith('https://')) &&
-            cleanCover.length <= 1_200_000)
+            cleanCover.length <= 2_500_000)
         ) {
           target.coverUrl = cleanCover;
         }
@@ -1219,6 +1336,7 @@ async function createServer() {
           post.authorName = target.fullName;
           post.authorAvatarUrl = target.avatarUrl || post.authorAvatarUrl;
           post.authorDepartment = target.department;
+          post.authorCollegeName = target.collegeName || target.instituteName || post.authorCollegeName;
         }
       }
 
@@ -1229,7 +1347,26 @@ async function createServer() {
 
     if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && !finalUser.id.startsWith('usr-')) {
       try {
-        await fetch(
+        const sbBody: Record<string, unknown> = {
+          id: finalUser.id,
+          email: finalUser.email,
+          full_name: finalUser.fullName,
+          department: finalUser.department,
+          semester: finalUser.semester,
+          college_name: finalUser.collegeName,
+          institute_name: finalUser.instituteName,
+          roll_number: finalUser.rollNumber,
+          bio: finalUser.bio,
+          gender: finalUser.gender,
+          show_gender: finalUser.showGender,
+          profile_visibility: finalUser.profileVisibility,
+          avatar_url: finalUser.avatarUrl,
+          updated_at: finalUser.updatedAt,
+        };
+        if (finalUser.firebaseUid) {
+          sbBody.firebase_uid = finalUser.firebaseUid;
+        }
+        const patchRes = await fetch(
           `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(finalUser.id)}`,
           {
             method: 'PATCH',
@@ -1237,23 +1374,24 @@ async function createServer() {
               apikey: SUPABASE_SERVICE_ROLE_KEY,
               Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
               'Content-Type': 'application/json',
+              Prefer: 'return=representation',
             },
-            body: JSON.stringify({
-              full_name: finalUser.fullName,
-              department: finalUser.department,
-              semester: finalUser.semester,
-              college_name: finalUser.collegeName,
-              institute_name: finalUser.instituteName,
-              roll_number: finalUser.rollNumber,
-              bio: finalUser.bio,
-              gender: finalUser.gender,
-              show_gender: finalUser.showGender,
-              profile_visibility: finalUser.profileVisibility,
-              avatar_url: finalUser.avatarUrl,
-              updated_at: finalUser.updatedAt,
-            }),
+            body: JSON.stringify(sbBody),
           }
         );
+        const patchedRows = patchRes.ok ? ((await patchRes.json().catch(() => [])) as unknown[]) : [];
+        if (!patchRes.ok || patchedRows.length === 0) {
+          await fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=id`, {
+            method: 'POST',
+            headers: {
+              apikey: SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'resolution=merge-duplicates',
+            },
+            body: JSON.stringify(sbBody),
+          }).catch(() => {});
+        }
       } catch {
         // local dbStore remains consistent if Supabase network request fails
       }
@@ -1533,11 +1671,11 @@ async function createServer() {
     const cleanImage =
       typeof imageUrl === 'string' &&
       (imageUrl.startsWith('data:image/') || imageUrl.startsWith('https://')) &&
-      imageUrl.length <= 1_200_000
+      imageUrl.length <= 3_000_000
         ? imageUrl.trim()
         : '';
 
-    if (cleanBody.length < 2 && !cleanImage) {
+    if (cleanBody.length < 1 && !cleanImage) {
       res.status(400).json({ error: 'পোস্টের লেখা বা একটি ছবি যোগ করুন।' });
       return;
     }
@@ -1559,8 +1697,8 @@ async function createServer() {
       authorCollegeName: auth.collegeName || auth.instituteName || '',
       authorDepartment: auth.department,
       authorRole: auth.role,
-      department: String(department),
-      semester: Math.min(8, Math.max(1, Number(semester) || 4)),
+      department: String(department || auth.department || 'power'),
+      semester: Math.min(8, Math.max(1, Number(semester || auth.semester || 4) || 4)),
       subjectTag: String(subjectTag || '').trim(),
       title: derivedTitle,
       body: cleanBody,
@@ -1572,10 +1710,11 @@ async function createServer() {
       createdAt: new Date().toISOString(),
     };
 
-    dbStore.mutate((draft) => {
+    const enriched = dbStore.mutate((draft) => {
       draft.communityPosts.unshift(post);
+      return enrichCommunityPost(post, draft.users);
     });
-    res.status(201).json({ post });
+    res.status(201).json({ post: enriched });
   });
 
   app.post(

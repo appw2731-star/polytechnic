@@ -57,6 +57,7 @@ interface ProfileAuthViewProps {
   isPasswordRecovery: boolean;
   onClearPasswordRecovery: () => void;
   onAuthSuccess: (user: AuthUser) => void;
+  onProfileUpdated?: (user: AuthUser) => void;
   onLogout: () => Promise<void> | void;
   onUpdateLocalSettings: (partial: Partial<UserSettings>) => void;
   onNavigate: (view: AppView) => void;
@@ -73,6 +74,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   isPasswordRecovery,
   onClearPasswordRecovery,
   onAuthSuccess,
+  onProfileUpdated,
   onLogout,
   onUpdateLocalSettings,
   onNavigate,
@@ -130,12 +132,31 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   const coverInputRef = useRef<HTMLInputElement | null>(null);
   const postImageInputRef = useRef<HTMLInputElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const lastSyncedUserKeyRef = useRef<string>('');
+
+  const applyProfileUpdated = useCallback(
+    (updatedUser: AuthUser) => {
+      if (onProfileUpdated) {
+        onProfileUpdated(updatedUser);
+      } else {
+        onAuthSuccess(updatedUser);
+      }
+    },
+    [onProfileUpdated, onAuthSuccess]
+  );
 
   useEffect(() => {
-    if (!currentUser) return;
-    setEditName(currentUser.fullName);
-    setEditDept(currentUser.department);
-    setEditSem(currentUser.semester);
+    if (!currentUser) {
+      lastSyncedUserKeyRef.current = '';
+      return;
+    }
+    const syncKey = `${currentUser.id}:${currentUser.updatedAt || ''}:${currentUser.fullName}:${currentUser.department}:${currentUser.semester}`;
+    if (lastSyncedUserKeyRef.current === syncKey) return;
+    lastSyncedUserKeyRef.current = syncKey;
+
+    setEditName(currentUser.fullName || '');
+    setEditDept(currentUser.department || localSettings.department);
+    setEditSem(currentUser.semester || localSettings.semester);
     setEditCollege(currentUser.collegeName || currentUser.instituteName || '');
     setEditRoll(currentUser.rollNumber || '');
     setEditBio(currentUser.bio || '');
@@ -144,7 +165,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setEditVisibility(currentUser.profileVisibility || 'public');
     setEditAvatarUrl(currentUser.avatarUrl || localSettings.avatarDataUrl || '');
     setEditCoverUrl(currentUser.coverUrl || localSettings.coverDataUrl || '');
-  }, [currentUser, localSettings.avatarDataUrl, localSettings.coverDataUrl]);
+  }, [currentUser, localSettings.department, localSettings.semester, localSettings.avatarDataUrl, localSettings.coverDataUrl]);
 
   const loadMyPosts = useCallback(async () => {
     if (!currentUser) {
@@ -355,8 +376,15 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       }
       setStoredToken(outcome.token);
       onAuthSuccess(outcome.syncedUser);
+      if (!outcome.syncedUser.collegeName && !outcome.syncedUser.instituteName) {
+        setProfileTab('about');
+      }
       setSuccessMsg(
-        bi(language, 'Google অ্যাকাউন্ট দিয়ে প্রোফাইল চালু হয়েছে!', 'Signed in with Google!')
+        bi(
+          language,
+          `Google (${outcome.syncedUser.email}) দিয়ে সাইন ইন হয়েছে! নিচে থেকে আপনার প্রোফাইল কাস্টমাইজ করুন।`,
+          `Signed in with Google (${outcome.syncedUser.email})! You can customize your profile below.`
+        )
       );
     } catch (err) {
       const code =
@@ -422,7 +450,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       const dataUrl = await compressImageFile(file, { maxWidth: 280, maxHeight: 280, quality: 0.84 });
       const res = await apiClient.updateProfile({ avatarUrl: dataUrl });
       setEditAvatarUrl(res.user.avatarUrl || dataUrl);
-      onAuthSuccess(res.user);
+      applyProfileUpdated(res.user);
       onUpdateLocalSettings({ avatarDataUrl: dataUrl });
       setSuccessMsg(bi(language, 'প্রোফাইল ছবি আপডেট হয়েছে!', 'Profile photo updated!'));
     } catch (err) {
@@ -440,7 +468,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       const dataUrl = await compressImageFile(file, { maxWidth: 1100, maxHeight: 420, quality: 0.8 });
       const res = await apiClient.updateProfile({ coverUrl: dataUrl });
       setEditCoverUrl(res.user.coverUrl || dataUrl);
-      onAuthSuccess(res.user);
+      applyProfileUpdated(res.user);
       onUpdateLocalSettings({ coverDataUrl: dataUrl });
       setSuccessMsg(bi(language, 'কভার ফটো আপডেট হয়েছে!', 'Cover photo updated!'));
     } catch (err) {
@@ -520,35 +548,45 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
+    const trimmedName = editName.trim();
+    if (!trimmedName) {
+      setErrorMsg(bi(language, 'আপনার পূর্ণ নাম লিখুন।', 'Please enter your full name.'));
+      return;
+    }
     setErrorMsg(null);
     setSuccessMsg(null);
     setLoading(true);
     try {
       const res = await apiClient.updateProfile({
-        fullName: editName,
+        fullName: trimmedName,
         department: editDept,
         semester: Number(editSem),
-        collegeName: editCollege,
-        instituteName: editCollege,
-        rollNumber: editRoll,
-        bio: editBio,
+        collegeName: editCollege.trim(),
+        instituteName: editCollege.trim(),
+        rollNumber: editRoll.trim(),
+        bio: editBio.trim(),
         gender: editGender,
         showGender: editShowGender,
         profileVisibility: editVisibility,
         avatarUrl: editAvatarUrl,
         coverUrl: editCoverUrl,
       });
-      onAuthSuccess(res.user);
+      const updatedUser: AuthUser = {
+        ...res.user,
+        email: res.user.email || currentUser.email,
+        firebaseUid: res.user.firebaseUid || currentUser.firebaseUid,
+      };
+      applyProfileUpdated(updatedUser);
 
       onUpdateLocalSettings({
-        studentName: editName.trim() || currentUser.fullName,
-        collegeName: editCollege.trim() || currentUser.collegeName || currentUser.instituteName,
-        department: editDept as DepartmentId,
-        semester: Number(editSem) as SemesterNumber,
-        avatarDataUrl: res.user.avatarUrl || editAvatarUrl || localSettings.avatarDataUrl,
-        coverDataUrl: res.user.coverUrl || editCoverUrl || localSettings.coverDataUrl,
+        studentName: updatedUser.fullName || trimmedName,
+        collegeName: updatedUser.collegeName || updatedUser.instituteName || editCollege.trim(),
+        department: (updatedUser.department || editDept) as DepartmentId,
+        semester: Number(updatedUser.semester || editSem) as SemesterNumber,
+        avatarDataUrl: updatedUser.avatarUrl || editAvatarUrl || localSettings.avatarDataUrl,
+        coverDataUrl: updatedUser.coverUrl || editCoverUrl || localSettings.coverDataUrl,
       });
-      setSuccessMsg(bi(language, 'প্রোফাইল সংরক্ষণ সম্পন্ন হয়েছে!', 'Profile updated!'));
+      setSuccessMsg(bi(language, 'প্রোফাইল কাস্টমাইজেশন সংরক্ষণ সম্পন্ন হয়েছে!', 'Profile changes saved!'));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Profile update failed');
     } finally {
@@ -719,6 +757,17 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                         </span>
                       )}
                     </div>
+                    {currentUser.email && (
+                      <p className="text-xs font-medium text-cyan-700 dark:text-cyan-400 flex items-center gap-1.5 break-all">
+                        <Mail className="w-3.5 h-3.5 shrink-0" />
+                        <span>{currentUser.email}</span>
+                        {currentUser.firebaseUid && (
+                          <span className="text-[10px] font-semibold text-slate-500 dark:text-slate-400">
+                            · Google
+                          </span>
+                        )}
+                      </p>
+                    )}
                     <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300">
                       {currentUser.collegeName || currentUser.instituteName || bi(language, 'পলিটেকনিক শিক্ষার্থী', 'Polytechnic Student')}
                       {' · '}
@@ -827,6 +876,16 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                   </p>
                 )}
                 <ul className="space-y-2.5 text-xs text-slate-600 dark:text-slate-300">
+                  {currentUser.email && (
+                    <li className="flex items-start gap-2.5">
+                      <Mail className="w-4 h-4 text-cyan-500 shrink-0 mt-0.5" />
+                      <span className="break-all">
+                        <strong className="text-slate-900 dark:text-white font-medium">
+                          {currentUser.email}
+                        </strong>
+                      </span>
+                    </li>
+                  )}
                   <li className="flex items-start gap-2.5">
                     <Building2 className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
                     <span>
@@ -1060,6 +1119,23 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
               </h3>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                {currentUser.email && (
+                  <div className="space-y-1 sm:col-span-2">
+                    <label className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
+                      <Mail className="w-3.5 h-3.5 text-cyan-500" />
+                      <span>
+                        {bi(language, 'সংযুক্ত ইমেইল / Gmail অ্যাকাউন্ট', 'Connected Gmail / Email Account')}
+                      </span>
+                    </label>
+                    <input
+                      type="email"
+                      readOnly
+                      value={currentUser.email}
+                      className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-100 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 text-sm text-slate-600 dark:text-slate-300 cursor-not-allowed"
+                    />
+                  </div>
+                )}
+
                 <div className="space-y-1">
                   <label className="text-xs font-medium text-slate-500">
                     {bi(language, 'পূর্ণ নাম', 'Full Name')}

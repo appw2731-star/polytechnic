@@ -316,9 +316,6 @@ export function shouldPreferGoogleRedirect(): boolean {
   if (isStandaloneOrMobileInAppBrowser()) {
     return true;
   }
-  if (isMobileBrowser() && !isCrossOriginIframe()) {
-    return true;
-  }
   return false;
 }
 
@@ -587,13 +584,15 @@ export async function ensureSupabaseProfileExists(
     const row = check.row ?? {};
     const reconciled: AuthUser = {
       ...user,
-      fullName: String(row.full_name || user.fullName),
-      department: String(row.department || user.department || 'power'),
-      semester: Number(row.semester || user.semester || 4),
-      collegeName: String(row.college_name || user.collegeName || ''),
-      avatarUrl: String(row.avatar_url || user.avatarUrl || ''),
-      bio: String(row.bio || user.bio || ''),
-      firebaseUid: String(row.firebase_uid || user.firebaseUid || '') || undefined,
+      email: user.email || String(row.email || ''),
+      fullName: user.fullName?.trim() || String(row.full_name || 'Student'),
+      department: user.department || String(row.department || 'power'),
+      semester: user.semester || Number(row.semester || 4),
+      collegeName: user.collegeName || String(row.college_name || ''),
+      instituteName: user.instituteName || user.collegeName || String(row.college_name || ''),
+      avatarUrl: user.avatarUrl || String(row.avatar_url || ''),
+      bio: user.bio || String(row.bio || ''),
+      firebaseUid: user.firebaseUid || String(row.firebase_uid || '') || undefined,
     };
 
     // If user has a firebaseUid that isn't yet linked on the Supabase row, trigger server link
@@ -646,6 +645,7 @@ export async function syncFirebaseUserToSupabaseProfile(
   const canonicalUser: AuthUser = {
     ...synced.user,
     id: synced.user.id || mapping.canonicalProfileId,
+    email: synced.user.email || mapping.email || fbUser.email || '',
     firebaseUid: synced.user.firebaseUid || mapping.firebaseUid,
   };
 

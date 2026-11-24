@@ -329,6 +329,11 @@ export interface TokenPayload {
   sub: string;
   role: UserRole;
   exp: number;
+  email?: string;
+  fullName?: string;
+  department?: string;
+  semester?: number;
+  firebaseUid?: string;
 }
 
 export function signAuthToken(user: DbUser): string {
@@ -336,6 +341,11 @@ export function signAuthToken(user: DbUser): string {
     sub: user.id,
     role: user.role,
     exp: Date.now() + 1000 * 60 * 60 * 24 * 14,
+    email: user.email,
+    fullName: user.fullName,
+    department: user.department,
+    semester: user.semester,
+    firebaseUid: user.firebaseUid,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');

@@ -1,3 +1,4 @@
+import { auth as firebaseAuth } from '../firebase';
 import { getActiveAccessToken } from '../lib/supabaseClient';
 import {
   AdminAiConfig,
@@ -74,10 +75,46 @@ export function setStoredToken(token: string | null): void {
 async function getUnifiedAuthToken(): Promise<string | null> {
   const localToken = getStoredToken();
   if (localToken) return localToken;
+  try {
+    if (firebaseAuth?.currentUser) {
+      const fbToken = await firebaseAuth.currentUser.getIdToken();
+      if (fbToken) return fbToken;
+    }
+  } catch {
+    // ignore
+  }
   return getActiveAccessToken();
 }
 
-async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function recoverFirebaseSessionToken(): Promise<string | null> {
+  try {
+    const fbUser = firebaseAuth?.currentUser;
+    if (!fbUser) return null;
+    const freshIdToken = await fbUser.getIdToken(true);
+    if (!freshIdToken) return null;
+    try {
+      const syncRes = await fetch('/api/auth/firebase-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: freshIdToken }),
+      });
+      if (syncRes.ok) {
+        const synced = (await syncRes.json().catch(() => ({}))) as { token?: string };
+        if (synced.token) {
+          setStoredToken(synced.token);
+          return synced.token;
+        }
+      }
+    } catch {
+      // Fall back to sending fresh Firebase ID token directly
+    }
+    return freshIdToken;
+  } catch {
+    return null;
+  }
+}
+
+async function apiRequest<T>(path: string, init: RequestInit = {}, allowAuthRetry = true): Promise<T> {
   const token = await getUnifiedAuthToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -88,6 +125,22 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   const res = await fetch(path, { ...init, headers });
+  if (res.status === 401 && allowAuthRetry && path !== '/api/auth/firebase-sync') {
+    const recoveredToken = await recoverFirebaseSessionToken();
+    if (recoveredToken && recoveredToken !== token) {
+      const retryHeaders = {
+        ...headers,
+        Authorization: `Bearer ${recoveredToken}`,
+      };
+      const retryRes = await fetch(path, { ...init, headers: retryHeaders });
+      const retryData = (await retryRes.json().catch(() => ({}))) as T & { error?: string };
+      if (!retryRes.ok) {
+        throw new ApiError(retryData.error || `Request failed (${retryRes.status})`, retryRes.status);
+      }
+      return retryData;
+    }
+  }
+
   const data = (await res.json().catch(() => ({}))) as T & { error?: string };
   if (!res.ok) {
     throw new ApiError(data.error || `Request failed (${res.status})`, res.status);

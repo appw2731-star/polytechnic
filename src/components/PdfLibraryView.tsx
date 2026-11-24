@@ -36,7 +36,11 @@ import {
   UserPdfRecord,
 } from '../types/study';
 import { formatDateBn, toBnDigits } from '../utils/formatBn';
-import { PdfReaderDocument, PdfReaderModal } from './PdfReaderModal';
+import {
+  PdfReaderDocument,
+  PdfReaderModal,
+  prefetchPdfWorkerForOffline,
+} from './PdfReaderModal';
 
 const MAX_PDF_BYTES = 50 * 1024 * 1024; // 50 MB
 
@@ -138,7 +142,10 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
   useEffect(() => {
     void loadOfflineVault();
     void loadCloudPdfs();
-  }, [loadOfflineVault, loadCloudPdfs]);
+    if (isOnline) {
+      void prefetchPdfWorkerForOffline();
+    }
+  }, [loadOfflineVault, loadCloudPdfs, isOnline]);
 
   const handleFilePicked = async (file: File | null) => {
     setErrorMsg(null);
@@ -208,29 +215,79 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     setUploadProgress(0);
 
     try {
+      // Read detached ArrayBuffer bytes upfront so the PDF is durably cached for offline reading
+      const rawBuffer = await selectedFile.arrayBuffer();
+      const detachedBytes = rawBuffer.slice(0);
+      const stableBlob = new Blob([detachedBytes], { type: 'application/pdf' });
+
       if (currentUser && isOnline) {
-        const upRes = await apiClient.uploadPdfWithProgress(
-          selectedFile,
-          {
-            customTitle: cleanTitle,
-            originalFilename: selectedFile.name,
+        try {
+          const upRes = await apiClient.uploadPdfWithProgress(
+            selectedFile,
+            {
+              customTitle: cleanTitle,
+              originalFilename: selectedFile.name,
+              department: uploadDept,
+              semester: uploadSem,
+              subjectName: uploadSubject.trim(),
+            },
+            (pct) => setUploadProgress(pct)
+          );
+          void syncPdfMetadataToFirestore(upRes.pdf).catch((err) => {
+            console.warn('Firestore PDF metadata sync notice:', err instanceof Error ? err.message : err);
+          });
+
+          // Automatically cache the uploaded PDF in IndexedDB for instant offline reading
+          await offlineDb.saveOfflinePdf({
+            id: upRes.pdf.id,
+            title: cleanTitle,
             department: uploadDept,
             semester: uploadSem,
-            subjectName: uploadSubject.trim(),
-          },
-          (pct) => setUploadProgress(pct)
-        );
-        void syncPdfMetadataToFirestore(upRes.pdf).catch((err) => {
-          console.warn('Firestore PDF metadata sync notice:', err instanceof Error ? err.message : err);
-        });
-        await loadCloudPdfs();
-        showToast(
-          bi(
-            language,
-            'PDF নিরাপদে আপনার ব্যক্তিগত লাইব্রেরিতে সংরক্ষিত হয়েছে।',
-            'PDF uploaded to your private cloud library.'
-          )
-        );
+            subjectCode: uploadSubject.trim() || undefined,
+            sourceType: 'pdf-blob',
+            mimeType: 'application/pdf',
+            sizeBytes: upRes.pdf.fileSizeBytes || selectedFile.size,
+            blob: stableBlob,
+            bytes: detachedBytes.slice(0),
+            savedAt: new Date().toISOString(),
+          });
+          void prefetchPdfWorkerForOffline();
+
+          await Promise.all([loadCloudPdfs(), loadOfflineVault()]);
+          showToast(
+            bi(
+              language,
+              'PDF ক্লাউড এবং এই ডিভাইসের অফলাইন ভল্টে সেভ হয়েছে—এখন অফলাইনেও পড়তে পারবেন।',
+              'PDF uploaded to cloud & automatically saved for offline reading.'
+            )
+          );
+        } catch (cloudErr) {
+          // Fallback: preserve PDF in device Offline Vault so user can still read it offline
+          const fallbackRecord: OfflinePdfRecord = {
+            id: `local-pdf-${Date.now()}`,
+            title: cleanTitle,
+            department: uploadDept,
+            semester: uploadSem,
+            subjectCode: uploadSubject.trim() || undefined,
+            sourceType: 'pdf-blob',
+            mimeType: 'application/pdf',
+            sizeBytes: selectedFile.size,
+            blob: stableBlob,
+            bytes: detachedBytes.slice(0),
+            savedAt: new Date().toISOString(),
+          };
+          setUploadProgress(90);
+          await offlineDb.saveOfflinePdf(fallbackRecord);
+          setUploadProgress(100);
+          await loadOfflineVault();
+          showToast(
+            bi(
+              language,
+              `ক্লাউডে আপলোড না হওয়ায় PDF টি অফলাইন ভল্টে সেভ করা হয়েছে (${cloudErr instanceof Error ? cloudErr.message : 'Network error'})।`,
+              'Cloud upload failed, so the PDF was saved to your Device Offline Vault.'
+            )
+          );
+        }
       } else {
         const record: OfflinePdfRecord = {
           id: `local-pdf-${Date.now()}`,
@@ -241,7 +298,8 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
           sourceType: 'pdf-blob',
           mimeType: 'application/pdf',
           sizeBytes: selectedFile.size,
-          blob: selectedFile,
+          blob: stableBlob,
+          bytes: detachedBytes.slice(0),
           savedAt: new Date().toISOString(),
         };
         setUploadProgress(75);
@@ -251,8 +309,8 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
         showToast(
           bi(
             language,
-            'PDF এই ডিভাইসের অফলাইন ভল্টে সেভ হয়েছে।',
-            'Saved to your device Offline Vault.'
+            'PDF এই ডিভাইসের অফলাইন ভল্টে সেভ হয়েছে—অফলাইনেও পড়তে পারবেন।',
+            'Saved to your Device Offline Vault for offline reading.'
           )
         );
       }
@@ -274,8 +332,54 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     setErrorMsg(null);
     try {
       const offlineCached = await offlineDb.getOfflinePdf(pdf.id);
-      if (!isOnline && offlineCached?.blob) {
-        const bytes = new Uint8Array(await offlineCached.blob.arrayBuffer());
+      const cachedBytes = offlineCached
+        ? await offlineDb.readOfflinePdfBytes(offlineCached)
+        : null;
+
+      if (!isOnline) {
+        if (cachedBytes) {
+          onTrackRecentPdf(pdf.id);
+          setReaderDoc({
+            title: pdf.customTitle,
+            filename: pdf.originalFilename || `${pdf.customTitle}.pdf`,
+            bytes: cachedBytes,
+            canDownload: true,
+          });
+          return;
+        }
+        throw new Error(
+          bi(
+            language,
+            'এই PDF টি অফলাইনে সেভ করা নেই। অনলাইনে এসে একবার খুলুন বা অফলাইন সেভ করুন।',
+            'This PDF is not cached offline yet. Open or save it once while online.'
+          )
+        );
+      }
+
+      try {
+        const bytes = await apiClient.fetchAuthenticatedPdfBytes(
+          `/api/pdfs/${encodeURIComponent(pdf.id)}/file`
+        );
+        // Auto-cache in background so subsequent offline reads work automatically
+        if (!cachedBytes) {
+          const copyBuf = bytes.slice().buffer;
+          void offlineDb
+            .saveOfflinePdf({
+              id: pdf.id,
+              title: pdf.customTitle,
+              department: pdf.department,
+              semester: pdf.semester,
+              subjectCode: pdf.subjectName || undefined,
+              sourceType: 'pdf-blob',
+              mimeType: 'application/pdf',
+              sizeBytes: pdf.fileSizeBytes || bytes.byteLength,
+              blob: new Blob([copyBuf], { type: 'application/pdf' }),
+              bytes: copyBuf,
+              savedAt: new Date().toISOString(),
+            })
+            .then(() => loadOfflineVault())
+            .catch(() => {});
+        }
         onTrackRecentPdf(pdf.id);
         setReaderDoc({
           title: pdf.customTitle,
@@ -283,19 +387,19 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
           bytes,
           canDownload: true,
         });
-        return;
+      } catch (networkErr) {
+        if (cachedBytes) {
+          onTrackRecentPdf(pdf.id);
+          setReaderDoc({
+            title: pdf.customTitle,
+            filename: pdf.originalFilename || `${pdf.customTitle}.pdf`,
+            bytes: cachedBytes,
+            canDownload: true,
+          });
+          return;
+        }
+        throw networkErr;
       }
-
-      const bytes = await apiClient.fetchAuthenticatedPdfBytes(
-        `/api/pdfs/${encodeURIComponent(pdf.id)}/file`
-      );
-      onTrackRecentPdf(pdf.id);
-      setReaderDoc({
-        title: pdf.customTitle,
-        filename: pdf.originalFilename || `${pdf.customTitle}.pdf`,
-        bytes,
-        canDownload: true,
-      });
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Unable to open PDF');
     } finally {
@@ -307,9 +411,25 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     setOpeningId(pdf.id);
     setErrorMsg(null);
     try {
-      const bytes = await apiClient.fetchAuthenticatedPdfBytes(
-        `/api/pdfs/${encodeURIComponent(pdf.id)}/file`
-      );
+      let bytes: Uint8Array | null = null;
+      if (isOnline) {
+        try {
+          bytes = await apiClient.fetchAuthenticatedPdfBytes(
+            `/api/pdfs/${encodeURIComponent(pdf.id)}/file`
+          );
+        } catch {
+          bytes = null;
+        }
+      }
+      if (!bytes) {
+        const offlineCached = await offlineDb.getOfflinePdf(pdf.id);
+        bytes = offlineCached ? await offlineDb.readOfflinePdfBytes(offlineCached) : null;
+      }
+      if (!bytes) {
+        throw new Error(
+          bi(language, 'PDF ডাউনলোড করা যায়নি।', 'Download failed — file not available offline.')
+        );
+      }
       const blob = new Blob([new Uint8Array(bytes)], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -333,16 +453,19 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
       const bytes = await apiClient.fetchAuthenticatedPdfBytes(
         `/api/pdfs/${encodeURIComponent(pdf.id)}/file`
       );
-      const blob = new Blob([new Uint8Array(bytes)], { type: 'application/pdf' });
+      const copyBuf = bytes.slice().buffer;
+      const blob = new Blob([copyBuf], { type: 'application/pdf' });
       await offlineDb.saveOfflinePdf({
         id: pdf.id,
         title: pdf.customTitle,
         department: pdf.department,
         semester: pdf.semester,
+        subjectCode: pdf.subjectName || undefined,
         sourceType: 'pdf-blob',
         mimeType: 'application/pdf',
         sizeBytes: pdf.fileSizeBytes || bytes.byteLength,
         blob,
+        bytes: copyBuf,
         savedAt: new Date().toISOString(),
       });
       await loadOfflineVault();
@@ -368,8 +491,17 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
       void syncPdfMetadataToFirestore(updatedRes.pdf).catch((err) => {
         console.warn('Firestore PDF edit sync notice:', err instanceof Error ? err.message : err);
       });
+      const existingOffline = await offlineDb.getOfflinePdf(pdf.id);
+      if (existingOffline) {
+        await offlineDb.saveOfflinePdf({
+          ...existingOffline,
+          title: trimmed,
+          department: editDept,
+          semester: editSem,
+        });
+      }
       setEditingId(null);
-      await loadCloudPdfs();
+      await Promise.all([loadCloudPdfs(), loadOfflineVault()]);
       showToast(bi(language, 'PDF তথ্য আপডেট করা হয়েছে।', 'PDF details updated.'));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Rename failed');
@@ -401,14 +533,61 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     setErrorMsg(null);
     try {
       onTrackRecentPdf(sn.id);
-      if (sn.pdfUrl.startsWith('/')) {
-        const bytes = await apiClient.fetchAuthenticatedPdfBytes(sn.pdfUrl);
+      const offlineCached = await offlineDb.getOfflinePdf(sn.id);
+      const cachedBytes = offlineCached
+        ? await offlineDb.readOfflinePdfBytes(offlineCached)
+        : null;
+
+      if (!isOnline && cachedBytes) {
         setReaderDoc({
           title: sn.title,
           filename: `${sn.title}.pdf`,
-          bytes,
+          bytes: cachedBytes,
           canDownload: sn.downloadPermitted,
         });
+        return;
+      }
+
+      if (sn.pdfUrl.startsWith('/')) {
+        try {
+          const bytes = await apiClient.fetchAuthenticatedPdfBytes(sn.pdfUrl);
+          if (!cachedBytes) {
+            const copyBuf = bytes.slice().buffer;
+            void offlineDb
+              .saveOfflinePdf({
+                id: sn.id,
+                title: sn.title,
+                department: sn.department,
+                semester: sn.semester,
+                subjectCode: sn.subjectCode || undefined,
+                sourceType: 'pdf-blob',
+                mimeType: 'application/pdf',
+                sizeBytes: bytes.byteLength,
+                blob: new Blob([copyBuf], { type: 'application/pdf' }),
+                bytes: copyBuf,
+                savedAt: new Date().toISOString(),
+              })
+              .then(() => loadOfflineVault())
+              .catch(() => {});
+          }
+          setReaderDoc({
+            title: sn.title,
+            filename: `${sn.title}.pdf`,
+            bytes,
+            canDownload: sn.downloadPermitted,
+          });
+        } catch (fetchErr) {
+          if (cachedBytes) {
+            setReaderDoc({
+              title: sn.title,
+              filename: `${sn.title}.pdf`,
+              bytes: cachedBytes,
+              canDownload: sn.downloadPermitted,
+            });
+            return;
+          }
+          throw fetchErr;
+        }
       } else {
         setReaderDoc({
           title: sn.title,
@@ -425,27 +604,54 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
   };
 
   const handleOpenOfflineRecord = async (rec: OfflinePdfRecord) => {
-    if (!rec.blob) return;
-    const bytes = new Uint8Array(await rec.blob.arrayBuffer());
-    onTrackRecentPdf(rec.id);
-    setReaderDoc({
-      title: rec.title,
-      filename: `${rec.title}.pdf`,
-      bytes,
-      canDownload: true,
-    });
+    setOpeningId(rec.id);
+    setErrorMsg(null);
+    try {
+      const bytes = await offlineDb.readOfflinePdfBytes(rec);
+      if (!bytes || bytes.byteLength === 0) {
+        setErrorMsg(
+          bi(
+            language,
+            'এই অফলাইন PDF ফাইলটি পড়া যাচ্ছে না। অনুগ্রহ করে আবার আপলোড বা অফলাইন সেভ করুন।',
+            'Could not read cached PDF bytes from this device. Please re-upload or re-cache it.'
+          )
+        );
+        return;
+      }
+      onTrackRecentPdf(rec.id);
+      setReaderDoc({
+        title: rec.title,
+        filename: `${rec.title}.pdf`,
+        bytes,
+        canDownload: true,
+      });
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to open offline PDF');
+    } finally {
+      setOpeningId(null);
+    }
   };
 
-  const handleDownloadOfflineRecord = (rec: OfflinePdfRecord) => {
-    if (!rec.blob) return;
-    const url = URL.createObjectURL(rec.blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${rec.title.replace(/[\\/:*?"<>|]/g, '_')}.pdf`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const handleDownloadOfflineRecord = async (rec: OfflinePdfRecord) => {
+    setErrorMsg(null);
+    try {
+      const bytes = await offlineDb.readOfflinePdfBytes(rec);
+      if (!bytes || bytes.byteLength === 0) {
+        setErrorMsg(bi(language, 'অফলাইন PDF ডাউনলোড করা যায়নি।', 'Could not read offline PDF for download.'));
+        return;
+      }
+      const blob = new Blob([new Uint8Array(bytes)], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${rec.title.replace(/[\\/:*?"<>|]/g, '_')}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Download failed');
+    }
   };
 
   const filteredCloudPdfs = useMemo(() => {
@@ -483,19 +689,110 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
     });
   }, [sharedNotes, searchQuery, filterDept, filterSem]);
 
-  const localOnlyOfflinePdfs = useMemo(() => {
-    const cloudIds = new Set(cloudPdfs.map((c) => c.id));
+  const filteredOfflinePdfs = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return offlinePdfs.filter((o) => {
-      const matchCloud = !cloudIds.has(o.id) || !isOnline;
-      const matchText = !q || o.title.toLowerCase().includes(q);
+      const matchText =
+        !q ||
+        o.title.toLowerCase().includes(q) ||
+        (o.subjectCode || '').toLowerCase().includes(q);
       const matchDept = filterDept === 'all' || !o.department || o.department === filterDept;
       const matchSem = filterSem === 'all' || !o.semester || o.semester === Number(filterSem);
-      return matchCloud && matchText && matchDept && matchSem;
+      return matchText && matchDept && matchSem;
     });
-  }, [cloudPdfs, offlinePdfs, isOnline, searchQuery, filterDept, filterSem]);
+  }, [offlinePdfs, searchQuery, filterDept, filterSem]);
 
   const offlineIdsSet = useMemo(() => new Set(offlinePdfs.map((o) => o.id)), [offlinePdfs]);
+
+  const renderOfflineVaultSection = () => (
+    <section className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+          <HardDrive className="w-4 h-4 text-emerald-500" />
+          <span>
+            {bi(
+              language,
+              `অফলাইন PDF ভল্ট (এই ডিভাইস · ${toBnDigits(filteredOfflinePdfs.length)}টি)`,
+              `Device Offline PDF Vault (${filteredOfflinePdfs.length})`
+            )}
+          </span>
+        </h2>
+        <span className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+          {bi(language, 'ইন্টারনেট ছাড়াই পড়া যাবে', 'Readable without internet')}
+        </span>
+      </div>
+
+      {filteredOfflinePdfs.length === 0 ? (
+        <div className="p-6 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-xs text-slate-500">
+          {bi(
+            language,
+            'এই ডিভাইসে এখনো কোনো অফলাইন PDF সংরক্ষিত নেই। নতুন PDF আপলোড করলে তা স্বয়ংক্রিয়ভাবে এখানে অফলাইন পড়ার জন্য সেভ হবে।',
+            'No device-cached PDFs yet. Any PDF you upload is automatically cached here for offline reading.'
+          )}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {filteredOfflinePdfs.map((rec) => {
+            const hasData = Boolean(rec.bytes || rec.blob);
+            return (
+              <article
+                key={rec.id}
+                className="p-5 rounded-2xl bg-white dark:bg-[#111827] border border-emerald-500/25 dark:border-emerald-500/20 flex flex-col justify-between gap-3"
+              >
+                <div>
+                  <p className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
+                    Offline Ready · {formatBytes(rec.sizeBytes)} · {formatDateBn(rec.savedAt)}
+                  </p>
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white mt-1 line-clamp-2">
+                    {rec.title}
+                  </h3>
+                  {(rec.department || rec.semester || rec.subjectCode) && (
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                      {rec.department ? rec.department.toUpperCase() : 'PDF'}
+                      {rec.semester ? ` · Sem ${rec.semester}` : ''}
+                      {rec.subjectCode ? ` · ${rec.subjectCode}` : ''}
+                    </p>
+                  )}
+                </div>
+                <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={!hasData || openingId === rec.id}
+                    onClick={() => void handleOpenOfflineRecord(rec)}
+                    className="flex-1 min-h-[38px] inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-50"
+                  >
+                    <Eye className="w-3.5 h-3.5" />
+                    <span>
+                      {openingId === rec.id
+                        ? bi(language, 'খুলছে...', 'Opening...')
+                        : bi(language, 'অফলাইনে পড়ুন', 'Read Offline')}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!hasData}
+                    onClick={() => void handleDownloadOfflineRecord(rec)}
+                    aria-label="Download offline PDF"
+                    className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-40"
+                  >
+                    <Download className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void offlineDb.deleteOfflinePdf(rec.id).then(loadOfflineVault)}
+                    aria-label="Remove offline PDF"
+                    className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-red-500"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
 
   return (
     <div className="space-y-6">
@@ -807,6 +1104,9 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
         </select>
       </div>
 
+      {/* When offline, show Device Offline PDF Vault right at the top */}
+      {!isOnline && renderOfflineVaultSection()}
+
       {/* Department & Admin PDF Books Section */}
       {filteredSharedBooks.length > 0 && (
         <section className="space-y-3">
@@ -874,8 +1174,8 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
         </section>
       )}
 
-      {/* Private Cloud PDFs Grid */}
-      {currentUser && (
+      {/* Private Cloud PDFs Grid (shown when online) */}
+      {currentUser && isOnline && (
         <section className="space-y-3">
           <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
             <FileText className="w-4 h-4 text-cyan-500" />
@@ -1070,71 +1370,8 @@ export const PdfLibraryView: React.FC<PdfLibraryViewProps> = ({
         </section>
       )}
 
-      {/* Local / Offline Vault PDFs */}
-      <section className="space-y-3">
-        <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
-          <HardDrive className="w-4 h-4 text-emerald-500" />
-          <span>
-            {bi(language, 'অফলাইন PDF ভল্ট (এই ডিভাইস)', 'Device Offline PDF Vault')}
-          </span>
-        </h2>
-
-        {localOnlyOfflinePdfs.length === 0 ? (
-          <div className="p-6 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-xs text-slate-500">
-            {bi(
-              language,
-              'এই ডিভাইসে এখনো কোনো অফলাইন PDF ক্যাশ করা হয়নি।',
-              'No device-cached PDFs yet. Upload a PDF or save any cloud PDF for offline access.'
-            )}
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {localOnlyOfflinePdfs.map((rec) => (
-              <article
-                key={rec.id}
-                className="p-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 flex flex-col justify-between gap-3"
-              >
-                <div>
-                  <p className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
-                    Offline · {formatBytes(rec.sizeBytes)} · {formatDateBn(rec.savedAt)}
-                  </p>
-                  <h3 className="text-base font-bold text-slate-900 dark:text-white mt-1 line-clamp-2">
-                    {rec.title}
-                  </h3>
-                </div>
-                <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={!rec.blob}
-                    onClick={() => void handleOpenOfflineRecord(rec)}
-                    className="flex-1 min-h-[38px] inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold disabled:opacity-50"
-                  >
-                    <Eye className="w-3.5 h-3.5" />
-                    <span>{bi(language, 'পড়ুন', 'Read')}</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!rec.blob}
-                    onClick={() => handleDownloadOfflineRecord(rec)}
-                    aria-label="Download offline PDF"
-                    className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300"
-                  >
-                    <Download className="w-4 h-4" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void offlineDb.deleteOfflinePdf(rec.id).then(loadOfflineVault)}
-                    aria-label="Remove offline PDF"
-                    className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-red-500"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
+      {/* Local / Offline Vault PDFs (shown below cloud section when online) */}
+      {isOnline && renderOfflineVaultSection()}
 
       {/* Canvas-Based PDF.js In-App Reader Modal */}
       {readerDoc && (
