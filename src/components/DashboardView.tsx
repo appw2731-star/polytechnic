@@ -24,22 +24,23 @@ import {
   X,
 } from 'lucide-react';
 import {
-  DEPARTMENTS,
-  SEMESTER_LABELS,
-  SEMESTER_LABELS_EN,
   SUBJECTS_CATALOG,
   getSubjectsForUser,
   getTodayDayBn,
 } from '../data/curriculum';
 import { bi } from '../i18n/translations';
+import type { ProfileUpdateResult } from '../services/profileUpdateService';
 import {
   AppView,
   AuthUser,
+  DepartmentId,
   FormulaItem,
   PlatformNotice,
+  SemesterNumber,
   StudyMateState,
 } from '../types/study';
-import { formatDateBn, formatTodayFullBn, toBnDigits } from '../utils/formatBn';
+import { formatDateBn, toBnDigits } from '../utils/formatBn';
+import { DashboardHero, type HeroProfileChangePayload } from './DashboardHero';
 import { LiveBangladeshClock } from './LiveBangladeshClock';
 import { MathFormula } from './MathFormula';
 
@@ -51,6 +52,9 @@ interface DashboardViewProps {
   onNavigate: (view: AppView) => void;
   onToggleTask: (taskId: string) => void;
   onUpdateWeeklyGoal?: (hours: number) => void;
+  onUpdateHeroProfile?: (
+    partial: HeroProfileChangePayload
+  ) => Promise<ProfileUpdateResult> | ProfileUpdateResult | void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -61,10 +65,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigate,
   onToggleTask,
   onUpdateWeeklyGoal,
+  onUpdateHeroProfile,
 }) => {
   const lang = state.settings.language;
   const todayBn = getTodayDayBn();
-  const deptInfo = DEPARTMENTS.find((d) => d.id === state.settings.department);
   const semesterSubjects = getSubjectsForUser(state.settings.department, state.settings.semester);
 
   const [globalSearch, setGlobalSearch] = useState('');
@@ -89,9 +93,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     );
     const weekStartUtcMs = weekStartDhaka - dhakaOffsetMs;
 
+    let weeklySessionsCount = 0;
     const timerMinutes = state.timerHistory.reduce((sum, session) => {
       const completedMs = new Date(session.completedAt).getTime();
       if (!Number.isNaN(completedMs) && completedMs >= weekStartUtcMs) {
+        weeklySessionsCount += 1;
         return sum + (session.completedMinutes || 0);
       }
       return sum;
@@ -109,6 +115,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     const remainingHours = Math.max(0, weeklyGoalHours - studiedHours);
 
     return {
+      weeklySessionsCount,
       timerMinutes,
       taskMinutes,
       totalMinutes,
@@ -257,7 +264,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     },
   ];
 
-  const displayName = currentUser?.fullName || state.settings.studentName;
+  const displayName = currentUser?.fullName || state.settings.studentName || 'Rokib Hasan';
+  const displayCollege =
+    currentUser?.collegeName ||
+    currentUser?.instituteName ||
+    state.settings.collegeName ||
+    'ঢাকা পলিটেকনিক ইনস্টিটিউট';
+  const displayAvatar = currentUser?.avatarUrl || state.settings.avatarDataUrl || '';
 
   return (
     <div className="space-y-6">
@@ -323,67 +336,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         )}
       </div>
 
-      {/* Welcome Banner */}
-      <section className="relative overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-900 text-white">
-        <img
-          src="/src/assets/images/diploma_study_blueprint_1794839045900.jpg"
-          alt="Polytechnic Hub Blueprint"
-          referrerPolicy="no-referrer"
-          className="absolute inset-0 w-full h-full object-cover opacity-35"
-          onError={(e) => {
-            e.currentTarget.style.display = 'none';
-          }}
-        />
-        <div className="absolute inset-0 bg-gradient-to-r from-[#060B16]/95 via-[#060B16]/85 to-[#0B1D36]/65" />
-
-        <div className="relative p-6 lg:p-8 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">
-          <div className="space-y-2 max-w-2xl">
-            <p className="text-xs font-medium text-cyan-300">
-              {formatTodayFullBn()} · {lang === 'en' ? deptInfo?.nameEn : deptInfo?.nameBn} ·{' '}
-              {lang === 'en'
-                ? SEMESTER_LABELS_EN[state.settings.semester]
-                : SEMESTER_LABELS[state.settings.semester]}
-            </p>
-            <h1 className="text-2xl lg:text-3xl font-bold tracking-tight text-balance">
-              {bi(lang, `স্বাগতম, ${displayName}`, `Welcome back, ${displayName}`)}
-            </h1>
-            <p className="text-sm lg:text-base text-slate-300 leading-relaxed">
-              {bi(
-                lang,
-                'Polytechnic Hub — আপনার ব্যক্তিগত PDF লাইব্রেরি, পদার্থবিজ্ঞান ও গণিত ফর্মুলা হাব, দ্রুত এআই টিউটর ও ইঞ্জিনিয়ারিং টুলস।',
-                'Polytechnic Hub — Your Private PDF Library, Physics & Math Formula Hub, Fast AI Tutor & Engineering Tools.'
-              )}
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-3 shrink-0">
-            <button
-              type="button"
-              onClick={() => onNavigate('pdf-library')}
-              className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-sm font-bold transition-colors whitespace-nowrap"
-            >
-              <FolderOpen className="w-4 h-4" />
-              <span>{bi(lang, 'আমার PDF লাইব্রেরি', 'My PDF Library')}</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigate('formulas')}
-              className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-sm font-medium transition-colors whitespace-nowrap"
-            >
-              <Sigma className="w-4 h-4" />
-              <span>{bi(lang, 'ফর্মুলা হাব', 'Formula Hub')}</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigate('timer')}
-              className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-sm font-medium transition-colors whitespace-nowrap"
-            >
-              <Timer className="w-4 h-4" />
-              <span>{bi(lang, 'স্টাডি টাইমার', 'Study Timer')}</span>
-            </button>
-          </div>
-        </div>
-      </section>
+      {/* Mobile-First Profile Hero Card */}
+      <DashboardHero
+        initialName={displayName}
+        collegeName={displayCollege}
+        initialDepartment={(currentUser?.department as DepartmentId) || state.settings.department}
+        initialSemester={(currentUser?.semester as SemesterNumber) || state.settings.semester}
+        initialAvatarUrl={displayAvatar}
+        onUpdateHeroProfile={onUpdateHeroProfile}
+        onOpenPdfLibrary={() => onNavigate('pdf-library')}
+        onOpenFormulaHub={() => onNavigate('formulas')}
+        onOpenStudyTimer={() => onNavigate('timer')}
+      />
 
       {/* Live Bangladesh Clock + Important Notices */}
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
@@ -684,22 +648,24 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </form>
                 ) : (
                   <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-                    <div className="flex flex-wrap items-center gap-3 text-xs">
-                      <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 tabular-nums">
+                    <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-slate-600 dark:text-slate-300 tabular-nums">
+                      <span>
                         {bi(
                           lang,
                           `লক্ষ্য: ${toBnDigits(weeklyGoalHours)} ঘণ্টা/সপ্তাহ`,
                           `Target: ${weeklyGoalHours} hrs/week`
                         )}
                       </span>
-                      <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 tabular-nums">
+                      <span aria-hidden="true" className="text-slate-400">·</span>
+                      <span>
                         {bi(
                           lang,
-                          `টাইমার: ${toBnDigits(weeklyStudyStats.timerMinutes)} মিঃ`,
-                          `Timer: ${weeklyStudyStats.timerMinutes}m`
+                          `সেশন: ${toBnDigits(weeklyStudyStats.weeklySessionsCount)}টি (${toBnDigits(weeklyStudyStats.timerMinutes)} মিঃ)`,
+                          `Sessions: ${weeklyStudyStats.weeklySessionsCount} (${weeklyStudyStats.timerMinutes}m)`
                         )}
                       </span>
-                      <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 tabular-nums">
+                      <span aria-hidden="true" className="text-slate-400">·</span>
+                      <span>
                         {bi(
                           lang,
                           `রুটিন টাস্ক: ${toBnDigits(weeklyStudyStats.taskMinutes)} মিঃ`,
@@ -711,7 +677,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     <button
                       type="button"
                       onClick={() => onNavigate('timer')}
-                      className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-cyan-500/12 hover:bg-cyan-500/20 text-cyan-700 dark:text-cyan-300 text-xs font-bold transition-colors"
+                      className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-cyan-500/12 hover:bg-cyan-500/20 text-cyan-700 dark:text-cyan-300 text-xs font-bold transition-colors whitespace-nowrap shrink-0"
                     >
                       <Timer className="w-3.5 h-3.5" />
                       <span>{bi(lang, 'অধ্যয়ন শুরু করুন', 'Log Study Session')}</span>

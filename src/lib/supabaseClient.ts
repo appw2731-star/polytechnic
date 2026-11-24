@@ -81,6 +81,7 @@ export function mapSupabaseProfileToAuthUser(
     instituteName: String(row?.institute_name || row?.college_name || ''),
     rollNumber: String(row?.roll_number || ''),
     profileVisibility,
+    firebaseUid: row?.firebase_uid ? String(row.firebase_uid) : undefined,
     createdAt: String(row?.created_at || fallbackAuth?.created_at || now),
     updatedAt: String(row?.updated_at || fallbackAuth?.updated_at || now),
   };

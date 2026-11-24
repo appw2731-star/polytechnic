@@ -17,6 +17,7 @@ export interface DbUser {
   passwordHash: string;
   role: UserRole;
   avatarUrl: string;
+  coverUrl?: string;
   gender: '' | 'male' | 'female';
   showGender: boolean;
   bio: string;
@@ -117,6 +118,7 @@ export interface DbCommunityReply {
   authorId: string;
   authorName: string;
   authorRole: UserRole;
+  authorAvatarUrl?: string;
   body: string;
   createdAt: string;
 }
@@ -125,6 +127,8 @@ export interface DbCommunityPost {
   id: string;
   authorId: string;
   authorName: string;
+  authorAvatarUrl?: string;
+  authorCollegeName?: string;
   authorDepartment: string;
   authorRole: UserRole;
   department: string;
@@ -132,6 +136,8 @@ export interface DbCommunityPost {
   subjectTag: string;
   title: string;
   body: string;
+  imageUrl?: string;
+  likedByUserIds?: string[];
   reportsCount: number;
   isHidden: boolean;
   replies: DbCommunityReply[];
@@ -144,6 +150,23 @@ export interface DbAiConfig {
   conciseByDefault: boolean;
   maxHistoryTurns: number;
   customSystemAddon: string;
+  updatedAt: string;
+}
+
+export interface DbAiChatTurn {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  mode?: 'general' | 'explain' | 'math' | 'power' | 'recommend';
+  timestamp: string;
+}
+
+export interface DbAiSession {
+  id: string;
+  ownerId?: string;
+  title: string;
+  messages: DbAiChatTurn[];
+  createdAt: string;
   updatedAt: string;
 }
 
@@ -268,6 +291,7 @@ export interface DatabaseSchema {
   notifications: DbNotificationCampaign[];
   userNotifications: DbUserNotification[];
   scheduledNotifications: DbScheduledNotification[];
+  aiSessions: DbAiSession[];
   aiConfig: DbAiConfig;
   usageStats: DbUsageStats;
   appConfig: DbAppConfig;
@@ -378,6 +402,8 @@ function createInitialDb(): DatabaseSchema {
         subjectTag: '27141 — IC Engine',
         title: 'ফোর-স্ট্রোক ডিজেল ইঞ্জিনে ভালভ ওভারল্যাপ (Valve Overlap) কেন রাখা হয়?',
         body: 'পাওয়ার টেকনোলজির শিক্ষার্থীদের জন্য পরীক্ষার একটি গুরুত্বপূর্ণ প্রশ্ন: Exhaust স্ট্রোকের শেষ প্রান্তে এবং Suction স্ট্রোকের শুরুতে ইনলেট ও এগজস্ট ভালভ কিছু ডিগ্রি একসাথে খোলা থাকে। এতে সিলিন্ডার থেকে পোড়া গ্যাস সম্পূর্ণ বের হতে (Scavenging) সাহায্য করে। আপনাদের প্র্যাকটিক্যাল ক্লাসের অভিজ্ঞতা বা প্রশ্ন এখানে শেয়ার করুন।',
+        authorCollegeName: 'Polytechnic Hub Editorial',
+        likedByUserIds: [],
         reportsCount: 0,
         isHidden: false,
         replies: [],
@@ -391,6 +417,7 @@ function createInitialDb(): DatabaseSchema {
     notifications: [],
     userNotifications: [],
     scheduledNotifications: [],
+    aiSessions: [],
     aiConfig: {
       activeModel: 'gemini-4-hydrogen',
       thinkingLevel: 'LOW',
@@ -487,6 +514,7 @@ class FileDatabase {
           ? parsed.users.map((u) => ({
               ...u,
               avatarUrl: u.avatarUrl ?? '',
+              coverUrl: u.coverUrl ?? '',
               gender: u.gender ?? '',
               showGender: u.showGender ?? false,
               bio: u.bio ?? '',
@@ -499,7 +527,10 @@ class FileDatabase {
         userPdfs: Array.isArray(parsed.userPdfs) ? parsed.userPdfs : [],
         mcqs: Array.isArray(parsed.mcqs) ? parsed.mcqs : [],
         communityPosts: Array.isArray(parsed.communityPosts)
-          ? parsed.communityPosts
+          ? parsed.communityPosts.map((p) => ({
+              ...p,
+              likedByUserIds: Array.isArray(p.likedByUserIds) ? p.likedByUserIds : [],
+            }))
           : fallback.communityPosts,
         customFormulas: Array.isArray(parsed.customFormulas) ? parsed.customFormulas : [],
         deletedFormulaIds: Array.isArray(parsed.deletedFormulaIds) ? parsed.deletedFormulaIds : [],
@@ -511,6 +542,12 @@ class FileDatabase {
         userNotifications: Array.isArray(parsed.userNotifications) ? parsed.userNotifications : [],
         scheduledNotifications: Array.isArray(parsed.scheduledNotifications)
           ? parsed.scheduledNotifications
+          : [],
+        aiSessions: Array.isArray(parsed.aiSessions)
+          ? parsed.aiSessions.map((s) => ({
+              ...s,
+              messages: Array.isArray(s.messages) ? s.messages : [],
+            }))
           : [],
         aiConfig: {
           ...fallback.aiConfig,

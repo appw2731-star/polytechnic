@@ -41,7 +41,8 @@ interface AiAssistantViewProps {
   onUpdateSessionMessages: (
     sessionId: string,
     updater: (prev: AiChatMessage[]) => AiChatMessage[],
-    titleOverride?: string
+    titleOverride?: string,
+    options?: { persistCloud?: boolean }
   ) => void;
   onCreateSession: () => void;
   onSelectSession: (sessionId: string) => void;
@@ -124,6 +125,7 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [waitingFirstToken, setWaitingFirstToken] = useState(false);
+  const [streamStatusText, setStreamStatusText] = useState<string | null>(null);
   const [savedMsgId, setSavedMsgId] = useState<string | null>(null);
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
   const [lastPromptInfo, setLastPromptInfo] = useState<{
@@ -180,6 +182,7 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
     abortControllerRef.current = null;
     setIsStreaming(false);
     setWaitingFirstToken(false);
+    setStreamStatusText(null);
   };
 
   const sendPrompt = async (
@@ -226,37 +229,79 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
           ? [...base, placeholderAssistant]
           : [...base, userMsg, placeholderAssistant];
       },
-      sessionTitle
+      sessionTitle,
+      { persistCloud: false }
     );
 
     if (!isRetry) setInput('');
     setIsStreaming(true);
     setWaitingFirstToken(true);
+    setStreamStatusText(null);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
+
+    // Only pass prior conversation turns (exclude the current prompt and error placeholders)
+    const cleanHistoryBefore = historyBefore.filter((m, idx) => {
+      if (m.isError) return false;
+      if (isRetry && idx === historyBefore.length - 1 && m.role === 'user' && m.text.trim() === trimmed) {
+        return false;
+      }
+      return true;
+    });
 
     let accumulated = '';
     try {
       await aiService.streamAssistant(
         {
+          sessionId: targetSessionId,
+          isRetry,
           message: trimmed,
           mode: chosenMode,
           language,
           departmentName,
           semesterLabel,
           concise: conciseMode,
-          history: isRetry ? historyBefore : [...historyBefore, userMsg],
+          history: cleanHistoryBefore,
         },
         (delta) => {
           setWaitingFirstToken(false);
+          setStreamStatusText(null);
           accumulated += delta;
-          onUpdateSessionMessages(targetSessionId, (prev) => {
-            const safePrev = Array.isArray(prev) ? prev : [];
-            return safePrev.map((m) => (m.id === assistantMsgId ? { ...m, text: accumulated } : m));
-          });
+          onUpdateSessionMessages(
+            targetSessionId,
+            (prev) => {
+              const safePrev = Array.isArray(prev) ? prev : [];
+              return safePrev.map((m) => (m.id === assistantMsgId ? { ...m, text: accumulated } : m));
+            },
+            undefined,
+            { persistCloud: false }
+          );
         },
-        controller.signal
+        controller.signal,
+        (statusEvt) => {
+          const stepLabel =
+            statusEvt.attempt && statusEvt.maxAttempts
+              ? ` (${statusEvt.attempt}/${statusEvt.maxAttempts})`
+              : '';
+          if (statusEvt.type === 'fallback') {
+            setStreamStatusText(
+              bi(
+                language,
+                `বিকল্প চ্যানেল দিয়ে উত্তর আনা হচ্ছে${stepLabel}...`,
+                `Switching to backup channel${stepLabel}...`
+              )
+            );
+          } else {
+            setStreamStatusText(
+              bi(
+                language,
+                `সার্ভার ব্যস্ত, স্বয়ংক্রিয়ভাবে পুনরায় চেষ্টা করা হচ্ছে${stepLabel}...`,
+                `Server busy — auto-retrying${stepLabel}...`
+              )
+            );
+          }
+        }
       );
 
       if (!accumulated.trim()) {
@@ -264,13 +309,43 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
           bi(language, 'এআই থেকে কোনো উত্তর পাওয়া যায়নি।', 'Empty response received from AI.')
         );
       }
+
+      // Persist completed turn cleanly once streaming finishes
+      onUpdateSessionMessages(
+        targetSessionId,
+        (prev) => {
+          const safePrev = Array.isArray(prev) ? prev : [];
+          return safePrev.map((m) =>
+            m.id === assistantMsgId
+              ? { ...m, text: accumulated, timestamp: new Date().toISOString() }
+              : m
+          );
+        },
+        sessionTitle,
+        { persistCloud: true }
+      );
     } catch (error: unknown) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
+      if (
+        (error instanceof DOMException && error.name === 'AbortError') ||
+        (error instanceof Error && error.name === 'AbortError')
+      ) {
         if (!accumulated.trim()) {
-          onUpdateSessionMessages(targetSessionId, (prev) => {
-            const safePrev = Array.isArray(prev) ? prev : [];
-            return safePrev.filter((m) => m.id !== assistantMsgId);
-          });
+          onUpdateSessionMessages(
+            targetSessionId,
+            (prev) => {
+              const safePrev = Array.isArray(prev) ? prev : [];
+              return safePrev.filter((m) => m.id !== assistantMsgId);
+            },
+            undefined,
+            { persistCloud: false }
+          );
+        } else {
+          onUpdateSessionMessages(
+            targetSessionId,
+            (prev) => (Array.isArray(prev) ? prev : []),
+            undefined,
+            { persistCloud: true }
+          );
         }
         return;
       }
@@ -284,16 +359,22 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
               'Failed to connect with AI Tutor. Please try again.'
             );
 
-      onUpdateSessionMessages(targetSessionId, (prev) => {
-        const safePrev = Array.isArray(prev) ? prev : [];
-        return safePrev.map((m) =>
-          m.id === assistantMsgId ? { ...m, text: errorText, isError: true } : m
-        );
-      });
+      onUpdateSessionMessages(
+        targetSessionId,
+        (prev) => {
+          const safePrev = Array.isArray(prev) ? prev : [];
+          return safePrev.map((m) =>
+            m.id === assistantMsgId ? { ...m, text: errorText, isError: true } : m
+          );
+        },
+        undefined,
+        { persistCloud: false }
+      );
     } finally {
       abortControllerRef.current = null;
       setIsStreaming(false);
       setWaitingFirstToken(false);
+      setStreamStatusText(null);
     }
   };
 
@@ -534,47 +615,72 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
                   {isUser ? (
                     <p className="leading-relaxed whitespace-pre-wrap">{msg.text}</p>
                   ) : showTypingDots ? (
-                    <div className="flex items-center gap-1.5 py-1.5 px-1">
-                      <span className="w-2 h-2 rounded-full bg-cyan-500 animate-bounce" />
-                      <span
-                        className="w-2 h-2 rounded-full bg-cyan-500 animate-bounce"
-                        style={{ animationDelay: '150ms' }}
-                      />
-                      <span
-                        className="w-2 h-2 rounded-full bg-cyan-500 animate-bounce"
-                        style={{ animationDelay: '300ms' }}
-                      />
-                    </div>
-                  ) : msg.isError ? (
-                    <div className="space-y-2">
-                      <p className="leading-relaxed">{msg.text}</p>
-                      {lastPromptInfo && isLast && (
-                        <button
-                          type="button"
-                          onClick={() => void sendPrompt(lastPromptInfo.text, lastPromptInfo.mode, true)}
-                          className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-600 dark:text-red-300 hover:underline"
-                        >
-                          <RotateCcw className="w-3.5 h-3.5" />
-                          <span>{bi(language, 'পুনরায় চেষ্টা করুন', 'Retry')}</span>
-                        </button>
+                    <div className="space-y-1.5 py-1 px-1">
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-cyan-500 animate-bounce" />
+                        <span
+                          className="w-2 h-2 rounded-full bg-cyan-500 animate-bounce"
+                          style={{ animationDelay: '150ms' }}
+                        />
+                        <span
+                          className="w-2 h-2 rounded-full bg-cyan-500 animate-bounce"
+                          style={{ animationDelay: '300ms' }}
+                        />
+                      </div>
+                      {streamStatusText && (
+                        <p className="text-[11px] font-medium text-cyan-600 dark:text-cyan-300">
+                          {streamStatusText}
+                        </p>
                       )}
                     </div>
+                  ) : msg.isError ? (
+                    (() => {
+                      const prevUserMsg = idx > 0 && messages[idx - 1]?.role === 'user' ? messages[idx - 1] : null;
+                      const retryText = lastPromptInfo?.text || prevUserMsg?.text || '';
+                      const retryMode = lastPromptInfo?.mode || prevUserMsg?.mode || mode;
+                      return (
+                        <div className="space-y-2">
+                          <p className="leading-relaxed">{msg.text}</p>
+                          {isLast && retryText && (
+                            <button
+                              type="button"
+                              onClick={() => void sendPrompt(retryText, retryMode, true)}
+                              className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-600 dark:text-red-300 hover:underline"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              <span>{bi(language, 'পুনরায় চেষ্টা করুন', 'Retry')}</span>
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })()
                   ) : (
                     <div className="space-y-3">
                       <FormattedAiText text={msg.text} />
+                      {isStreaming && isLast && (
+                        <div className="inline-flex items-center gap-1.5 text-[11px] font-medium text-cyan-600 dark:text-cyan-400">
+                          <span className="w-1.5 h-3.5 rounded-xs bg-cyan-500 animate-pulse" />
+                          <span>{bi(language, 'উত্তর লেখা হচ্ছে...', 'Streaming...')}</span>
+                        </div>
+                      )}
                       {(!isStreaming || !isLast) && (
                         <div className="pt-2 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2">
                           <div className="flex items-center gap-1.5">
-                            {isLast && lastPromptInfo && (
-                              <button
-                                type="button"
-                                onClick={() => void sendPrompt(lastPromptInfo.text, lastPromptInfo.mode, true)}
-                                className="min-h-[32px] inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium text-slate-500 hover:text-cyan-500"
-                              >
-                                <RotateCcw className="w-3.5 h-3.5" />
-                                <span>{bi(language, 'আবার উত্তর দিন', 'Regenerate')}</span>
-                              </button>
-                            )}
+                            {isLast && (() => {
+                              const prevUserMsg = idx > 0 && messages[idx - 1]?.role === 'user' ? messages[idx - 1] : null;
+                              const regenText = lastPromptInfo?.text || prevUserMsg?.text || '';
+                              const regenMode = lastPromptInfo?.mode || prevUserMsg?.mode || mode;
+                              return regenText ? (
+                                <button
+                                  type="button"
+                                  onClick={() => void sendPrompt(regenText, regenMode, true)}
+                                  className="min-h-[32px] inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium text-slate-500 hover:text-cyan-500"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5" />
+                                  <span>{bi(language, 'আবার উত্তর দিন', 'Regenerate')}</span>
+                                </button>
+                              ) : null;
+                            })()}
                             <button
                               type="button"
                               onClick={() => void handleCopyReply(msg)}

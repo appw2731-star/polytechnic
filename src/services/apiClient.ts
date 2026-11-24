@@ -11,6 +11,7 @@ import {
   McqQuestion,
   NotificationPreferences,
   PlatformNotice,
+  PublicStudentProfile,
   PushAudienceType,
   PushCategory,
   PushNotificationCampaign,
@@ -34,9 +35,25 @@ export interface BootstrapResponse {
   hasAdmin: boolean;
 }
 
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 export function getStoredToken(): string | null {
   try {
-    return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    const raw = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed === 'null' || trimmed === 'undefined') {
+      return null;
+    }
+    return trimmed;
   } catch {
     return null;
   }
@@ -44,8 +61,8 @@ export function getStoredToken(): string | null {
 
 export function setStoredToken(token: string | null): void {
   try {
-    if (token) {
-      window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    if (token && token.trim()) {
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, token.trim());
     } else {
       window.localStorage.removeItem(TOKEN_STORAGE_KEY);
     }
@@ -73,7 +90,7 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, { ...init, headers });
   const data = (await res.json().catch(() => ({}))) as T & { error?: string };
   if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+    throw new ApiError(data.error || `Request failed (${res.status})`, res.status);
   }
   return data;
 }
@@ -150,6 +167,7 @@ export const apiClient = {
         | 'showGender'
         | 'profileVisibility'
         | 'avatarUrl'
+        | 'coverUrl'
       >
     >
   ): Promise<{ user: AuthUser }> {
@@ -159,15 +177,61 @@ export const apiClient = {
     });
   },
 
+  ensureProfile(payload?: {
+    fullName?: string;
+    department?: string;
+    semester?: number;
+    collegeName?: string;
+    rollNumber?: string;
+  }): Promise<{
+    exists: boolean;
+    created: boolean;
+    syncedToSupabase: boolean;
+    user: AuthUser;
+  }> {
+    return apiRequest('/api/auth/ensure-profile', {
+      method: 'POST',
+      body: JSON.stringify(payload ?? {}),
+    });
+  },
+
+  getPublicProfile(userId: string): Promise<{
+    profile: PublicStudentProfile;
+    posts: CommunityPost[];
+  }> {
+    return apiRequest(`/api/users/${encodeURIComponent(userId)}/public-profile`);
+  },
+
   // Community
+  getCommunityProfiles(ids: string[]): Promise<{
+    profiles: Record<
+      string,
+      {
+        id: string;
+        fullName: string;
+        department: string;
+        semester: number;
+        collegeName: string;
+        avatarUrl: string;
+        bio: string;
+        role: UserRole;
+        source: 'supabase' | 'server';
+      }
+    >;
+  }> {
+    const q = encodeURIComponent(ids.join(','));
+    return apiRequest(`/api/community/profiles?ids=${q}`);
+  },
+
   getCommunityPosts(includeHidden = false): Promise<{ posts: CommunityPost[] }> {
     const q = includeHidden ? '?includeHidden=1' : '';
     return apiRequest(`/api/community/posts${q}`);
   },
 
   createCommunityPost(payload: {
-    title: string;
+    title?: string;
     body: string;
+    imageUrl?: string;
     department: string;
     semester: number;
     subjectTag?: string;
@@ -175,6 +239,12 @@ export const apiClient = {
     return apiRequest('/api/community/posts', {
       method: 'POST',
       body: JSON.stringify(payload),
+    });
+  },
+
+  toggleLikeCommunityPost(postId: string): Promise<{ post: CommunityPost }> {
+    return apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/like`, {
+      method: 'POST',
     });
   },
 

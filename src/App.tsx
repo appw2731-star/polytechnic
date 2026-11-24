@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw, X } from 'lucide-react';
+import { AlarmClock, BellOff, RefreshCw, X } from 'lucide-react';
 import { BASE_MATHEMATICS_FORMULAS, BASE_PHYSICS_FORMULAS } from './data/formulas';
 import { AdminDashboardView } from './components/AdminDashboardView';
 import { AiAssistantView } from './components/AiAssistantView';
@@ -21,15 +21,22 @@ import { RoutineView } from './components/RoutineView';
 import { SettingsView } from './components/SettingsView';
 import { StudyTimeView } from './components/StudyTimeView';
 import { SubjectsView } from './components/SubjectsView';
+import { ViewErrorBoundary } from './components/ViewErrorBoundary';
 import { getCategoryMeta } from './data/notificationCategories';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { usePWAInstall } from './hooks/usePWAInstall';
 import { bi } from './i18n/translations';
 import {
   consumeGoogleRedirectResult,
+  ensureSupabaseProfileExists,
   formatFirebaseAuthError,
+  isStoredTokenStructurallyValid,
+  reconcileFirebaseSession,
+  setCachedAuthUser,
   signOutFirebase,
   subscribeFirebaseAuth,
+  syncFirebaseUserToSupabaseProfile,
+  validateStoredSessionToken,
 } from './lib/firebaseAuth';
 import { supabase } from './lib/supabaseClient';
 import { aiService } from './services/aiService';
@@ -41,8 +48,11 @@ import {
   syncUserProfileToFirestore,
 } from './services/firestoreService';
 import { playNotificationSound } from './services/notificationSound';
+import { startAlarmLoop, stopAlarmLoop } from './services/alarmAudio';
 import { offlineDb } from './services/offlineDb';
+import { profileUpdateService, type ProfileUpdateResult } from './services/profileUpdateService';
 import { pushNotificationService } from './services/pushNotificationService';
+import type { HeroProfileChangePayload } from './components/DashboardHero';
 import { createNewAiSession, storageService } from './services/storageService';
 import {
   AiChatMessage,
@@ -51,6 +61,7 @@ import {
   AppView,
   AuthUser,
   CompletedTimerSession,
+  DayOfWeek,
   DepartmentId,
   DeviceTokenRecord,
   FormulaItem,
@@ -58,6 +69,7 @@ import {
   PushCategory,
   QuizAttempt,
   SemesterNumber,
+  StudyAlarm,
   StudyMateState,
   StudyNote,
   StudyTask,
@@ -66,7 +78,7 @@ import {
   UserNotificationItem,
   UserSettings,
 } from './types/study';
-import { getDhakaClockSnapshot } from './utils/formatBn';
+import { getDhakaClockSnapshot, toBnDigits } from './utils/formatBn';
 
 const VALID_APP_VIEWS = new Set<AppView>([
   'dashboard',
@@ -183,7 +195,9 @@ export default function App() {
     imageUrl?: string;
     notificationId?: string;
   } | null>(null);
+  const [ringingAlarm, setRingingAlarm] = useState<StudyAlarm | null>(null);
   const firedRemindersRef = useRef<Set<string>>(new Set());
+  const firedAlarmsRef = useRef<Set<string>>(new Set());
   const pendingDeepLinkNotificationIdRef = useRef<string | null>(null);
 
   const isOnline = useOnlineStatus();
@@ -192,6 +206,10 @@ export default function App() {
   const [swUpdateHandler, setSwUpdateHandler] = useState<(() => void) | null>(null);
 
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const languageRef = useRef(state.settings.language);
+  languageRef.current = state.settings.language;
+  const settingsRef = useRef(state.settings);
+  settingsRef.current = state.settings;
   const [inboxNotifications, setInboxNotifications] = useState<UserNotificationItem[]>([]);
   const [unreadPushCount, setUnreadPushCount] = useState<number>(0);
   const [pushPreferences, setPushPreferences] = useState<NotificationPreferences>(() =>
@@ -426,14 +444,27 @@ export default function App() {
     }
 
     try {
-      const cloudSessions = await aiService.loadCloudChatSessions(user.id);
-      if (cloudSessions.length > 0) {
+      const [cloudSessions, serverSessions] = await Promise.all([
+        aiService.loadCloudChatSessions(user.id),
+        aiService.loadServerSessions(),
+      ]);
+      const remoteSessions = [...serverSessions, ...cloudSessions];
+      if (remoteSessions.length > 0) {
         setState((prev) => {
           const mergedMap = new Map<string, AiChatSession>();
-          for (const s of cloudSessions) mergedMap.set(s.id, s);
+          for (const s of remoteSessions) {
+            const existing = mergedMap.get(s.id);
+            if (!existing || (s.updatedAt || '') >= (existing.updatedAt || '')) {
+              mergedMap.set(s.id, s);
+            }
+          }
           for (const s of Array.isArray(prev.aiSessions) ? prev.aiSessions : []) {
             const safeMsgs = Array.isArray(s?.messages) ? s.messages : [];
-            if (safeMsgs.length > 0 && !mergedMap.has(s.id)) {
+            const existing = mergedMap.get(s.id);
+            if (
+              safeMsgs.length > 0 &&
+              (!existing || (s.updatedAt || '') > (existing.updatedAt || ''))
+            ) {
               mergedMap.set(s.id, { ...s, messages: safeMsgs });
             }
           }
@@ -456,60 +487,107 @@ export default function App() {
     void refreshBootstrap();
 
     let mounted = true;
-    const hydrateUnifiedAuth = async () => {
-      // 1. Check if returning from a Firebase Google Sign-In redirect (mobile / popup-blocked)
+    let hydrating = true;
+
+    const verifyHydratedSupabaseProfile = async (hydratedUser: AuthUser): Promise<AuthUser> => {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        return hydratedUser;
+      }
       try {
-        const redirectCred = await consumeGoogleRedirectResult();
-        if (redirectCred?.idToken && mounted) {
-          const synced = await apiClient.firebaseSync({ idToken: redirectCred.idToken });
-          setStoredToken(synced.token);
+        const currentSettings = settingsRef.current;
+        const result = await ensureSupabaseProfileExists(hydratedUser, {
+          fullName: hydratedUser.fullName || currentSettings.studentName,
+          department: hydratedUser.department || currentSettings.department,
+          semester: hydratedUser.semester || currentSettings.semester,
+          collegeName:
+            hydratedUser.collegeName || hydratedUser.instituteName || currentSettings.collegeName,
+          rollNumber: hydratedUser.rollNumber || undefined,
+        });
+        const resolvedUser = result.user || hydratedUser;
+        if (mounted && (result.created || resolvedUser.id !== hydratedUser.id || resolvedUser.fullName !== hydratedUser.fullName)) {
+          setCachedAuthUser(resolvedUser);
+          setCurrentUser(resolvedUser);
+        }
+        return resolvedUser;
+      } catch {
+        return hydratedUser;
+      }
+    };
+
+    const hydrateUnifiedAuth = async () => {
+      try {
+        // 1. Complete any pending Firebase Google OAuth redirect (mobile / popup-blocked)
+        try {
+          const redirectCred = await consumeGoogleRedirectResult();
+          if (redirectCred?.syncedUser && mounted) {
+            setStoredToken(redirectCred.token);
+            setCachedAuthUser(redirectCred.syncedUser);
+            setCurrentUser(redirectCred.syncedUser);
+            const ensuredUser = await verifyHydratedSupabaseProfile(redirectCred.syncedUser);
+            if (mounted) {
+              void syncSupabaseUserContext(ensuredUser);
+            }
+            return;
+          }
+        } catch (err) {
           if (mounted) {
-            setCurrentUser(synced.user);
-            void syncSupabaseUserContext(synced.user);
+            setInAppToast({
+              title: 'Google Sign-In',
+              body: formatFirebaseAuthError(err, languageRef.current),
+              category: 'IMPORTANT',
+              targetView: 'profile',
+            });
+          }
+        }
+
+        // 2. Validate stored JWT/session token (structure, expiry, and /api/auth/me)
+        // before setting initial authenticated state across browser refreshes
+        const validation = await validateStoredSessionToken();
+        if (!mounted) return;
+
+        if ((validation.status === 'valid' || validation.status === 'offline') && validation.user) {
+          setCurrentUser(validation.user);
+          if (validation.status === 'valid') {
+            const ensuredUser = await verifyHydratedSupabaseProfile(validation.user);
+            if (mounted) {
+              void syncSupabaseUserContext(ensuredUser);
+            }
           }
           return;
         }
-      } catch (err) {
-        if (mounted) {
-          setInAppToast({
-            title: 'Google Sign-In',
-            body: formatFirebaseAuthError(err, state.settings.language),
-            category: 'IMPORTANT',
-            targetView: 'profile',
-          });
-        }
-      }
 
-      // 2. Restore persistent session via stored Bearer token
-      const token = getStoredToken();
-      if (token) {
-        try {
-          const me = await apiClient.getMe();
+        // 3. If stored token was missing, expired, or rejected, reconcile from Firebase Auth persistence
+        const reconciled = await reconcileFirebaseSession();
+        if (!mounted) return;
+        if (reconciled?.user) {
+          setCurrentUser(reconciled.user);
+          const ensuredUser = await verifyHydratedSupabaseProfile(reconciled.user);
           if (mounted) {
-            setCurrentUser(me.user);
-            void syncSupabaseUserContext(me.user);
-            return;
+            void syncSupabaseUserContext(ensuredUser);
           }
-        } catch {
-          setStoredToken(null);
+          return;
         }
+
+        setCurrentUser(null);
+      } finally {
+        hydrating = false;
       }
     };
 
     void hydrateUnifiedAuth();
 
-    // 3. Keep Firebase Auth state synchronized if user returns with active Firebase session
+    // 4. Keep Firebase Auth state synchronized after initial hydration if token is missing or expired
     const unsubscribeFb = subscribeFirebaseAuth((fbUser) => {
-      if (!fbUser || !mounted) return;
-      if (getStoredToken()) return;
-      void fbUser
-        .getIdToken()
-        .then((idToken) => apiClient.firebaseSync({ idToken }))
-        .then((synced) => {
-          setStoredToken(synced.token);
+      if (!mounted || hydrating || !fbUser) return;
+      if (isStoredTokenStructurallyValid(getStoredToken())) return;
+
+      void syncFirebaseUserToSupabaseProfile(fbUser)
+        .then(async (synced) => {
+          if (!mounted) return;
+          setCurrentUser(synced.user);
+          const ensuredUser = await verifyHydratedSupabaseProfile(synced.user);
           if (mounted) {
-            setCurrentUser(synced.user);
-            void syncSupabaseUserContext(synced.user);
+            void syncSupabaseUserContext(ensuredUser);
           }
         })
         .catch(() => {
@@ -521,7 +599,7 @@ export default function App() {
       mounted = false;
       unsubscribeFb();
     };
-  }, [refreshBootstrap, syncSupabaseUserContext, state.settings.language]);
+  }, [refreshBootstrap, syncSupabaseUserContext]);
 
   useEffect(() => {
     storageService.saveState(state);
@@ -630,6 +708,129 @@ export default function App() {
     const interval = window.setInterval(checkSchedule, 10000);
     return () => window.clearInterval(interval);
   }, [state.timeSettings, triggerNotification]);
+
+  const triggerRingingAlarm = useCallback((alarm: StudyAlarm) => {
+    setRingingAlarm(alarm);
+    startAlarmLoop(alarm.tone || 'chime');
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      try {
+        new Notification(`অ্যালার্ম: ${alarm.label}`, {
+          body: `সময় হয়েছে (${alarm.time}) — Polytechnic Hub স্টাডি অ্যালার্ম`,
+          icon: '/icons/icon-192x192.png',
+        });
+      } catch {
+        // Shown via modal
+      }
+    }
+  }, []);
+
+  const handleDismissAlarm = useCallback(() => {
+    stopAlarmLoop();
+    setRingingAlarm(null);
+  }, []);
+
+  const handleSnoozeAlarm = useCallback(() => {
+    const current = ringingAlarm;
+    stopAlarmLoop();
+    setRingingAlarm(null);
+    if (!current) return;
+
+    const snoozeTargetIso = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    if (current.id !== 'alarm-preview-test') {
+      setState((prev) => ({
+        ...prev,
+        timeSettings: {
+          ...prev.timeSettings,
+          alarms: (prev.timeSettings.alarms || []).map((a) =>
+            a.id === current.id
+              ? { ...a, enabled: true, snoozedUntil: snoozeTargetIso }
+              : a
+          ),
+        },
+      }));
+    }
+    setInAppToast({
+      title: bi(state.settings.language, 'অ্যালার্ম ৫ মিনিট স্নুজ করা হয়েছে', 'Alarm snoozed for 5 minutes'),
+      body: current.label,
+      category: 'EDUCATION',
+      targetView: 'timer',
+    });
+  }, [ringingAlarm, state.settings.language]);
+
+  useEffect(() => {
+    const alarms = state.timeSettings.alarms || [];
+    if (alarms.length === 0) return;
+
+    const checkAlarms = () => {
+      const now = new Date();
+      const nowMs = now.getTime();
+      const snap = getDhakaClockSnapshot(now);
+
+      for (const alarm of alarms) {
+        if (!alarm.enabled) continue;
+
+        // 1. Check active snooze
+        if (alarm.snoozedUntil) {
+          const snoozeMs = new Date(alarm.snoozedUntil).getTime();
+          if (Number.isFinite(snoozeMs) && nowMs >= snoozeMs) {
+            const snoozeKey = `snooze-${alarm.id}-${alarm.snoozedUntil}`;
+            if (!firedAlarmsRef.current.has(snoozeKey)) {
+              firedAlarmsRef.current.add(snoozeKey);
+              setState((prev) => ({
+                ...prev,
+                timeSettings: {
+                  ...prev.timeSettings,
+                  alarms: (prev.timeSettings.alarms || []).map((a) =>
+                    a.id === alarm.id ? { ...a, snoozedUntil: null } : a
+                  ),
+                },
+              }));
+              triggerRingingAlarm(alarm);
+              return;
+            }
+          }
+        }
+
+        // 2. Check scheduled HH:MM in Asia/Dhaka
+        if (alarm.time === snap.hhmm24) {
+          const dayMatch =
+            !alarm.days ||
+            alarm.days.length === 0 ||
+            alarm.days.includes(snap.weekdayBn as DayOfWeek);
+          if (!dayMatch) continue;
+
+          const key = `alarm-${alarm.id}-${snap.dateKey24}-${snap.hhmm24}`;
+          if (!firedAlarmsRef.current.has(key)) {
+            firedAlarmsRef.current.add(key);
+            if (!alarm.days || alarm.days.length === 0) {
+              // One-time alarm automatically disables after ringing
+              setState((prev) => ({
+                ...prev,
+                timeSettings: {
+                  ...prev.timeSettings,
+                  alarms: (prev.timeSettings.alarms || []).map((a) =>
+                    a.id === alarm.id ? { ...a, enabled: false, snoozedUntil: null } : a
+                  ),
+                },
+              }));
+            }
+            triggerRingingAlarm(alarm);
+            return;
+          }
+        }
+      }
+    };
+
+    checkAlarms();
+    const interval = window.setInterval(checkAlarms, 4000);
+    return () => window.clearInterval(interval);
+  }, [state.timeSettings.alarms, triggerRingingAlarm]);
+
+  useEffect(() => {
+    return () => {
+      stopAlarmLoop();
+    };
+  }, []);
 
   const handleToggleTheme = () => {
     setState((prev) => ({
@@ -799,8 +1000,10 @@ export default function App() {
   const handleUpdateAiSessionMessages = (
     sessionId: string,
     updater: (prev: AiChatMessage[]) => AiChatMessage[],
-    titleOverride?: string
+    titleOverride?: string,
+    options?: { persistCloud?: boolean }
   ) => {
+    const shouldPersistCloud = options?.persistCloud ?? true;
     setState((prev) => {
       const now = new Date().toISOString();
       const prevSessions = Array.isArray(prev.aiSessions) ? prev.aiSessions : [];
@@ -818,7 +1021,7 @@ export default function App() {
         };
         return updatedSession;
       });
-      if (currentUser && !currentUser.id.startsWith('usr-') && updatedSession) {
+      if (shouldPersistCloud && currentUser && !currentUser.id.startsWith('usr-') && updatedSession) {
         void aiService.saveCloudChatSession(currentUser.id, updatedSession);
       }
       return { ...prev, aiSessions: nextSessions };
@@ -841,6 +1044,7 @@ export default function App() {
   };
 
   const handleDeleteAiSession = (sessionId: string) => {
+    void aiService.deleteServerSession(sessionId);
     if (currentUser && !currentUser.id.startsWith('usr-')) {
       void aiService.deleteCloudChatSession(currentUser.id, sessionId);
     }
@@ -860,7 +1064,8 @@ export default function App() {
 
   const handleClearActiveAiSession = () => {
     const activeId = state.activeAiSessionId;
-    handleUpdateAiSessionMessages(activeId, () => []);
+    void aiService.clearServerSession(activeId);
+    handleUpdateAiSessionMessages(activeId, () => [], undefined, { persistCloud: true });
   };
 
   const handleToggleFavoriteFormula = (formulaId: string) => {
@@ -970,17 +1175,68 @@ export default function App() {
   };
 
   const handleAuthSuccess = (user: AuthUser) => {
+    setCachedAuthUser(user);
     setCurrentUser(user);
     handleUpdateSettings({
       studentName: user.fullName,
+      collegeName: user.collegeName || user.instituteName || state.settings.collegeName,
+      avatarDataUrl: user.avatarUrl || state.settings.avatarDataUrl,
+      coverDataUrl: user.coverUrl || state.settings.coverDataUrl,
       department: (user.department as DepartmentId) || state.settings.department,
       semester: (user.semester as SemesterNumber) || state.settings.semester,
     });
-    void syncSupabaseUserContext(user);
+    void ensureSupabaseProfileExists(user, {
+      fullName: user.fullName || settingsRef.current.studentName,
+      department: user.department || settingsRef.current.department,
+      semester: user.semester || settingsRef.current.semester,
+      collegeName: user.collegeName || user.instituteName || settingsRef.current.collegeName,
+      rollNumber: user.rollNumber || undefined,
+    })
+      .then((res) => {
+        const ensured = res.user || user;
+        if (res.created || ensured.id !== user.id) {
+          setCachedAuthUser(ensured);
+          setCurrentUser(ensured);
+        }
+        void syncSupabaseUserContext(ensured);
+      })
+      .catch(() => {
+        void syncSupabaseUserContext(user);
+      });
+  };
+
+  const handleUpdateHeroProfile = async (
+    partial: HeroProfileChangePayload
+  ): Promise<ProfileUpdateResult> => {
+    handleUpdateSettings({
+      ...(partial.studentName !== undefined ? { studentName: partial.studentName } : {}),
+      ...(partial.collegeName !== undefined ? { collegeName: partial.collegeName } : {}),
+      ...(partial.department !== undefined ? { department: partial.department } : {}),
+      ...(partial.semester !== undefined ? { semester: partial.semester } : {}),
+      ...(partial.avatarDataUrl !== undefined ? { avatarDataUrl: partial.avatarDataUrl } : {}),
+    });
+
+    const result = await profileUpdateService.updateHeroProfile(
+      {
+        fullName: partial.studentName,
+        collegeName: partial.collegeName,
+        department: partial.department,
+        semester: partial.semester,
+        avatarUrl: partial.avatarDataUrl,
+      },
+      isOnline
+    );
+
+    if (result.user) {
+      setCachedAuthUser(result.user);
+      setCurrentUser(result.user);
+    }
+    return result;
   };
 
   const handleLogout = async () => {
     setStoredToken(null);
+    setCachedAuthUser(null);
     await signOutFirebase().catch(() => {});
     setCurrentUser(null);
     if (activeView === 'admin') {
@@ -1098,6 +1354,11 @@ export default function App() {
         })()}
 
         <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 pb-24 lg:pb-10">
+          <ViewErrorBoundary
+            language={state.settings.language}
+            viewKey={activeView}
+            onResetHome={() => setActiveView('dashboard')}
+          >
           {activeView === 'dashboard' && (
             <DashboardView
               state={state}
@@ -1109,6 +1370,7 @@ export default function App() {
               onUpdateWeeklyGoal={(hours) =>
                 handleUpdateSettings({ weeklyStudyGoalHours: hours })
               }
+              onUpdateHeroProfile={handleUpdateHeroProfile}
             />
           )}
 
@@ -1216,6 +1478,7 @@ export default function App() {
               onAddCompletedTimerSession={handleAddCompletedTimerSession}
               onClearTimerHistory={handleClearTimerHistory}
               onTriggerNotification={triggerNotification}
+              onTestAlarm={triggerRingingAlarm}
             />
           )}
 
@@ -1311,8 +1574,54 @@ export default function App() {
               onRefreshBootstrap={refreshBootstrap}
             />
           )}
+          </ViewErrorBoundary>
         </main>
       </div>
+
+      {ringingAlarm && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          aria-label={bi(state.settings.language, 'স্টাডি অ্যালার্ম বাজছে', 'Study Alarm Ringing')}
+          className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-[#0f172a] border border-cyan-500/40 shadow-2xl p-6 text-center space-y-5">
+            <div className="w-16 h-16 mx-auto rounded-2xl bg-cyan-500/15 border border-cyan-500/40 flex items-center justify-center text-cyan-500 animate-bounce">
+              <AlarmClock className="w-8 h-8" />
+            </div>
+            <div className="space-y-1">
+              <p className="text-xs font-semibold uppercase tracking-wider text-cyan-600 dark:text-cyan-400">
+                {bi(state.settings.language, 'স্টাডি অ্যালার্ম বাজছে', 'Study Alarm Ringing')}
+              </p>
+              <p className="text-3xl font-mono font-extrabold text-slate-900 dark:text-white tabular-nums">
+                {state.settings.language === 'bn'
+                  ? toBnDigits(ringingAlarm.time)
+                  : ringingAlarm.time}
+              </p>
+              <p className="text-sm font-medium text-slate-600 dark:text-slate-300">
+                {ringingAlarm.label}
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3 pt-1">
+              <button
+                type="button"
+                onClick={handleSnoozeAlarm}
+                className="min-h-[46px] px-4 rounded-xl border border-slate-300 dark:border-slate-700 text-xs font-bold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                {bi(state.settings.language, '৫ মিনিট স্নুজ', 'Snooze 5m')}
+              </button>
+              <button
+                type="button"
+                onClick={handleDismissAlarm}
+                className="min-h-[46px] px-4 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold inline-flex items-center justify-center gap-1.5"
+              >
+                <BellOff className="w-4 h-4" />
+                <span>{bi(state.settings.language, 'বন্ধ করুন', 'Stop Alarm')}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <MobileBottomNav
         activeView={activeView}

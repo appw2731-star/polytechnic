@@ -139,6 +139,19 @@ export interface ScheduledStudySession {
   reminderEnabled: boolean;
 }
 
+export type AlarmTone = 'classic' | 'chime' | 'gentle';
+
+export interface StudyAlarm {
+  id: string;
+  time: string; // HH:MM (24-hour Asia/Dhaka)
+  label: string;
+  enabled: boolean;
+  days: DayOfWeek[]; // empty = one-time alarm, non-empty = repeats on selected days
+  tone: AlarmTone;
+  snoozedUntil?: string | null;
+  createdAt: string;
+}
+
 export interface TimeSettings {
   studyStartTime: string;
   studyEndTime: string;
@@ -146,6 +159,7 @@ export interface TimeSettings {
   notificationsEnabled: boolean;
   reminderMinutesBefore: number;
   sessions: ScheduledStudySession[];
+  alarms: StudyAlarm[];
 }
 
 export interface CompletedTimerSession {
@@ -210,6 +224,9 @@ export interface AiChatSession {
 
 export interface UserSettings {
   studentName: string;
+  collegeName?: string;
+  avatarDataUrl?: string;
+  coverDataUrl?: string;
   department: DepartmentId;
   semester: SemesterNumber;
   theme: ThemeMode;
@@ -240,6 +257,7 @@ export interface AuthUser {
   email: string;
   role: UserRole;
   avatarUrl: string;
+  coverUrl?: string;
   gender: '' | 'male' | 'female';
   showGender: boolean;
   bio: string;
@@ -253,6 +271,23 @@ export interface AuthUser {
   isDisabled?: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PublicStudentProfile {
+  id: string;
+  fullName: string;
+  role: UserRole;
+  avatarUrl: string;
+  coverUrl: string;
+  bio: string;
+  department: string;
+  semester: number;
+  collegeName: string;
+  gender?: '' | 'male' | 'female';
+  showGender?: boolean;
+  profileVisibility: 'public' | 'department' | 'private';
+  createdAt: string;
+  postsCount: number;
 }
 
 export type FormulaSubjectCategory = 'physics' | 'mathematics';
@@ -329,6 +364,7 @@ export interface CommunityReply {
   authorId: string;
   authorName: string;
   authorRole: UserRole;
+  authorAvatarUrl?: string;
   body: string;
   createdAt: string;
 }
@@ -337,6 +373,8 @@ export interface CommunityPost {
   id: string;
   authorId: string;
   authorName: string;
+  authorAvatarUrl?: string;
+  authorCollegeName?: string;
   authorDepartment: string;
   authorRole: UserRole;
   department: string;
@@ -344,6 +382,8 @@ export interface CommunityPost {
   subjectTag: string;
   title: string;
   body: string;
+  imageUrl?: string;
+  likedByUserIds?: string[];
   reportsCount: number;
   isHidden: boolean;
   replies: CommunityReply[];

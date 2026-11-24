@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlarmClock,
   Bell,
   BellOff,
   CheckCircle2,
@@ -13,12 +14,18 @@ import {
   RotateCcw,
   Save,
   Trash2,
+  Volume2,
 } from 'lucide-react';
+import { DAYS_OF_WEEK } from '../data/curriculum';
 import { bi } from '../i18n/translations';
+import { previewAlarmTone } from '../services/alarmAudio';
 import {
+  AlarmTone,
   CompletedTimerSession,
+  DayOfWeek,
   LanguageMode,
   ScheduledStudySession,
+  StudyAlarm,
   TimeSettings,
 } from '../types/study';
 import { formatDateBn, formatTimeBn, formatTimerSeconds, toBnDigits } from '../utils/formatBn';
@@ -32,10 +39,30 @@ interface StudyTimeViewProps {
   onAddCompletedTimerSession: (session: CompletedTimerSession) => void;
   onClearTimerHistory: () => void;
   onTriggerNotification: (title: string, body: string) => void;
+  onTestAlarm?: (alarm: StudyAlarm) => void;
 }
 
 type TimerStatus = 'idle' | 'running' | 'paused';
-type ClockToolMode = 'countdown' | 'pomodoro' | 'stopwatch';
+type ClockToolMode = 'alarm' | 'countdown' | 'pomodoro' | 'stopwatch';
+
+const DAY_SHORT_BN: Record<DayOfWeek, string> = {
+  শনিবার: 'শনি',
+  রবিবার: 'রবি',
+  সোমবার: 'সোম',
+  মঙ্গলবার: 'মঙ্গল',
+  বুধবার: 'বুধ',
+  বৃহস্পতিবার: 'বৃহঃ',
+  শুক্রবার: 'শুক্র',
+};
+
+function formatTime12h(hhmm: string, lang: LanguageMode): string {
+  const [rawH, rawM] = hhmm.split(':').map(Number);
+  if (Number.isNaN(rawH) || Number.isNaN(rawM)) return hhmm;
+  const period = rawH >= 12 ? (lang === 'bn' ? 'PM' : 'PM') : 'AM';
+  const h12 = rawH % 12 === 0 ? 12 : rawH % 12;
+  const formatted = `${String(h12).padStart(2, '0')}:${String(rawM).padStart(2, '0')} ${period}`;
+  return lang === 'bn' ? toBnDigits(formatted) : formatted;
+}
 
 function playCompletionBeep() {
   try {
@@ -68,8 +95,17 @@ export const StudyTimeView: React.FC<StudyTimeViewProps> = ({
   onAddCompletedTimerSession,
   onClearTimerHistory,
   onTriggerNotification,
+  onTestAlarm,
 }) => {
-  const [toolMode, setToolMode] = useState<ClockToolMode>('countdown');
+  const [toolMode, setToolMode] = useState<ClockToolMode>('alarm');
+
+  // Alarm Manager State
+  const alarms = timeSettings.alarms || [];
+  const [editingAlarmId, setEditingAlarmId] = useState<string | null>(null);
+  const [alarmTime, setAlarmTime] = useState<string>('06:00');
+  const [alarmLabel, setAlarmLabel] = useState<string>('');
+  const [alarmDays, setAlarmDays] = useState<DayOfWeek[]>([]);
+  const [alarmTone, setAlarmTone] = useState<AlarmTone>('chime');
 
   // Countdown & Pomodoro State
   const [plannedMinutes, setPlannedMinutes] = useState<number>(25);
@@ -98,6 +134,86 @@ export const StudyTimeView: React.FC<StudyTimeViewProps> = ({
 
   const completedRef = useRef(false);
 
+  const toggleAlarmDay = (day: DayOfWeek) => {
+    setAlarmDays((prev) =>
+      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]
+    );
+  };
+
+  const handleSaveAlarm = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!alarmTime) return;
+    const cleanLabel =
+      alarmLabel.trim() || bi(language, 'পড়ার অ্যালার্ম', 'Study Alarm');
+
+    if (editingAlarmId) {
+      const updated = alarms.map((item) =>
+        item.id === editingAlarmId
+          ? {
+              ...item,
+              time: alarmTime,
+              label: cleanLabel,
+              days: alarmDays,
+              tone: alarmTone,
+              enabled: true,
+              snoozedUntil: null,
+            }
+          : item
+      );
+      onUpdateTimeSettings({ alarms: updated });
+      setEditingAlarmId(null);
+      setSavedToast(bi(language, 'অ্যালার্ম আপডেট ও চালু হয়েছে।', 'Alarm updated and enabled.'));
+    } else {
+      const created: StudyAlarm = {
+        id: `alarm-${Date.now()}`,
+        time: alarmTime,
+        label: cleanLabel,
+        enabled: true,
+        days: alarmDays,
+        tone: alarmTone,
+        snoozedUntil: null,
+        createdAt: new Date().toISOString(),
+      };
+      onUpdateTimeSettings({ alarms: [created, ...alarms] });
+      setSavedToast(bi(language, 'নতুন অ্যালার্ম সেট হয়েছে!', 'New alarm set!'));
+    }
+
+    setAlarmLabel('');
+    setAlarmDays([]);
+    window.setTimeout(() => setSavedToast(null), 2600);
+  };
+
+  const handleToggleAlarm = (alarmId: string) => {
+    const updated = alarms.map((a) =>
+      a.id === alarmId
+        ? { ...a, enabled: !a.enabled, snoozedUntil: null }
+        : a
+    );
+    onUpdateTimeSettings({ alarms: updated });
+  };
+
+  const handleDeleteAlarm = (alarmId: string) => {
+    onUpdateTimeSettings({
+      alarms: alarms.filter((a) => a.id !== alarmId),
+    });
+    if (editingAlarmId === alarmId) {
+      setEditingAlarmId(null);
+      setAlarmLabel('');
+      setAlarmDays([]);
+    }
+    setSavedToast(bi(language, 'অ্যালার্ম মুছে ফেলা হয়েছে।', 'Alarm deleted.'));
+    window.setTimeout(() => setSavedToast(null), 2200);
+  };
+
+  const handleEditAlarm = (alarm: StudyAlarm) => {
+    setToolMode('alarm');
+    setEditingAlarmId(alarm.id);
+    setAlarmTime(alarm.time);
+    setAlarmLabel(alarm.label);
+    setAlarmDays(alarm.days || []);
+    setAlarmTone(alarm.tone || 'chime');
+  };
+
   // Switch Tool Mode safely
   const handleSwitchToolMode = (nextMode: ClockToolMode) => {
     setToolMode(nextMode);
@@ -117,7 +233,7 @@ export const StudyTimeView: React.FC<StudyTimeViewProps> = ({
 
   // Countdown / Pomodoro interval
   useEffect(() => {
-    if (timerStatus !== 'running' || toolMode === 'stopwatch') return;
+    if (timerStatus !== 'running' || toolMode === 'stopwatch' || toolMode === 'alarm') return;
     const interval = window.setInterval(() => {
       setSecondsLeft((prev) => {
         if (prev <= 1) {
@@ -141,7 +257,13 @@ export const StudyTimeView: React.FC<StudyTimeViewProps> = ({
 
   // Handle Timer Completion
   useEffect(() => {
-    if (timerStatus === 'running' && secondsLeft === 0 && !completedRef.current && toolMode !== 'stopwatch') {
+    if (
+      timerStatus === 'running' &&
+      secondsLeft === 0 &&
+      !completedRef.current &&
+      toolMode !== 'stopwatch' &&
+      toolMode !== 'alarm'
+    ) {
       completedRef.current = true;
       playCompletionBeep();
 
@@ -330,13 +452,13 @@ export const StudyTimeView: React.FC<StudyTimeViewProps> = ({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl lg:text-2xl font-bold text-slate-900 dark:text-white">
-            {bi(language, 'লাইভ ক্লক, পোমোডোরো, স্টপওয়াচ ও টাইমার', 'Live Clock, Pomodoro, Stopwatch & Timer')}
+            {bi(language, 'অ্যালার্ম, লাইভ ক্লক, পোমোডোরো ও টাইমার', 'Study Alarm, Live Clock, Pomodoro & Timer')}
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
             {bi(
               language,
-              'বাংলাদেশ লাইভ সময় (অফলাইনেও চলে), কাউন্টডাউন, পোমোডোরো, স্টপওয়াচ ও কাস্টম সেশন রিমাইন্ডার',
-              'Bangladesh Live Clock (works offline), Countdown, Pomodoro cycles, Stopwatch & Reminders'
+              'পড়ার অ্যালার্ম (স্নুজ ও রিংটোনসহ), বাংলাদেশ লাইভ সময়, কাউন্টডাউন, পোমোডোরো ও স্টপওয়াচ',
+              'Study Alarms with snooze & ringtones, Bangladesh Live Clock, Countdown, Pomodoro & Stopwatch'
             )}
           </p>
         </div>
@@ -352,12 +474,13 @@ export const StudyTimeView: React.FC<StudyTimeViewProps> = ({
       <LiveBangladeshClock />
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Timer / Pomodoro / Stopwatch Panel */}
-        <section className="lg:col-span-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-6 space-y-5">
+        {/* Alarm / Timer / Pomodoro / Stopwatch Panel */}
+        <section className="lg:col-span-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-5">
           {/* Tool Mode Switcher */}
-          <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div className="grid grid-cols-4 gap-1 p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
             {(
               [
+                { id: 'alarm', label: bi(language, 'অ্যালার্ম', 'Alarm') },
                 { id: 'countdown', label: bi(language, 'টাইমার', 'Timer') },
                 { id: 'pomodoro', label: 'Pomodoro' },
                 { id: 'stopwatch', label: bi(language, 'স্টপওয়াচ', 'Stopwatch') },
@@ -367,10 +490,10 @@ export const StudyTimeView: React.FC<StudyTimeViewProps> = ({
                 key={m.id}
                 type="button"
                 onClick={() => handleSwitchToolMode(m.id)}
-                className={`min-h-[38px] rounded-lg text-xs font-semibold transition-colors ${
+                className={`min-h-[40px] rounded-lg text-xs font-semibold transition-colors px-1.5 ${
                   toolMode === m.id
                     ? 'bg-cyan-600 text-white'
-                    : 'text-slate-600 dark:text-slate-300'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
                 }`}
               >
                 {m.label}
@@ -384,7 +507,273 @@ export const StudyTimeView: React.FC<StudyTimeViewProps> = ({
             </div>
           )}
 
-          {toolMode === 'stopwatch' ? (
+          {toolMode === 'alarm' ? (
+            <div className="space-y-5">
+              <form onSubmit={handleSaveAlarm} className="space-y-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                    <AlarmClock className="w-4 h-4 text-cyan-500" />
+                    <span>
+                      {editingAlarmId
+                        ? bi(language, 'অ্যালার্ম এডিট করুন', 'Edit Study Alarm')
+                        : bi(language, 'নতুন অ্যালার্ম সেট করুন', 'Set New Study Alarm')}
+                    </span>
+                  </h2>
+                  {editingAlarmId && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingAlarmId(null);
+                        setAlarmLabel('');
+                        setAlarmDays([]);
+                      }}
+                      className="text-xs font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white"
+                    >
+                      {bi(language, 'বাতিল', 'Cancel')}
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">
+                      {bi(language, 'সময় (বাংলাদেশ সময়)', 'Time (Bangladesh Time)')}
+                    </label>
+                    <input
+                      type="time"
+                      required
+                      value={alarmTime}
+                      onChange={(e) => setAlarmTime(e.target.value)}
+                      className="w-full min-h-[44px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-base font-mono font-bold text-slate-900 dark:text-white tabular-nums"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">
+                      {bi(language, 'অ্যালার্মের নাম', 'Alarm Label')}
+                    </label>
+                    <input
+                      type="text"
+                      value={alarmLabel}
+                      onChange={(e) => setAlarmLabel(e.target.value)}
+                      placeholder={bi(language, 'যেমন: ফজর ও সকালের পড়া', 'e.g. Morning Revision')}
+                      className="w-full min-h-[44px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm text-slate-900 dark:text-white"
+                    />
+                  </div>
+                </div>
+
+                {/* Repeat Days */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                      {bi(language, 'কোন কোন দিন বাজবে', 'Repeat Days')}
+                    </span>
+                    <div className="flex items-center gap-2 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setAlarmDays([...DAYS_OF_WEEK])}
+                        className="text-cyan-600 dark:text-cyan-400 font-semibold hover:underline"
+                      >
+                        {bi(language, 'প্রতিদিন', 'Everyday')}
+                      </button>
+                      <span className="text-slate-300 dark:text-slate-700">·</span>
+                      <button
+                        type="button"
+                        onClick={() => setAlarmDays([])}
+                        className="text-slate-500 dark:text-slate-400 hover:underline"
+                      >
+                        {bi(language, 'একবার', 'Once')}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-7 gap-1.5">
+                    {DAYS_OF_WEEK.map((day) => {
+                      const active = alarmDays.includes(day);
+                      return (
+                        <button
+                          key={day}
+                          type="button"
+                          onClick={() => toggleAlarmDay(day)}
+                          className={`min-h-[38px] rounded-xl text-[11px] font-semibold border transition-colors ${
+                            active
+                              ? 'bg-cyan-600 border-cyan-600 text-white'
+                              : 'bg-slate-50 dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300 hover:border-cyan-500/60'
+                          }`}
+                        >
+                          {DAY_SHORT_BN[day]}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Alarm Tone */}
+                <div className="space-y-1.5">
+                  <span className="block text-xs font-medium text-slate-500 dark:text-slate-400">
+                    {bi(language, 'অ্যালার্ম সাউন্ড', 'Alarm Ringtone')}
+                  </span>
+                  <div className="grid grid-cols-3 gap-2">
+                    {(
+                      [
+                        { id: 'chime', label: bi(language, 'মেলোডি', 'Chime') },
+                        { id: 'classic', label: bi(language, 'ক্লাসিক', 'Classic') },
+                        { id: 'gentle', label: bi(language, 'সফট বেল', 'Gentle') },
+                      ] as const
+                    ).map((t) => (
+                      <button
+                        key={t.id}
+                        type="button"
+                        onClick={() => {
+                          setAlarmTone(t.id);
+                          previewAlarmTone(t.id);
+                        }}
+                        className={`min-h-[40px] px-2.5 rounded-xl border text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors ${
+                          alarmTone === t.id
+                            ? 'border-cyan-500 bg-cyan-500/12 text-cyan-700 dark:text-cyan-300'
+                            : 'border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300'
+                        }`}
+                      >
+                        <Volume2 className="w-3.5 h-3.5" />
+                        <span>{t.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    type="submit"
+                    className="flex-1 min-h-[44px] inline-flex items-center justify-center gap-2 px-4 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-bold"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>
+                      {editingAlarmId
+                        ? bi(language, 'অ্যালার্ম আপডেট করুন', 'Update Alarm')
+                        : bi(language, 'অ্যালার্ম সেট করুন', 'Add Alarm')}
+                    </span>
+                  </button>
+                  {onTestAlarm && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onTestAlarm({
+                          id: 'alarm-preview-test',
+                          time: alarmTime,
+                          label: alarmLabel.trim() || bi(language, 'টেস্ট স্টাডি অ্যালার্ম', 'Test Study Alarm'),
+                          enabled: true,
+                          days: alarmDays,
+                          tone: alarmTone,
+                          createdAt: new Date().toISOString(),
+                        })
+                      }
+                      className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      {bi(language, 'টেস্ট', 'Test')}
+                    </button>
+                  )}
+                </div>
+              </form>
+
+              {/* Alarm List */}
+              <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
+                <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                  <span className="font-semibold text-slate-700 dark:text-slate-200">
+                    {bi(language, 'আপনার অ্যালার্মসমূহ', 'Your Alarms')} ({language === 'bn' ? toBnDigits(alarms.length) : alarms.length})
+                  </span>
+                  <span>
+                    {alarms.filter((a) => a.enabled).length}{' '}
+                    {bi(language, 'টি চালু', 'active')}
+                  </span>
+                </div>
+
+                {alarms.length === 0 ? (
+                  <p className="text-xs text-slate-500 dark:text-slate-400 py-4 text-center">
+                    {bi(
+                      language,
+                      'এখনো কোনো অ্যালার্ম সেট করা হয়নি। উপরে সময় দিয়ে নতুন অ্যালার্ম যোগ করুন।',
+                      'No alarms set yet. Pick a time above to add your first study alarm.'
+                    )}
+                  </p>
+                ) : (
+                  <ul className="divide-y divide-slate-200 dark:divide-slate-800">
+                    {alarms.map((alarm) => {
+                      const repeatSummary =
+                        !alarm.days || alarm.days.length === 0
+                          ? bi(language, 'একবার', 'Once')
+                          : alarm.days.length === 7
+                            ? bi(language, 'প্রতিদিন', 'Everyday')
+                            : alarm.days.map((d) => DAY_SHORT_BN[d]).join(', ');
+
+                      return (
+                        <li
+                          key={alarm.id}
+                          className={`py-3 flex items-center justify-between gap-3 ${
+                            alarm.enabled ? '' : 'opacity-60'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <p className="text-lg font-mono font-bold text-slate-900 dark:text-white tabular-nums leading-tight">
+                              {formatTime12h(alarm.time, language)}
+                            </p>
+                            <p className="text-xs font-medium text-slate-700 dark:text-slate-300 truncate mt-0.5">
+                              {alarm.label}
+                            </p>
+                            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                              {repeatSummary}
+                              {alarm.snoozedUntil && (
+                                <>
+                                  {' · '}
+                                  <span className="text-amber-500 font-semibold">
+                                    {bi(language, 'স্নুজ চালু', 'Snoozed')}
+                                  </span>
+                                </>
+                              )}
+                            </p>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              role="switch"
+                              aria-checked={alarm.enabled}
+                              aria-label={bi(language, 'অ্যালার্ম চালু বা বন্ধ করুন', 'Toggle alarm')}
+                              onClick={() => handleToggleAlarm(alarm.id)}
+                              className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors ${
+                                alarm.enabled
+                                  ? 'bg-cyan-600'
+                                  : 'bg-slate-300 dark:bg-slate-700'
+                              }`}
+                            >
+                              <span
+                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
+                                  alarm.enabled ? 'translate-x-6' : 'translate-x-1'
+                                }`}
+                              />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleEditAlarm(alarm)}
+                              title={bi(language, 'এডিট', 'Edit')}
+                              className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-cyan-500 hover:bg-cyan-500/10"
+                            >
+                              <Edit3 className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteAlarm(alarm.id)}
+                              title={bi(language, 'মুছুন', 'Delete')}
+                              className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-500/10"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            </div>
+          ) : toolMode === 'stopwatch' ? (
             <div className="space-y-5">
               <div className="flex flex-col items-center py-6 rounded-2xl bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800">
                 <span className="font-mono text-4xl font-bold text-slate-900 dark:text-white tabular-nums">

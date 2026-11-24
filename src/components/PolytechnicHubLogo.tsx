@@ -1,5 +1,5 @@
 import React from 'react';
-import { Download, CheckCircle2, WifiOff, Wifi } from 'lucide-react';
+import { Download, CheckCircle2, ChevronDown, WifiOff } from 'lucide-react';
 import { LanguageMode } from '../types/study';
 import { bi } from '../i18n/translations';
 
@@ -57,23 +57,40 @@ export const SplashScreen: React.FC<{ visible: boolean }> = ({ visible }) => {
   );
 };
 
-export const OfflineStatusBadge: React.FC<{ isOnline: boolean; language: LanguageMode }> = ({
-  isOnline,
-  language,
-}) => {
+export const OfflineStatusBadge: React.FC<{
+  isOnline: boolean;
+  language: LanguageMode;
+  isOpen?: boolean;
+  onToggle?: () => void;
+}> = ({ isOnline, language, isOpen = false, onToggle }) => {
   if (isOnline) {
-    return (
-      <span className="hidden xl:inline-flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400 whitespace-nowrap shrink-0">
-        <Wifi className="w-3.5 h-3.5" />
-        <span>{bi(language, 'অনলাইন', 'Online')}</span>
-      </span>
-    );
+    return null;
   }
   return (
-    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/15 border border-amber-500/30 text-xs font-semibold text-amber-700 dark:text-amber-300 whitespace-nowrap shrink-0">
-      <WifiOff className="w-3.5 h-3.5" />
-      <span>{bi(language, 'অফলাইন মোড', 'Offline Mode')}</span>
-    </span>
+    <div role="status" aria-live="polite" className="inline-flex shrink-0">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={isOpen}
+        aria-controls="offline-mode-popover"
+        title={bi(
+          language,
+          'অফলাইন মোড চালু — ক্যাশড রিসোর্স দেখতে ক্লিক করুন',
+          'Offline Mode active — click to inspect cached resources'
+        )}
+        className="min-h-[36px] inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-xs font-semibold text-amber-800 dark:text-amber-200 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
+      >
+        <WifiOff className="w-3.5 h-3.5 text-amber-600 dark:text-amber-300 shrink-0" />
+        <span>{bi(language, 'অফলাইন মোড', 'Offline Mode')}</span>
+        {onToggle && (
+          <ChevronDown
+            className={`w-3.5 h-3.5 text-amber-600 dark:text-amber-300 shrink-0 transition-transform ${
+              isOpen ? 'rotate-180' : ''
+            }`}
+          />
+        )}
+      </button>
+    </div>
   );
 };
 

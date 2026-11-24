@@ -14,6 +14,7 @@ import {
   verifyAuthToken,
   verifyPassword,
   type DbAiConfig,
+  type DbAiSession,
   type DbCommunityPost,
   type DbDeviceToken,
   type DbFormulaItem,
@@ -88,6 +89,8 @@ interface ChatHistoryTurn {
 }
 
 interface AiAskBody {
+  sessionId?: string;
+  isRetry?: boolean;
   message?: string;
   mode?: AiMode;
   language?: LanguageCode;
@@ -458,6 +461,8 @@ function mapSupabaseProfileRow(row: Record<string, unknown>): PublicUser {
       row.profile_visibility === 'public' || row.profile_visibility === 'private'
         ? row.profile_visibility
         : 'department',
+    firebaseUid: row.firebase_uid ? String(row.firebase_uid) : undefined,
+    isDisabled: Boolean(row.is_disabled),
     createdAt: String(row.created_at || ''),
     updatedAt: String(row.updated_at || ''),
   };
@@ -642,7 +647,7 @@ async function createServer() {
         }
         if (!supabaseProfile) {
           const byEmailRes = await fetch(
-            `${SUPABASE_URL}/rest/v1/profiles?email=eq.${encodeURIComponent(normalizedEmail)}&select=*`,
+            `${SUPABASE_URL}/rest/v1/profiles?email=ilike.${encodeURIComponent(normalizedEmail)}&select=*`,
             { headers }
           );
           if (byEmailRes.ok) {
@@ -657,6 +662,7 @@ async function createServer() {
 
     let syncedUser: DbUser | null = null;
     let disabledAccount = false;
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
     dbStore.mutate((draft) => {
       let existing =
@@ -668,8 +674,9 @@ async function createServer() {
         return;
       }
 
+      const validExistingUuid = existing?.id && UUID_REGEX.test(existing.id) ? existing.id : null;
       const canonicalId = String(
-        supabaseProfile?.id || existing?.id || deterministicUuidFromFirebaseUid(claims!.uid)
+        supabaseProfile?.id || validExistingUuid || deterministicUuidFromFirebaseUid(claims!.uid)
       );
       const resolvedRole: UserRole =
         adminEnvEmail && normalizedEmail === adminEnvEmail
@@ -798,18 +805,45 @@ async function createServer() {
           body: JSON.stringify(upsertPayload),
         });
         if (!upsertRes.ok) {
-          // Retry without firebase_uid if migration 004 hasn't been applied yet
-          delete upsertPayload.firebase_uid;
-          await fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=id`, {
-            method: 'POST',
-            headers: {
-              apikey: SUPABASE_SERVICE_ROLE_KEY,
-              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-              'Content-Type': 'application/json',
-              Prefer: 'resolution=merge-duplicates',
-            },
-            body: JSON.stringify(upsertPayload),
-          }).catch(() => {});
+          const errText = await upsertRes.text().catch(() => '');
+          // If email already exists on another profile row, patch that row with firebase_uid to avoid duplicates
+          if (upsertRes.status === 409 || errText.includes('23505')) {
+            await fetch(
+              `${SUPABASE_URL}/rest/v1/profiles?email=ilike.${encodeURIComponent(u.email)}`,
+              {
+                method: 'PATCH',
+                headers: {
+                  apikey: SUPABASE_SERVICE_ROLE_KEY,
+                  Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  firebase_uid: claims.uid,
+                  full_name: u.fullName,
+                  avatar_url: u.avatarUrl,
+                  department: u.department,
+                  semester: u.semester,
+                  college_name: u.collegeName,
+                  institute_name: u.instituteName,
+                  roll_number: u.rollNumber,
+                  updated_at: now,
+                }),
+              }
+            ).catch(() => {});
+          } else {
+            // Retry without firebase_uid if migration 004 hasn't been applied yet
+            delete upsertPayload.firebase_uid;
+            await fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=id`, {
+              method: 'POST',
+              headers: {
+                apikey: SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                'Content-Type': 'application/json',
+                Prefer: 'resolution=merge-duplicates',
+              },
+              body: JSON.stringify(upsertPayload),
+            }).catch(() => {});
+          }
         }
       } catch {
         // non-blocking fallback to local dbStore
@@ -896,7 +930,189 @@ async function createServer() {
     res.json({ user: req.authUser! });
   });
 
-  app.patch('/api/auth/profile', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  app.post('/api/auth/ensure-profile', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const auth = req.authUser!;
+    const { fullName, department, semester, collegeName, rollNumber } = (req.body ?? {}) as {
+      fullName?: string;
+      department?: string;
+      semester?: number;
+      collegeName?: string;
+      rollNumber?: string;
+    };
+
+    const now = new Date().toISOString();
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    const canonicalUser = dbStore.mutate((draft) => {
+      let target = draft.users.find((u) => u.id === auth.id);
+      if (!target) {
+        target = {
+          id: auth.id,
+          firebaseUid: auth.firebaseUid,
+          fullName: (typeof fullName === 'string' && fullName.trim()) || auth.fullName,
+          email: auth.email,
+          passwordHash: '',
+          role: auth.role,
+          avatarUrl: auth.avatarUrl || '',
+          coverUrl: auth.coverUrl || '',
+          gender: auth.gender || '',
+          showGender: Boolean(auth.showGender),
+          bio: auth.bio || '',
+          department: (typeof department === 'string' && department.trim()) || auth.department || 'power',
+          semester: Math.min(8, Math.max(1, Number(semester || auth.semester || 4) || 4)),
+          collegeName: (typeof collegeName === 'string' && collegeName.trim()) || auth.collegeName || auth.instituteName || '',
+          instituteName: (typeof collegeName === 'string' && collegeName.trim()) || auth.instituteName || auth.collegeName || '',
+          rollNumber: (typeof rollNumber === 'string' && rollNumber.trim()) || auth.rollNumber || '',
+          profileVisibility: auth.profileVisibility || 'public',
+          createdAt: auth.createdAt || now,
+          updatedAt: now,
+        };
+        draft.users.push(target);
+      }
+      return toPublicUser(target);
+    });
+
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      res.json({
+        exists: true,
+        created: false,
+        syncedToSupabase: false,
+        user: canonicalUser,
+      });
+      return;
+    }
+
+    const headers = {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    };
+
+    const supabaseProfileId = UUID_REGEX.test(canonicalUser.id)
+      ? canonicalUser.id
+      : canonicalUser.firebaseUid
+        ? deterministicUuidFromFirebaseUid(canonicalUser.firebaseUid)
+        : deterministicUuidFromFirebaseUid(`local:${canonicalUser.id}`);
+
+    try {
+      // 1. Verify existence in Supabase profiles by id, firebase_uid, or email
+      let existingRow: Record<string, unknown> | null = null;
+      const byIdRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(supabaseProfileId)}&select=*`,
+        { headers }
+      );
+      if (byIdRes.ok) {
+        const rows = (await byIdRes.json()) as Record<string, unknown>[];
+        if (rows[0]) existingRow = rows[0];
+      }
+
+      if (!existingRow && canonicalUser.firebaseUid) {
+        const byUidRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/profiles?firebase_uid=eq.${encodeURIComponent(canonicalUser.firebaseUid)}&select=*`,
+          { headers }
+        );
+        if (byUidRes.ok) {
+          const rows = (await byUidRes.json()) as Record<string, unknown>[];
+          if (rows[0]) existingRow = rows[0];
+        }
+      }
+
+      if (!existingRow && canonicalUser.email) {
+        const byEmailRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/profiles?email=ilike.${encodeURIComponent(canonicalUser.email)}&select=*`,
+          { headers }
+        );
+        if (byEmailRes.ok) {
+          const rows = (await byEmailRes.json()) as Record<string, unknown>[];
+          if (rows[0]) existingRow = rows[0];
+        }
+      }
+
+      if (existingRow) {
+        // Ensure firebase_uid link is populated if missing on an existing row
+        if (canonicalUser.firebaseUid && !existingRow.firebase_uid && existingRow.id) {
+          await fetch(
+            `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(String(existingRow.id))}`,
+            {
+              method: 'PATCH',
+              headers,
+              body: JSON.stringify({
+                firebase_uid: canonicalUser.firebaseUid,
+                updated_at: now,
+              }),
+            }
+          ).catch(() => {});
+        }
+
+        res.json({
+          exists: true,
+          created: false,
+          syncedToSupabase: true,
+          user: canonicalUser,
+        });
+        return;
+      }
+
+      // 2. Profile missing in Supabase — create it now
+      const insertPayload: Record<string, unknown> = {
+        id: supabaseProfileId,
+        full_name: canonicalUser.fullName,
+        email: canonicalUser.email,
+        role: canonicalUser.role,
+        avatar_url: canonicalUser.avatarUrl,
+        department: canonicalUser.department,
+        semester: canonicalUser.semester,
+        college_name: canonicalUser.collegeName,
+        institute_name: canonicalUser.instituteName,
+        roll_number: canonicalUser.rollNumber,
+        bio: canonicalUser.bio,
+        profile_visibility: canonicalUser.profileVisibility,
+        updated_at: now,
+      };
+      if (canonicalUser.firebaseUid) {
+        insertPayload.firebase_uid = canonicalUser.firebaseUid;
+      }
+
+      const createRes = await fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=id`, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          Prefer: 'resolution=merge-duplicates',
+        },
+        body: JSON.stringify(insertPayload),
+      });
+
+      let createdOk = createRes.ok;
+      if (!createdOk && insertPayload.firebase_uid) {
+        delete insertPayload.firebase_uid;
+        const retryRes = await fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=id`, {
+          method: 'POST',
+          headers: {
+            ...headers,
+            Prefer: 'resolution=merge-duplicates',
+          },
+          body: JSON.stringify(insertPayload),
+        });
+        createdOk = retryRes.ok;
+      }
+
+      res.json({
+        exists: createdOk,
+        created: createdOk,
+        syncedToSupabase: createdOk,
+        user: canonicalUser,
+      });
+    } catch {
+      res.json({
+        exists: false,
+        created: false,
+        syncedToSupabase: false,
+        user: canonicalUser,
+      });
+    }
+  });
+
+  app.patch('/api/auth/profile', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const auth = req.authUser!;
     const {
       fullName,
@@ -910,11 +1126,36 @@ async function createServer() {
       showGender,
       profileVisibility,
       avatarUrl,
+      coverUrl,
     } = req.body ?? {};
 
     const updated = dbStore.mutate((draft) => {
-      const target = draft.users.find((u) => u.id === auth.id);
-      if (!target) return null;
+      let target = draft.users.find((u) => u.id === auth.id);
+      if (!target) {
+        const now = new Date().toISOString();
+        target = {
+          id: auth.id,
+          firebaseUid: auth.firebaseUid,
+          fullName: auth.fullName,
+          email: auth.email,
+          passwordHash: '',
+          role: auth.role,
+          avatarUrl: auth.avatarUrl || '',
+          coverUrl: auth.coverUrl || '',
+          gender: auth.gender || '',
+          showGender: Boolean(auth.showGender),
+          bio: auth.bio || '',
+          department: auth.department || 'power',
+          semester: auth.semester || 4,
+          collegeName: auth.collegeName || auth.instituteName || '',
+          instituteName: auth.instituteName || auth.collegeName || '',
+          rollNumber: auth.rollNumber || '',
+          profileVisibility: auth.profileVisibility || 'public',
+          createdAt: auth.createdAt || now,
+          updatedAt: now,
+        };
+        draft.users.push(target);
+      }
       if (typeof fullName === 'string' && fullName.trim().length >= 2) {
         target.fullName = fullName.trim();
       }
@@ -951,55 +1192,380 @@ async function createServer() {
         target.profileVisibility = profileVisibility;
       }
       if (typeof avatarUrl === 'string') {
-        target.avatarUrl = avatarUrl.trim();
+        const cleanAvatar = avatarUrl.trim();
+        if (
+          cleanAvatar === '' ||
+          ((cleanAvatar.startsWith('data:image/') || cleanAvatar.startsWith('https://')) &&
+            cleanAvatar.length <= 1_200_000)
+        ) {
+          target.avatarUrl = cleanAvatar;
+        }
+      }
+      if (typeof coverUrl === 'string') {
+        const cleanCover = coverUrl.trim();
+        if (
+          cleanCover === '' ||
+          ((cleanCover.startsWith('data:image/') || cleanCover.startsWith('https://')) &&
+            cleanCover.length <= 1_200_000)
+        ) {
+          target.coverUrl = cleanCover;
+        }
       }
       target.updatedAt = new Date().toISOString();
+
+      // Propagate updated profile info to the student's existing community posts
+      for (const post of draft.communityPosts) {
+        if (post.authorId === target.id) {
+          post.authorName = target.fullName;
+          post.authorAvatarUrl = target.avatarUrl || post.authorAvatarUrl;
+          post.authorDepartment = target.department;
+        }
+      }
+
       return toPublicUser(target);
     });
 
-    res.json({ user: updated ?? auth });
+    const finalUser = updated ?? auth;
+
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && !finalUser.id.startsWith('usr-')) {
+      try {
+        await fetch(
+          `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(finalUser.id)}`,
+          {
+            method: 'PATCH',
+            headers: {
+              apikey: SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              full_name: finalUser.fullName,
+              department: finalUser.department,
+              semester: finalUser.semester,
+              college_name: finalUser.collegeName,
+              institute_name: finalUser.instituteName,
+              roll_number: finalUser.rollNumber,
+              bio: finalUser.bio,
+              gender: finalUser.gender,
+              show_gender: finalUser.showGender,
+              profile_visibility: finalUser.profileVisibility,
+              avatar_url: finalUser.avatarUrl,
+              updated_at: finalUser.updatedAt,
+            }),
+          }
+        );
+      } catch {
+        // local dbStore remains consistent if Supabase network request fails
+      }
+    }
+
+    res.json({ user: finalUser });
   });
 
   // =========================================================================
   // COMMUNITY Q&A FORUM
   // =========================================================================
+  interface SupabaseProfileCardRow {
+    id: string;
+    full_name?: string | null;
+    department?: string | null;
+    semester?: number | null;
+    college_name?: string | null;
+    institute_name?: string | null;
+    avatar_url?: string | null;
+    bio?: string | null;
+    role?: string | null;
+    profile_visibility?: string | null;
+    created_at?: string | null;
+  }
+
+  const UUID_V_REGEX =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  const fetchSupabaseProfilesByIds = async (
+    ids: string[]
+  ): Promise<Map<string, SupabaseProfileCardRow>> => {
+    const map = new Map<string, SupabaseProfileCardRow>();
+    const supabaseKey = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+    if (!SUPABASE_URL || !supabaseKey) return map;
+
+    const uuidIds = Array.from(new Set(ids.filter((id) => UUID_V_REGEX.test(id)))).slice(0, 60);
+    if (uuidIds.length === 0) return map;
+
+    try {
+      const inClause = `(${uuidIds.join(',')})`;
+      const url = `${SUPABASE_URL.replace(/\/+$/, '')}/rest/v1/profiles?id=in.${encodeURIComponent(
+        inClause
+      )}&select=id,full_name,department,semester,college_name,institute_name,avatar_url,bio,role,profile_visibility,created_at`;
+      const resp = await fetch(url, {
+        headers: {
+          apikey: supabaseKey,
+          Authorization: `Bearer ${supabaseKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      if (!resp.ok) return map;
+      const rows = (await resp.json()) as SupabaseProfileCardRow[];
+      if (Array.isArray(rows)) {
+        for (const r of rows) {
+          if (r?.id) map.set(r.id, r);
+        }
+      }
+    } catch {
+      // Graceful fallback to local dbStore
+    }
+    return map;
+  };
+
+  const enrichCommunityPost = (
+    post: DbCommunityPost,
+    users: DbUser[],
+    sbMap?: Map<string, SupabaseProfileCardRow>
+  ): DbCommunityPost => {
+    const author = users.find((u) => u.id === post.authorId);
+    const sbAuthor = sbMap?.get(post.authorId);
+    return {
+      ...post,
+      authorName: sbAuthor?.full_name || author?.fullName || post.authorName,
+      authorDepartment:
+        sbAuthor?.department || author?.department || post.authorDepartment,
+      authorAvatarUrl:
+        sbAuthor?.avatar_url || author?.avatarUrl || post.authorAvatarUrl || '',
+      authorCollegeName:
+        sbAuthor?.college_name ||
+        sbAuthor?.institute_name ||
+        author?.collegeName ||
+        author?.instituteName ||
+        post.authorCollegeName ||
+        '',
+      likedByUserIds: Array.isArray(post.likedByUserIds) ? post.likedByUserIds : [],
+      replies: (post.replies || []).map((rep) => {
+        const repAuthor = users.find((u) => u.id === rep.authorId);
+        const sbRep = sbMap?.get(rep.authorId);
+        return {
+          ...rep,
+          authorName: sbRep?.full_name || repAuthor?.fullName || rep.authorName,
+          authorAvatarUrl:
+            sbRep?.avatar_url || repAuthor?.avatarUrl || rep.authorAvatarUrl || '',
+        };
+      }),
+    };
+  };
+
+  app.get('/api/community/profiles', async (req: Request, res: Response) => {
+    const rawIds = String(req.query.ids || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 60);
+
+    if (rawIds.length === 0) {
+      res.json({ profiles: {} });
+      return;
+    }
+
+    const db = dbStore.load();
+    const viewer = await resolveBearerUser(req);
+    const sbProfiles = await fetchSupabaseProfilesByIds(rawIds);
+    const profiles: Record<
+      string,
+      {
+        id: string;
+        fullName: string;
+        department: string;
+        semester: number;
+        collegeName: string;
+        avatarUrl: string;
+        bio: string;
+        role: UserRole;
+        source: 'supabase' | 'server';
+      }
+    > = {};
+
+    for (const id of rawIds) {
+      const sb = sbProfiles.get(id);
+      const local = db.users.find((u) => u.id === id);
+      const isSelfOrAdmin = viewer?.user.id === id || viewer?.user.role === 'admin';
+
+      if (sb) {
+        const isPrivate = sb.profile_visibility === 'private' && !isSelfOrAdmin;
+        profiles[id] = {
+          id,
+          fullName: String(sb.full_name || local?.fullName || 'Student').trim() || 'Student',
+          department: String(sb.department || local?.department || 'power'),
+          semester: Math.min(8, Math.max(1, Number(sb.semester || local?.semester || 4) || 4)),
+          collegeName: isPrivate
+            ? ''
+            : String(sb.college_name || sb.institute_name || local?.collegeName || ''),
+          avatarUrl: String(sb.avatar_url || local?.avatarUrl || ''),
+          bio: isPrivate ? '' : String(sb.bio || local?.bio || ''),
+          role: sb.role === 'admin' || local?.role === 'admin' ? 'admin' : 'student',
+          source: 'supabase',
+        };
+      } else if (local) {
+        const isPrivate = local.profileVisibility === 'private' && !isSelfOrAdmin;
+        profiles[id] = {
+          id: local.id,
+          fullName: local.fullName,
+          department: local.department,
+          semester: Math.min(8, Math.max(1, Number(local.semester) || 4)),
+          collegeName: isPrivate ? '' : local.collegeName || local.instituteName || '',
+          avatarUrl: local.avatarUrl || '',
+          bio: isPrivate ? '' : local.bio || '',
+          role: local.role,
+          source: 'server',
+        };
+      }
+    }
+
+    res.json({ profiles });
+  });
+
+  app.get('/api/users/:id/public-profile', async (req: Request, res: Response) => {
+    const db = dbStore.load();
+    const viewer = await resolveBearerUser(req);
+    const targetId = String(req.params.id || '');
+    const sbMap = await fetchSupabaseProfilesByIds([targetId]);
+    const sbUser = sbMap.get(targetId);
+    const user = db.users.find((u) => u.id === targetId);
+    const userPosts = db.communityPosts
+      .filter((p) => p.authorId === targetId && !p.isHidden)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .map((p) => enrichCommunityPost(p, db.users, sbMap));
+
+    if (!user && !sbUser) {
+      if (userPosts.length > 0) {
+        const sample = userPosts[0];
+        res.json({
+          profile: {
+            id: targetId,
+            fullName: sample.authorName,
+            role: sample.authorRole,
+            avatarUrl: sample.authorAvatarUrl || '',
+            coverUrl: '',
+            bio:
+              targetId === 'system-guide'
+                ? 'Polytechnic Hub Official Editorial & Student Support'
+                : '',
+            department: sample.authorDepartment,
+            semester: sample.semester,
+            collegeName: sample.authorCollegeName || 'Polytechnic Hub',
+            profileVisibility: 'public',
+            createdAt: sample.createdAt,
+            postsCount: userPosts.length,
+          },
+          posts: userPosts,
+        });
+        return;
+      }
+      res.status(404).json({ error: 'Student profile not found.' });
+      return;
+    }
+
+    const isSelfOrAdmin =
+      viewer?.user.id === targetId || viewer?.user.role === 'admin';
+    const rawVisibility = sbUser?.profile_visibility || user?.profileVisibility || 'department';
+    const profileVisibility: 'public' | 'department' | 'private' =
+      rawVisibility === 'public' || rawVisibility === 'private' ? rawVisibility : 'department';
+    const isPrivate = profileVisibility === 'private' && !isSelfOrAdmin;
+
+    res.json({
+      profile: {
+        id: targetId,
+        fullName: String(sbUser?.full_name || user?.fullName || 'Student'),
+        role: sbUser?.role === 'admin' || user?.role === 'admin' ? 'admin' : 'student',
+        avatarUrl: String(sbUser?.avatar_url || user?.avatarUrl || ''),
+        coverUrl: user?.coverUrl || '',
+        bio: isPrivate ? '' : String(sbUser?.bio || user?.bio || ''),
+        department: String(sbUser?.department || user?.department || 'power'),
+        semester: Math.min(8, Math.max(1, Number(sbUser?.semester || user?.semester || 4) || 4)),
+        collegeName: isPrivate
+          ? ''
+          : String(
+              sbUser?.college_name ||
+                sbUser?.institute_name ||
+                user?.collegeName ||
+                user?.instituteName ||
+                ''
+            ),
+        gender: !isPrivate && user?.showGender ? user.gender : '',
+        showGender: !isPrivate && Boolean(user?.showGender),
+        profileVisibility,
+        createdAt: String(sbUser?.created_at || user?.createdAt || new Date().toISOString()),
+        postsCount: userPosts.length,
+      },
+      posts: userPosts,
+    });
+  });
+
   app.get('/api/community/posts', async (req: Request, res: Response) => {
     const db = dbStore.load();
     const resolved = await resolveBearerUser(req);
     const includeHidden =
       resolved?.user.role === 'admin' && req.query.includeHidden === '1';
 
-    const posts = db.communityPosts
+    const visiblePosts = db.communityPosts
       .filter((p) => (includeHidden ? true : !p.isHidden))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+    const involvedIds = visiblePosts.flatMap((p) => [
+      p.authorId,
+      ...(p.replies || []).map((r) => r.authorId),
+    ]);
+    const sbMap = await fetchSupabaseProfilesByIds(involvedIds);
+    const posts = visiblePosts.map((p) => enrichCommunityPost(p, db.users, sbMap));
 
     res.json({ posts });
   });
 
   app.post('/api/community/posts', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const auth = req.authUser!;
-    const { title, body, department = auth.department, semester = auth.semester, subjectTag = '' } =
-      req.body ?? {};
-    if (typeof title !== 'string' || title.trim().length < 4) {
-      res.status(400).json({ error: 'শিরোনাম কমপক্ষে ৪ অক্ষরের হতে হবে।' });
+    const {
+      title = '',
+      body = '',
+      imageUrl = '',
+      department = auth.department,
+      semester = auth.semester,
+      subjectTag = '',
+    } = req.body ?? {};
+
+    const cleanBody = typeof body === 'string' ? body.trim() : '';
+    const cleanImage =
+      typeof imageUrl === 'string' &&
+      (imageUrl.startsWith('data:image/') || imageUrl.startsWith('https://')) &&
+      imageUrl.length <= 1_200_000
+        ? imageUrl.trim()
+        : '';
+
+    if (cleanBody.length < 2 && !cleanImage) {
+      res.status(400).json({ error: 'পোস্টের লেখা বা একটি ছবি যোগ করুন।' });
       return;
     }
-    if (typeof body !== 'string' || body.trim().length < 8) {
-      res.status(400).json({ error: 'প্রশ্ন বা বিবরণ কমপক্ষে ৮ অক্ষরের লিখুন।' });
-      return;
-    }
+
+    const rawTitle = typeof title === 'string' ? title.trim() : '';
+    const derivedTitle =
+      rawTitle.length > 0
+        ? rawTitle.slice(0, 140)
+        : cleanBody
+            .split('\n')[0]
+            .trim()
+            .slice(0, 80) || 'ফটো পোস্ট';
 
     const post: DbCommunityPost = {
       id: `post-${crypto.randomUUID()}`,
       authorId: auth.id,
       authorName: auth.fullName,
+      authorAvatarUrl: auth.avatarUrl || '',
+      authorCollegeName: auth.collegeName || auth.instituteName || '',
       authorDepartment: auth.department,
       authorRole: auth.role,
       department: String(department),
       semester: Math.min(8, Math.max(1, Number(semester) || 4)),
       subjectTag: String(subjectTag || '').trim(),
-      title: title.trim(),
-      body: body.trim(),
+      title: derivedTitle,
+      body: cleanBody,
+      imageUrl: cleanImage || undefined,
+      likedByUserIds: [],
       reportsCount: 0,
       isHidden: false,
       replies: [],
@@ -1011,6 +1577,30 @@ async function createServer() {
     });
     res.status(201).json({ post });
   });
+
+  app.post(
+    '/api/community/posts/:id/like',
+    requireAuth,
+    (req: AuthenticatedRequest, res: Response) => {
+      const auth = req.authUser!;
+      const updatedPost = dbStore.mutate((draft) => {
+        const post = draft.communityPosts.find((p) => p.id === req.params.id);
+        if (!post) return null;
+        const currentLikes = Array.isArray(post.likedByUserIds) ? post.likedByUserIds : [];
+        const hasLiked = currentLikes.includes(auth.id);
+        post.likedByUserIds = hasLiked
+          ? currentLikes.filter((uid) => uid !== auth.id)
+          : [...currentLikes, auth.id];
+        return enrichCommunityPost(post, draft.users);
+      });
+
+      if (!updatedPost) {
+        res.status(404).json({ error: 'Post not found.' });
+        return;
+      }
+      res.json({ post: updatedPost });
+    }
+  );
 
   app.post(
     '/api/community/posts/:id/reply',
@@ -1031,10 +1621,11 @@ async function createServer() {
           authorId: auth.id,
           authorName: auth.fullName,
           authorRole: auth.role,
+          authorAvatarUrl: auth.avatarUrl || '',
           body: body.trim(),
           createdAt: new Date().toISOString(),
         });
-        return post;
+        return enrichCommunityPost(post, draft.users);
       });
 
       if (!updatedPost) {
@@ -2932,21 +3523,344 @@ async function createServer() {
   schedulerInterval.unref?.();
 
   // =========================================================================
-  // FAST STREAMING AI TUTOR (SSE) + NON-STREAMING FALLBACK
+  // FAST STREAMING AI TUTOR (SSE) + NON-STREAMING FALLBACK + SESSION HISTORY
   // =========================================================================
-  function resolveThinkingLevelForModel(
-    modelName: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite',
+  type SupportedAiModel = 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
+
+  function sanitizeAiSessionId(raw: unknown): string {
+    if (typeof raw === 'string') {
+      const cleaned = raw.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+      if (cleaned.length >= 4) {
+        return cleaned;
+      }
+    }
+    return `ai-sess-${crypto.randomUUID()}`;
+  }
+
+  function resolveSessionTurnsForContext(
+    sessionId: string,
+    ownerId: string | undefined,
+    clientHistory: ChatHistoryTurn[] | undefined,
+    currentMessage: string,
+    isRetry: boolean | undefined,
+    historyLimit: number
+  ): ChatHistoryTurn[] {
+    const db = dbStore.load();
+    const existing = db.aiSessions.find((s) => s.id === sessionId);
+    const canUseServerSession =
+      Boolean(existing) && (!existing?.ownerId || !ownerId || existing.ownerId === ownerId);
+
+    const serverTurns: ChatHistoryTurn[] =
+      canUseServerSession && existing
+        ? existing.messages.map((m) => ({ role: m.role, text: m.text }))
+        : [];
+
+    const clientTurns: ChatHistoryTurn[] = Array.isArray(clientHistory)
+      ? clientHistory
+          .filter(
+            (turn): turn is ChatHistoryTurn =>
+              Boolean(turn) &&
+              (turn.role === 'user' || turn.role === 'assistant') &&
+              typeof turn.text === 'string' &&
+              turn.text.trim().length > 0
+          )
+          .map((turn) => ({ role: turn.role, text: turn.text.trim() }))
+      : [];
+
+    // Prefer the authoritative server-side session history when populated,
+    // falling back to client history if the session was created offline or predates server sync.
+    const merged = serverTurns.length >= clientTurns.length ? [...serverTurns] : [...clientTurns];
+    const trimmedCurrent = currentMessage.trim();
+
+    if (isRetry && merged.length > 0) {
+      if (merged[merged.length - 1].role === 'assistant') {
+        merged.pop();
+      }
+      if (
+        merged.length > 0 &&
+        merged[merged.length - 1].role === 'user' &&
+        merged[merged.length - 1].text.trim() === trimmedCurrent
+      ) {
+        merged.pop();
+      }
+    }
+
+    return merged.slice(-historyLimit);
+  }
+
+  function commitAiSessionTurn(params: {
+    sessionId: string;
+    ownerId?: string;
+    userMessage: string;
+    assistantReply: string;
+    mode: AiMode;
+    isRetry?: boolean;
+  }): DbAiSession {
+    const now = new Date().toISOString();
+    const cleanUserText = params.userMessage.trim().slice(0, 6000);
+    const cleanAssistantText = params.assistantReply.trim().slice(0, 20000);
+
+    return dbStore.mutate((draft) => {
+      if (!Array.isArray(draft.aiSessions)) {
+        draft.aiSessions = [];
+      }
+
+      let session = draft.aiSessions.find((s) => s.id === params.sessionId);
+      if (session && session.ownerId && params.ownerId && session.ownerId !== params.ownerId) {
+        // Avoid overwriting another user's session if an ID collided
+        session = undefined;
+      }
+
+      if (!session) {
+        session = {
+          id: params.sessionId,
+          ownerId: params.ownerId,
+          title: cleanUserText.slice(0, 48) || 'Chat Session',
+          messages: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+        draft.aiSessions.unshift(session);
+      } else {
+        if (!session.ownerId && params.ownerId) {
+          session.ownerId = params.ownerId;
+        }
+        if (session.messages.length === 0) {
+          session.title = cleanUserText.slice(0, 48) || session.title;
+        }
+      }
+
+      if (params.isRetry && session.messages.length > 0) {
+        if (session.messages[session.messages.length - 1].role === 'assistant') {
+          session.messages.pop();
+        }
+        if (
+          session.messages.length > 0 &&
+          session.messages[session.messages.length - 1].role === 'user' &&
+          session.messages[session.messages.length - 1].text.trim() === cleanUserText
+        ) {
+          session.messages.pop();
+        }
+      }
+
+      session.messages.push(
+        {
+          id: `srv-u-${crypto.randomUUID().slice(0, 8)}`,
+          role: 'user',
+          text: cleanUserText,
+          mode: params.mode,
+          timestamp: now,
+        },
+        {
+          id: `srv-a-${crypto.randomUUID().slice(0, 8)}`,
+          role: 'assistant',
+          text: cleanAssistantText,
+          mode: params.mode,
+          timestamp: now,
+        }
+      );
+
+      if (session.messages.length > 40) {
+        session.messages = session.messages.slice(-40);
+      }
+      session.updatedAt = now;
+
+      // Keep server store compact (most recent 100 sessions)
+      draft.aiSessions.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+      if (draft.aiSessions.length > 100) {
+        draft.aiSessions = draft.aiSessions.slice(0, 100);
+      }
+
+      return session;
+    });
+  }
+
+  app.get('/api/ai/sessions', async (req: Request, res: Response) => {
+    const authResolved = await resolveBearerUser(req).catch(() => null);
+    const querySessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : '';
+    const db = dbStore.load();
+
+    if (authResolved?.user) {
+      const owned = db.aiSessions
+        .filter((s) => s.ownerId === authResolved.user.id)
+        .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))
+        .slice(0, 25);
+      res.json({ sessions: owned });
+      return;
+    }
+
+    if (querySessionId) {
+      const match = db.aiSessions.find((s) => s.id === querySessionId && !s.ownerId);
+      res.json({ sessions: match ? [match] : [] });
+      return;
+    }
+
+    res.json({ sessions: [] });
+  });
+
+  app.get('/api/ai/sessions/:sessionId', async (req: Request, res: Response) => {
+    const authResolved = await resolveBearerUser(req).catch(() => null);
+    const sessionId = sanitizeAiSessionId(req.params.sessionId);
+    const db = dbStore.load();
+    const session = db.aiSessions.find((s) => s.id === sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Chat session not found.' });
+      return;
+    }
+    if (session.ownerId && session.ownerId !== authResolved?.user?.id) {
+      res.status(403).json({ error: 'Forbidden.' });
+      return;
+    }
+    res.json({ session });
+  });
+
+  app.post('/api/ai/sessions/:sessionId/clear', async (req: Request, res: Response) => {
+    const authResolved = await resolveBearerUser(req).catch(() => null);
+    const sessionId = sanitizeAiSessionId(req.params.sessionId);
+    const result = dbStore.mutate((draft) => {
+      const target = draft.aiSessions.find((s) => s.id === sessionId);
+      if (!target) return 'not_found';
+      if (target.ownerId && target.ownerId !== authResolved?.user?.id) return 'forbidden';
+      target.messages = [];
+      target.updatedAt = new Date().toISOString();
+      return 'ok';
+    });
+    if (result === 'forbidden') {
+      res.status(403).json({ error: 'Forbidden.' });
+      return;
+    }
+    res.json({ ok: true, sessionId });
+  });
+
+  app.delete('/api/ai/sessions/:sessionId', async (req: Request, res: Response) => {
+    const authResolved = await resolveBearerUser(req).catch(() => null);
+    const sessionId = sanitizeAiSessionId(req.params.sessionId);
+    const result = dbStore.mutate((draft) => {
+      const idx = draft.aiSessions.findIndex((s) => s.id === sessionId);
+      if (idx === -1) return 'not_found';
+      const target = draft.aiSessions[idx];
+      if (target.ownerId && target.ownerId !== authResolved?.user?.id) return 'forbidden';
+      draft.aiSessions.splice(idx, 1);
+      return 'ok';
+    });
+    if (result === 'forbidden') {
+      res.status(403).json({ error: 'Forbidden.' });
+      return;
+    }
+    res.json({ ok: true, sessionId });
+  });
+
+  function buildGeminiContents(
+    history: ChatHistoryTurn[] | undefined,
+    currentMessage: string,
+    historyLimit: number
+  ): Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> {
+    const trimmedCurrent = currentMessage.trim();
+    const rawTurns = Array.isArray(history)
+      ? history
+          .filter(
+            (turn): turn is ChatHistoryTurn =>
+              Boolean(turn) &&
+              (turn.role === 'user' || turn.role === 'assistant') &&
+              typeof turn.text === 'string' &&
+              turn.text.trim().length > 0
+          )
+          .slice(-historyLimit)
+      : [];
+
+    // Deduplicate trailing user turn if client already included current message in history
+    if (
+      rawTurns.length > 0 &&
+      rawTurns[rawTurns.length - 1].role === 'user' &&
+      rawTurns[rawTurns.length - 1].text.trim() === trimmedCurrent
+    ) {
+      rawTurns.pop();
+    }
+
+    const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+    for (const turn of rawTurns) {
+      const geminiRole: 'user' | 'model' = turn.role === 'user' ? 'user' : 'model';
+      // Gemini requires conversation to start with a user turn
+      if (contents.length === 0 && geminiRole !== 'user') continue;
+      const cleanText = turn.text.trim().slice(0, 4000);
+      const prev = contents[contents.length - 1];
+      if (prev && prev.role === geminiRole) {
+        prev.parts.push({ text: cleanText });
+      } else {
+        contents.push({ role: geminiRole, parts: [{ text: cleanText }] });
+      }
+    }
+
+    const last = contents[contents.length - 1];
+    if (last && last.role === 'user') {
+      last.parts.push({ text: trimmedCurrent });
+    } else {
+      contents.push({ role: 'user', parts: [{ text: trimmedCurrent }] });
+    }
+
+    return contents;
+  }
+
+  function buildModelConfig(
+    modelName: SupportedAiModel,
+    systemInstruction: string,
     concise: boolean | undefined,
     mode: AiMode,
-    aiConfig: DbAiConfig
-  ): ThinkingLevel {
-    if (modelName === 'gemini-3.1-flash-lite') {
-      return ThinkingLevel.MINIMAL;
+    aiConfig: DbAiConfig,
+    includeThinking: boolean
+  ): {
+    systemInstruction: string;
+    thinkingConfig?: { thinkingLevel: ThinkingLevel };
+  } {
+    if (!includeThinking || modelName === 'gemini-3.1-flash-lite') {
+      return { systemInstruction };
     }
-    if (concise || aiConfig.thinkingLevel === 'LOW') {
-      return ThinkingLevel.LOW;
+    const thinkingLevel =
+      concise || aiConfig.thinkingLevel === 'LOW'
+        ? ThinkingLevel.LOW
+        : mode === 'math' || mode === 'power'
+          ? ThinkingLevel.MEDIUM
+          : ThinkingLevel.LOW;
+    return {
+      systemInstruction,
+      thinkingConfig: { thinkingLevel },
+    };
+  }
+
+  const modelQuotaCooldownUntil = new Map<SupportedAiModel, number>();
+
+  function isQuotaExhaustedError(raw: string): boolean {
+    return (
+      raw.includes('429') ||
+      raw.includes('RESOURCE_EXHAUSTED') ||
+      raw.includes('Quota exceeded') ||
+      raw.includes('GenerateRequestsPerDay')
+    );
+  }
+
+  function recordModelQuotaCooldown(model: SupportedAiModel, rawError: string): void {
+    const retryMatch = rawError.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
+    const parsedSec = retryMatch ? Number(retryMatch[1]) : 900;
+    // Clamp cooldown between 60 seconds and 6 hours so transient burst vs daily limit is handled cleanly
+    const cooldownMs = Math.min(6 * 60 * 60 * 1000, Math.max(60 * 1000, parsedSec * 1000));
+    const until = Date.now() + cooldownMs;
+    const prev = modelQuotaCooldownUntil.get(model) ?? 0;
+    if (until > prev + 10_000) {
+      modelQuotaCooldownUntil.set(model, until);
+      console.warn(
+        `[AI Quota] Model ${model} hit 429 quota limit; routing around it for ~${Math.round(cooldownMs / 60000)}m.`
+      );
     }
-    return mode === 'math' || mode === 'power' ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW;
+  }
+
+  function isModelInQuotaCooldown(model: SupportedAiModel): boolean {
+    const until = modelQuotaCooldownUntil.get(model);
+    if (!until) return false;
+    if (Date.now() >= until) {
+      modelQuotaCooldownUntil.delete(model);
+      return false;
+    }
+    return true;
   }
 
   function formatGeminiErrorForClient(err: unknown, language: LanguageCode, modelName: string): {
@@ -2970,14 +3884,19 @@ async function createServer() {
             : 'GEMINI_API_KEY সঠিক নয় বা অনুমতি পাওয়া যায়নি। Settings > Secrets প্যানেল থেকে কী যাচাই করুন।',
       };
     }
-    if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
+    if (isQuotaExhaustedError(raw)) {
+      const isDaily = raw.includes('PerDay') || raw.includes('Free Tier') || raw.includes('QUOTA_EXHAUSTED');
       return {
         status: 429,
-        code: 'RATE_LIMIT',
+        code: isDaily ? 'QUOTA_EXHAUSTED' : 'RATE_LIMIT',
         message:
           language === 'en'
-            ? 'AI rate limit reached. Please wait a few seconds and retry.'
-            : 'অনুরোধের সীমা অতিক্রম করেছে। কিছুক্ষণ পর আবার চেষ্টা করুন।',
+            ? isDaily
+              ? 'Free Tier daily AI quota has been reached for this API key. Select a billing-enabled API key in Settings > Secrets or retry after quota resets.'
+              : 'AI rate limit reached. Please wait a few seconds and retry.'
+            : isDaily
+              ? 'এই API Key-এর দৈনিক Free Tier কোটা শেষ হয়ে গেছে। Settings > Secrets প্যানেলে বিলিং-সক্রিয় API Key যুক্ত করুন অথবা কোটা রিসেট হলে আবার চেষ্টা করুন।'
+              : 'অনুরোধের সীমা অতিক্রম করেছে। কিছুক্ষণ পর আবার চেষ্টা করুন।',
       };
     }
     if (raw.includes('404') || raw.includes('NOT_FOUND')) {
@@ -2990,7 +3909,15 @@ async function createServer() {
             : `নির্বাচিত মডেল (${modelName}) এই API Key-এর জন্য পাওয়া যায়নি। Admin প্যানেল থেকে মডেল পরিবর্তন করুন।`,
       };
     }
-    if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+    if (
+      raw.includes('503') ||
+      raw.includes('UNAVAILABLE') ||
+      raw.includes('high demand') ||
+      raw.includes('overloaded') ||
+      raw.includes('500') ||
+      raw.includes('INTERNAL') ||
+      raw.includes('DEADLINE_EXCEEDED')
+    ) {
       return {
         status: 503,
         code: 'MODEL_BUSY',
@@ -3010,19 +3937,66 @@ async function createServer() {
     };
   }
 
-  function isFallbackEligibleAiError(msg: string): boolean {
+  function isRetryableAiError(msg: string): boolean {
+    const lower = msg.toLowerCase();
     return (
-      msg.includes('404') ||
-      msg.includes('NOT_FOUND') ||
-      msg.includes('503') ||
-      msg.includes('UNAVAILABLE') ||
-      msg.includes('high demand')
+      lower.includes('404') ||
+      lower.includes('not_found') ||
+      lower.includes('429') ||
+      lower.includes('resource_exhausted') ||
+      lower.includes('500') ||
+      lower.includes('502') ||
+      lower.includes('503') ||
+      lower.includes('504') ||
+      lower.includes('internal') ||
+      lower.includes('unavailable') ||
+      lower.includes('deadline_exceeded') ||
+      lower.includes('high demand') ||
+      lower.includes('overloaded') ||
+      lower.includes('fetch failed') ||
+      lower.includes('econnreset') ||
+      lower.includes('etimedout') ||
+      lower.includes('socket')
     );
   }
 
-  app.post('/api/ai/stream', async (req: Request<unknown, unknown, AiAskBody>, res: Response) => {
+  function buildRetryPlan(
+    primaryModel: SupportedAiModel,
+    fallbackModel: SupportedAiModel
+  ): Array<{ model: SupportedAiModel; delayMs: number; includeThinking: boolean }> {
+    const primaryCooling = isModelInQuotaCooldown(primaryModel);
+    const fallbackCooling = isModelInQuotaCooldown(fallbackModel);
+
+    if (primaryCooling && fallbackCooling) {
+      return [];
+    }
+    if (primaryCooling && !fallbackCooling) {
+      return [
+        { model: fallbackModel, delayMs: 0, includeThinking: false },
+        { model: fallbackModel, delayMs: 800, includeThinking: false },
+        { model: fallbackModel, delayMs: 1650, includeThinking: false },
+      ];
+    }
+    if (!primaryCooling && fallbackCooling) {
+      return [
+        { model: primaryModel, delayMs: 0, includeThinking: true },
+        { model: primaryModel, delayMs: 850, includeThinking: false },
+      ];
+    }
+
+    return [
+      { model: primaryModel, delayMs: 0, includeThinking: true },
+      { model: fallbackModel, delayMs: 550, includeThinking: false },
+      { model: primaryModel, delayMs: 1250, includeThinking: false },
+      { model: fallbackModel, delayMs: 2100, includeThinking: false },
+    ];
+  }
+
+  app.post('/api/ai/stream', async (req: Request<Record<string, string>, unknown, AiAskBody>, res: Response) => {
     const startedAt = Date.now();
     const {
+      sessionId: rawSessionId,
+      isRetry = false,
       message,
       mode = 'explain',
       language = 'bn',
@@ -3051,23 +4025,28 @@ async function createServer() {
       return;
     }
 
+    const authResolved = await resolveBearerUser(req).catch(() => null);
+    const ownerId = authResolved?.user?.id;
+    const sessionId = sanitizeAiSessionId(rawSessionId);
+
     const db = dbStore.load();
     const aiConfig = db.aiConfig;
     const historyLimit = Math.min(20, Math.max(2, aiConfig.maxHistoryTurns || 8));
-    const recentHistory = Array.isArray(history) ? history.slice(-historyLimit) : [];
-    const formattedHistory = recentHistory
-      .map((turn) => `${turn.role === 'user' ? 'Student' : 'Polytechnic Hub AI'}: ${turn.text}`)
-      .join('\n\n');
+    const resolvedHistory = resolveSessionTurnsForContext(
+      sessionId,
+      ownerId,
+      history,
+      message,
+      isRetry,
+      historyLimit
+    );
+    const contents = buildGeminiContents(resolvedHistory, message, historyLimit);
 
-    const promptText = formattedHistory
-      ? `Previous Conversation:\n${formattedHistory}\n\nCurrent Question:\n${message.trim()}`
-      : message.trim();
-
-    const primaryModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' =
+    const primaryModel: SupportedAiModel =
       aiConfig.activeModel === 'gemini-3.1-flash-lite'
         ? 'gemini-3.1-flash-lite'
         : 'gemini-4-hydrogen';
-    const fallbackModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' =
+    const fallbackModel: SupportedAiModel =
       primaryModel === 'gemini-4-hydrogen' ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen';
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -3083,6 +4062,13 @@ async function createServer() {
       }
     });
 
+    // Periodic SSE keep-alive comment while awaiting first token
+    const keepAliveTimer = setInterval(() => {
+      if (!clientAborted && !res.writableEnded) {
+        res.write(': keepalive\n\n');
+      }
+    }, 8000);
+
     const systemInstruction = buildSystemInstruction(
       mode,
       language,
@@ -3092,111 +4078,172 @@ async function createServer() {
       concise
     );
 
-    const openStreamWithCandidate = async (candidateModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite') => {
-      const thinkingLevel = resolveThinkingLevelForModel(candidateModel, concise, mode, aiConfig);
+    const openStreamAttempt = async (
+      candidateModel: SupportedAiModel,
+      includeThinking: boolean
+    ) => {
+      const config = buildModelConfig(
+        candidateModel,
+        systemInstruction,
+        concise,
+        mode,
+        aiConfig,
+        includeThinking
+      );
       try {
-        return {
+        return await ai.models.generateContentStream({
           model: candidateModel,
-          stream: await ai.models.generateContentStream({
-            model: candidateModel,
-            contents: promptText,
-            config: {
-              systemInstruction,
-              thinkingConfig: { thinkingLevel },
-            },
-          }),
-        };
+          contents,
+          config,
+        });
       } catch (innerErr: unknown) {
         const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
-        // Retry without thinkingConfig if model rejects thinkingConfig enum
-        if (msg.includes('thinking') || msg.includes('INVALID_ARGUMENT')) {
-          return {
+        if (includeThinking && (msg.includes('thinking') || msg.includes('INVALID_ARGUMENT'))) {
+          return await ai.models.generateContentStream({
             model: candidateModel,
-            stream: await ai.models.generateContentStream({
-              model: candidateModel,
-              contents: promptText,
-              config: { systemInstruction },
-            }),
-          };
+            contents,
+            config: { systemInstruction },
+          });
         }
         throw innerErr;
       }
     };
 
     let hasEmittedChunk = false;
-    const runStreamWithCandidate = async (candidateModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite') => {
-      const attempt = await openStreamWithCandidate(candidateModel);
-      for await (const chunk of attempt.stream) {
-        if (clientAborted) break;
-        const delta = chunk.text;
-        if (delta) {
-          hasEmittedChunk = true;
-          res.write(`data: ${JSON.stringify({ type: 'chunk', text: delta })}\n\n`);
-        }
-      }
-      return attempt.model;
-    };
+    let accumulatedReply = '';
+    let streamModel: SupportedAiModel = primaryModel;
+    const plan = buildRetryPlan(primaryModel, fallbackModel);
 
     try {
-      let streamModel: string = primaryModel;
-      try {
-        streamModel = await runStreamWithCandidate(primaryModel);
-      } catch (primaryErr: unknown) {
-        const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
-        if (!hasEmittedChunk && isFallbackEligibleAiError(msg)) {
-          try {
-            streamModel = await runStreamWithCandidate(fallbackModel);
-          } catch (fallbackErr: unknown) {
-            const fMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-            if (!hasEmittedChunk && (fMsg.includes('503') || fMsg.includes('UNAVAILABLE') || fMsg.includes('high demand'))) {
-              await new Promise((r) => setTimeout(r, 900));
-              streamModel = await runStreamWithCandidate(fallbackModel);
-            } else {
-              throw fallbackErr;
+      let lastError: unknown = null;
+      let succeeded = false;
+
+      for (let i = 0; i < plan.length; i += 1) {
+        if (clientAborted) break;
+        const step = plan[i];
+        if (i > 0) {
+          if (!res.writableEnded) {
+            res.write(
+              `data: ${JSON.stringify({
+                type: 'status',
+                status: 'retrying',
+                attempt: i + 1,
+                maxAttempts: plan.length,
+                model: step.model,
+                sessionId,
+              })}\n\n`
+            );
+          }
+          const jitter = Math.floor(Math.random() * 250);
+          await new Promise((r) => setTimeout(r, step.delayMs + jitter));
+          if (clientAborted) break;
+        }
+
+        try {
+          const stream = await openStreamAttempt(step.model, step.includeThinking);
+          for await (const chunk of stream) {
+            if (clientAborted) break;
+            const delta = chunk.text;
+            if (delta) {
+              hasEmittedChunk = true;
+              accumulatedReply += delta;
+              res.write(`data: ${JSON.stringify({ type: 'chunk', text: delta })}\n\n`);
             }
           }
-        } else {
-          throw primaryErr;
+
+          if (clientAborted || hasEmittedChunk) {
+            streamModel = step.model;
+            succeeded = true;
+            break;
+          }
+
+          throw new Error('UNAVAILABLE: Empty stream response from model');
+        } catch (attemptErr: unknown) {
+          lastError = attemptErr;
+          const errMsg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
+          if (isQuotaExhaustedError(errMsg)) {
+            recordModelQuotaCooldown(step.model, errMsg);
+          } else {
+            console.warn(`[AI Stream attempt ${i + 1}/${plan.length} ${step.model}] ${errMsg.slice(0, 180)}`);
+          }
+
+          if (hasEmittedChunk || clientAborted || !isRetryableAiError(errMsg)) {
+            throw attemptErr;
+          }
         }
       }
 
       if (clientAborted) {
+        if (accumulatedReply.trim()) {
+          commitAiSessionTurn({
+            sessionId,
+            ownerId,
+            userMessage: message,
+            assistantReply: accumulatedReply,
+            mode,
+            isRetry,
+          });
+        }
         if (!res.writableEnded) res.end();
         return;
       }
 
-      if (!clientAborted) {
-        recordAiUsage(mode, Date.now() - startedAt, false);
-        res.write(
-          `data: ${JSON.stringify({
-            type: 'done',
-            mode,
-            model: streamModel,
-            timestamp: new Date().toISOString(),
-          })}\n\n`
-        );
+      if (plan.length === 0) {
+        throw new Error('429 RESOURCE_EXHAUSTED QUOTA_EXHAUSTED: All configured models are in quota cooldown.');
       }
+
+      if (!succeeded || !accumulatedReply.trim()) {
+        throw lastError ?? new Error('UNAVAILABLE: AI Tutor failed to generate a response.');
+      }
+
+      const savedSession = commitAiSessionTurn({
+        sessionId,
+        ownerId,
+        userMessage: message,
+        assistantReply: accumulatedReply,
+        mode,
+        isRetry,
+      });
+
+      recordAiUsage(mode, Date.now() - startedAt, false);
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'done',
+          sessionId: savedSession.id,
+          turnCount: savedSession.messages.length,
+          mode,
+          model: streamModel,
+          timestamp: new Date().toISOString(),
+        })}\n\n`
+      );
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      console.error('AI Stream Error:', errorMessage);
+      const mapped = formatGeminiErrorForClient(err, language, streamModel);
+      if (mapped.code === 'MODEL_BUSY' || mapped.code === 'RATE_LIMIT' || mapped.code === 'QUOTA_EXHAUSTED') {
+        console.warn(`[AI Stream ${mapped.code}] ${streamModel}`);
+      } else {
+        console.error('AI Stream Error:', errorMessage.slice(0, 300));
+      }
       recordAiUsage(mode, Date.now() - startedAt, true);
 
       if (!clientAborted && !res.writableEnded) {
-        const mapped = formatGeminiErrorForClient(err, language, primaryModel);
         res.write(
-          `data: ${JSON.stringify({ type: 'error', error: mapped.message, code: mapped.code })}\n\n`
+          `data: ${JSON.stringify({ type: 'error', error: mapped.message, code: mapped.code, sessionId })}\n\n`
         );
       }
     } finally {
+      clearInterval(keepAliveTimer);
       if (!res.writableEnded) {
         res.end();
       }
     }
   });
 
-  app.post('/api/ai/ask', async (req: Request<unknown, unknown, AiAskBody>, res: Response) => {
+  app.post('/api/ai/ask', async (req: Request<Record<string, string>, unknown, AiAskBody>, res: Response) => {
     const startedAt = Date.now();
     const {
+      sessionId: rawSessionId,
+      isRetry = false,
       message,
       mode = 'explain',
       language = 'bn',
@@ -3225,23 +4272,28 @@ async function createServer() {
       return;
     }
 
+    const authResolved = await resolveBearerUser(req).catch(() => null);
+    const ownerId = authResolved?.user?.id;
+    const sessionId = sanitizeAiSessionId(rawSessionId);
+
     const db = dbStore.load();
     const aiConfig = db.aiConfig;
     const historyLimit = Math.min(20, Math.max(2, aiConfig.maxHistoryTurns || 8));
-    const recentHistory = Array.isArray(history) ? history.slice(-historyLimit) : [];
-    const formattedHistory = recentHistory
-      .map((turn) => `${turn.role === 'user' ? 'Student' : 'Polytechnic Hub AI'}: ${turn.text}`)
-      .join('\n\n');
+    const resolvedHistory = resolveSessionTurnsForContext(
+      sessionId,
+      ownerId,
+      history,
+      message,
+      isRetry,
+      historyLimit
+    );
+    const contents = buildGeminiContents(resolvedHistory, message, historyLimit);
 
-    const promptText = formattedHistory
-      ? `Previous Conversation:\n${formattedHistory}\n\nCurrent Question:\n${message.trim()}`
-      : message.trim();
-
-    const primaryModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' =
+    const primaryModel: SupportedAiModel =
       aiConfig.activeModel === 'gemini-3.1-flash-lite'
         ? 'gemini-3.1-flash-lite'
         : 'gemini-4-hydrogen';
-    const fallbackModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' =
+    const fallbackModel: SupportedAiModel =
       primaryModel === 'gemini-4-hydrogen' ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen';
 
     const systemInstruction = buildSystemInstruction(
@@ -3253,23 +4305,30 @@ async function createServer() {
       concise
     );
 
-    const askWithModel = async (candidateModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite') => {
-      const thinkingLevel = resolveThinkingLevelForModel(candidateModel, concise, mode, aiConfig);
+    const askWithModel = async (
+      candidateModel: SupportedAiModel,
+      includeThinking: boolean
+    ) => {
+      const config = buildModelConfig(
+        candidateModel,
+        systemInstruction,
+        concise,
+        mode,
+        aiConfig,
+        includeThinking
+      );
       try {
         return await ai.models.generateContent({
           model: candidateModel,
-          contents: promptText,
-          config: {
-            systemInstruction,
-            thinkingConfig: { thinkingLevel },
-          },
+          contents,
+          config,
         });
       } catch (innerErr: unknown) {
         const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
-        if (msg.includes('thinking') || msg.includes('INVALID_ARGUMENT')) {
+        if (includeThinking && (msg.includes('thinking') || msg.includes('INVALID_ARGUMENT'))) {
           return await ai.models.generateContent({
             model: candidateModel,
-            contents: promptText,
+            contents,
             config: { systemInstruction },
           });
         }
@@ -3277,54 +4336,81 @@ async function createServer() {
       }
     };
 
+    const plan = buildRetryPlan(primaryModel, fallbackModel);
+    let usedModel: SupportedAiModel = primaryModel;
+
     try {
-      let response;
-      try {
-        response = await askWithModel(primaryModel);
-      } catch (primaryErr: unknown) {
-        const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
-        if (isFallbackEligibleAiError(msg)) {
-          try {
-            response = await askWithModel(fallbackModel);
-          } catch (fallbackErr: unknown) {
-            const fMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-            if (fMsg.includes('503') || fMsg.includes('UNAVAILABLE') || fMsg.includes('high demand')) {
-              await new Promise((r) => setTimeout(r, 900));
-              response = await askWithModel(fallbackModel);
-            } else {
-              throw fallbackErr;
-            }
+      let answerText = '';
+      let lastError: unknown = null;
+
+      for (let i = 0; i < plan.length; i += 1) {
+        const step = plan[i];
+        if (i > 0) {
+          const jitter = Math.floor(Math.random() * 250);
+          await new Promise((r) => setTimeout(r, step.delayMs + jitter));
+        }
+
+        try {
+          const response = await askWithModel(step.model, step.includeThinking);
+          const candidateText = response.text?.trim() || '';
+          if (candidateText) {
+            answerText = candidateText;
+            usedModel = step.model;
+            break;
           }
-        } else {
-          throw primaryErr;
+          throw new Error('UNAVAILABLE: Empty response from model');
+        } catch (attemptErr: unknown) {
+          lastError = attemptErr;
+          const errMsg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
+          if (isQuotaExhaustedError(errMsg)) {
+            recordModelQuotaCooldown(step.model, errMsg);
+          } else {
+            console.warn(`[AI Ask attempt ${i + 1}/${plan.length} ${step.model}] ${errMsg.slice(0, 180)}`);
+          }
+
+          if (!isRetryableAiError(errMsg)) {
+            throw attemptErr;
+          }
         }
       }
 
-      const answerText = response.text?.trim();
-      if (!answerText) {
-        recordAiUsage(mode, Date.now() - startedAt, true);
-        res.status(502).json({
-          error:
-            language === 'en'
-              ? 'No response received from AI. Please try again.'
-              : 'এআই থেকে উত্তর পাওয়া যায়নি। অনুগ্রহ করে আবার চেষ্টা করুন।',
-        });
-        return;
+      if (plan.length === 0) {
+        throw new Error('429 RESOURCE_EXHAUSTED QUOTA_EXHAUSTED: All configured models are in quota cooldown.');
       }
+
+      if (!answerText) {
+        throw lastError ?? new Error('UNAVAILABLE: No response received from AI.');
+      }
+
+      const savedSession = commitAiSessionTurn({
+        sessionId,
+        ownerId,
+        userMessage: message,
+        assistantReply: answerText,
+        mode,
+        isRetry,
+      });
 
       recordAiUsage(mode, Date.now() - startedAt, false);
       res.json({
         reply: answerText,
+        sessionId: savedSession.id,
+        turnCount: savedSession.messages.length,
         mode,
+        model: usedModel,
         language,
         timestamp: new Date().toISOString(),
       });
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      console.error('AI Ask Error:', errorMessage);
+      const mapped = formatGeminiErrorForClient(err, language, usedModel);
+      if (mapped.code === 'MODEL_BUSY' || mapped.code === 'RATE_LIMIT' || mapped.code === 'QUOTA_EXHAUSTED') {
+        console.warn(`[AI Ask ${mapped.code}] ${usedModel}`);
+      } else {
+        console.error('AI Ask Error:', errorMessage.slice(0, 300));
+      }
       recordAiUsage(mode, Date.now() - startedAt, true);
-      const mapped = formatGeminiErrorForClient(err, language, primaryModel);
-      res.status(mapped.status).json({ error: mapped.message, code: mapped.code });
+      res.status(mapped.status).json({ error: mapped.message, code: mapped.code, sessionId });
     }
   });
 

@@ -26,6 +26,18 @@ export function createDefaultTimeSettings(): TimeSettings {
         reminderEnabled: true,
       },
     ],
+    alarms: [
+      {
+        id: 'alarm-init-1',
+        time: '06:00',
+        label: 'সকালের পড়া ও রিভিশন',
+        enabled: false,
+        days: ['শনিবার', 'রবিবার', 'সোমবার', 'মঙ্গলবার', 'বুধবার', 'বৃহস্পতিবার'],
+        tone: 'chime',
+        snoozedUntil: null,
+        createdAt: new Date().toISOString(),
+      },
+    ],
   };
 }
 
@@ -47,7 +59,10 @@ export function createInitialState(): StudyMateState {
 
   return {
     settings: {
-      studentName: 'ডিপ্লোমা শিক্ষার্থী',
+      studentName: 'Rokib Hasan',
+      collegeName: 'ঢাকা পলিটেকনিক ইনস্টিটিউট',
+      avatarDataUrl: '',
+      coverDataUrl: '',
       department: 'power',
       semester: 4,
       theme: 'dark',
@@ -186,6 +201,14 @@ export const storageService = {
         settings: {
           ...fallback.settings,
           ...(parsed.settings ?? {}),
+          collegeName:
+            typeof parsed.settings?.collegeName === 'string' && parsed.settings.collegeName.trim()
+              ? parsed.settings.collegeName.trim()
+              : fallback.settings.collegeName,
+          avatarDataUrl:
+            typeof parsed.settings?.avatarDataUrl === 'string' ? parsed.settings.avatarDataUrl : '',
+          coverDataUrl:
+            typeof parsed.settings?.coverDataUrl === 'string' ? parsed.settings.coverDataUrl : '',
           language: parsed.settings?.language === 'en' ? 'en' : 'bn',
           weeklyStudyGoalHours:
             typeof parsed.settings?.weeklyStudyGoalHours === 'number' &&
@@ -199,6 +222,9 @@ export const storageService = {
           sessions: Array.isArray(parsed.timeSettings?.sessions)
             ? parsed.timeSettings.sessions
             : defaultTime.sessions,
+          alarms: Array.isArray(parsed.timeSettings?.alarms)
+            ? parsed.timeSettings.alarms
+            : defaultTime.alarms,
         },
         timerHistory: Array.isArray(parsed.timerHistory) ? parsed.timerHistory : [],
         tasks: Array.isArray(parsed.tasks) ? parsed.tasks : fallback.tasks,
@@ -242,6 +268,7 @@ export const storageService = {
       timeSettings: {
         ...createDefaultTimeSettings(),
         sessions: [],
+        alarms: [],
       },
       timerHistory: [],
       tasks: [],

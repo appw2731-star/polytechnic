@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Award,
   BarChart3,
@@ -6,6 +6,7 @@ import {
   BookMarked,
   Bot,
   CalendarCheck2,
+  CheckCircle2,
   Download,
   ExternalLink,
   FolderOpen,
@@ -16,18 +17,26 @@ import {
   MessageSquare,
   Moon,
   NotebookPen,
+  RefreshCw,
   Settings,
   Shield,
   Sigma,
   Sun,
   Timer,
   User,
+  WifiOff,
   Wrench,
   X,
 } from 'lucide-react';
 import { getCategoryMeta } from '../data/notificationCategories';
 import { DEPARTMENTS, SEMESTER_LABELS, SEMESTER_LABELS_EN } from '../data/curriculum';
+import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import { bi, VIEW_TITLES } from '../i18n/translations';
+import {
+  formatBytesShort,
+  inspectCachedOfflineResources,
+  OfflineCachedResourcesSnapshot,
+} from '../services/offlineCacheInventory';
 import {
   AppView,
   AuthUser,
@@ -38,6 +47,7 @@ import {
   ThemeMode,
   UserNotificationItem,
 } from '../types/study';
+import { toBnDigits } from '../utils/formatBn';
 import {
   OfflineStatusBadge,
   PolytechnicHubLogo,
@@ -69,10 +79,10 @@ export const NAV_ITEMS: NavItem[] = [
   { id: 'notes', labelBn: 'নোটস ও শেয়ার্ড PDF', labelEn: 'Notes', shortLabelBn: 'নোটস', shortLabelEn: 'Notes', group: 'study', icon: NotebookPen },
   { id: 'quiz', labelBn: 'MCQ ও মডেল টেস্ট', labelEn: 'MCQ & Quiz', shortLabelBn: 'কুইজ', shortLabelEn: 'Quiz', group: 'study', icon: HelpCircle },
   { id: 'routine', labelBn: 'স্টাডি রুটিন', labelEn: 'Routine', shortLabelBn: 'রুটিন', shortLabelEn: 'Routine', group: 'study', icon: CalendarCheck2 },
-  { id: 'timer', labelBn: 'ক্লক ও টাইমার', labelEn: 'Clock & Timer', shortLabelBn: 'টাইমার', shortLabelEn: 'Timer', group: 'study', icon: Timer },
+  { id: 'timer', labelBn: 'অ্যালার্ম ও টাইমার', labelEn: 'Alarm & Timer', shortLabelBn: 'অ্যালার্ম', shortLabelEn: 'Alarm', group: 'study', icon: Timer },
   { id: 'progress', labelBn: 'অগ্রগতি রিপোর্ট', labelEn: 'Progress', shortLabelBn: 'অগ্রগতি', shortLabelEn: 'Progress', group: 'study', icon: BarChart3 },
   // Platform
-  { id: 'community', labelBn: 'স্টুডেন্ট কমিউনিটি', labelEn: 'Community', shortLabelBn: 'ফোরাম', shortLabelEn: 'Forum', group: 'platform', icon: MessageSquare },
+  { id: 'community', labelBn: 'স্টুডেন্ট কমিউনিটি', labelEn: 'Community', shortLabelBn: 'কমিউনিটি', shortLabelEn: 'Community', group: 'platform', icon: MessageSquare },
   { id: 'install', labelBn: 'অ্যাপ ইনস্টল (PWA/APK)', labelEn: 'Install App', shortLabelBn: 'ইনস্টল', shortLabelEn: 'Install', group: 'platform', icon: Download },
   { id: 'settings', labelBn: 'সেটিংস', labelEn: 'Settings', shortLabelBn: 'সেটিংস', shortLabelEn: 'Settings', group: 'platform', icon: Settings },
   { id: 'admin', labelBn: 'অ্যাডমিন প্যানেল', labelEn: 'Admin Panel', shortLabelBn: 'অ্যাডমিন', shortLabelEn: 'Admin', group: 'platform', icon: Shield },
@@ -235,10 +245,179 @@ export const TopHeader: React.FC<TopBarProps> = ({
   inboxNotifications = [],
   unreadPushCount = 0,
 }) => {
+  const navigatorOnline = useOnlineStatus();
+  const effectiveOnline = isOnline && navigatorOnline;
+
   const [notifOpen, setNotifOpen] = useState(false);
+  const [offlineInfoOpen, setOfflineInfoOpen] = useState(false);
+  const [cacheSnapshot, setCacheSnapshot] = useState<OfflineCachedResourcesSnapshot | null>(null);
+  const [inspectingCache, setInspectingCache] = useState(false);
+  const headerActionsRef = useRef<HTMLDivElement | null>(null);
   const unreadNoticesCount = notices.filter((n) => !readNoticeIds.includes(n.id)).length;
   const unreadCount = unreadNoticesCount + unreadPushCount;
   const viewTitle = VIEW_TITLES[activeView];
+
+  const refreshCacheInventory = React.useCallback(async () => {
+    setInspectingCache(true);
+    try {
+      const snap = await inspectCachedOfflineResources();
+      setCacheSnapshot(snap);
+    } finally {
+      setInspectingCache(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (effectiveOnline) {
+      setOfflineInfoOpen(false);
+    } else {
+      void refreshCacheInventory();
+    }
+  }, [effectiveOnline, refreshCacheInventory]);
+
+  useEffect(() => {
+    if (offlineInfoOpen && !effectiveOnline) {
+      void refreshCacheInventory();
+    }
+  }, [offlineInfoOpen, effectiveOnline, refreshCacheInventory]);
+
+  useEffect(() => {
+    if (!offlineInfoOpen && !notifOpen) return;
+    const handleOutsideClick = (event: MouseEvent) => {
+      if (
+        headerActionsRef.current &&
+        !headerActionsRef.current.contains(event.target as Node)
+      ) {
+        setOfflineInfoOpen(false);
+        setNotifOpen(false);
+      }
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOfflineInfoOpen(false);
+        setNotifOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [offlineInfoOpen, notifOpen]);
+
+  const fmtCount = (n: number) => (language === 'bn' ? toBnDigits(n) : String(n));
+
+  const offlineAvailableFeatures: {
+    view: AppView;
+    titleBn: string;
+    titleEn: string;
+    detailBn: string;
+    detailEn: string;
+    cachedReady: boolean;
+    icon: React.ComponentType<{ className?: string }>;
+  }[] = [
+    {
+      view: 'pdf-library',
+      titleBn: 'ক্যাশড PDF লাইব্রেরি',
+      titleEn: 'Cached PDF Library',
+      detailBn: cacheSnapshot
+        ? cacheSnapshot.cachedPdfCount > 0
+          ? `${fmtCount(cacheSnapshot.cachedPdfCount)}টি PDF সংরক্ষিত (${formatBytesShort(cacheSnapshot.cachedPdfBytes)})`
+          : 'এখনো কোনো PDF ক্যাশ করা হয়নি'
+        : 'সংরক্ষিত লোকাল PDF',
+      detailEn: cacheSnapshot
+        ? cacheSnapshot.cachedPdfCount > 0
+          ? `${cacheSnapshot.cachedPdfCount} cached PDFs (${formatBytesShort(cacheSnapshot.cachedPdfBytes)})`
+          : 'No PDFs saved offline yet'
+        : 'Saved local PDFs',
+      cachedReady: (cacheSnapshot?.cachedPdfCount ?? 0) > 0,
+      icon: FolderOpen,
+    },
+    {
+      view: 'formulas',
+      titleBn: 'ফর্মুলা হাব',
+      titleEn: 'Formula Hub',
+      detailBn: cacheSnapshot
+        ? `${fmtCount(cacheSnapshot.totalFormulasCount)}টি Physics ও Math সূত্র ক্যাশড`
+        : 'Physics ও Math সূত্রসমূহ',
+      detailEn: cacheSnapshot
+        ? `${cacheSnapshot.totalFormulasCount} Physics & Math formulas cached`
+        : 'Cached Physics & Math formulas',
+      cachedReady: true,
+      icon: Sigma,
+    },
+    {
+      view: 'notes',
+      titleBn: 'সংরক্ষিত নোটস',
+      titleEn: 'Saved Study Notes',
+      detailBn: cacheSnapshot
+        ? `${fmtCount(cacheSnapshot.savedNotesCount)}টি লোকাল নোট অফলাইনে উপলব্ধ`
+        : 'লোকাল নোট পড়া ও এডিট',
+      detailEn: cacheSnapshot
+        ? `${cacheSnapshot.savedNotesCount} local notes ready offline`
+        : 'Read & edit local notes',
+      cachedReady: true,
+      icon: NotebookPen,
+    },
+    {
+      view: 'subjects',
+      titleBn: 'অধ্যায় ও সিলেবাস',
+      titleEn: 'Chapters & Syllabus',
+      detailBn: cacheSnapshot
+        ? `${fmtCount(cacheSnapshot.departmentsCount)}টি ডিপার্টমেন্টের সিলেবাস`
+        : 'সব ডিপার্টমেন্ট ও সেমিস্টার',
+      detailEn: cacheSnapshot
+        ? `${cacheSnapshot.departmentsCount} departments bundled offline`
+        : 'All departments & semesters',
+      cachedReady: true,
+      icon: BookMarked,
+    },
+    {
+      view: 'routine',
+      titleBn: 'স্টাডি রুটিন',
+      titleEn: 'Study Routine',
+      detailBn: cacheSnapshot
+        ? `${fmtCount(cacheSnapshot.routineTasksCount)}টি টাস্ক লোকাল স্টোরেজে`
+        : 'দৈনিক টাস্ক ও চেকলিস্ট',
+      detailEn: cacheSnapshot
+        ? `${cacheSnapshot.routineTasksCount} tasks cached locally`
+        : 'Daily tasks & checklist',
+      cachedReady: true,
+      icon: CalendarCheck2,
+    },
+    {
+      view: 'timer',
+      titleBn: 'অ্যালার্ম ও টাইমার',
+      titleEn: 'Alarms & Study Timer',
+      detailBn: cacheSnapshot
+        ? `${fmtCount(cacheSnapshot.alarmsCount)}টি অ্যালার্ম · ${fmtCount(cacheSnapshot.timerSessionsCount)} সেশন`
+        : 'অ্যালার্ম, পোমোডোরো ও স্টপওয়াচ',
+      detailEn: cacheSnapshot
+        ? `${cacheSnapshot.alarmsCount} alarms · ${cacheSnapshot.timerSessionsCount} sessions`
+        : 'Alarms, Pomodoro & Stopwatch',
+      cachedReady: true,
+      icon: Timer,
+    },
+    {
+      view: 'tools',
+      titleBn: 'পাওয়ার ক্যালকুলেটর',
+      titleEn: 'Engineering Calculators',
+      detailBn: 'ওহম, পাওয়ার ও এনার্জি টুলস',
+      detailEn: "Ohm's Law, Power & Energy",
+      cachedReady: true,
+      icon: Wrench,
+    },
+    {
+      view: 'progress',
+      titleBn: 'অগ্রগতি রিপোর্ট',
+      titleEn: 'Progress Report',
+      detailBn: 'লোকাল কুইজ ও অধ্যায় তথ্য',
+      detailEn: 'Local quiz & chapter stats',
+      cachedReady: true,
+      icon: BarChart3,
+    },
+  ];
 
   return (
     <header className="sticky top-0 z-20 h-14 lg:h-16 px-4 lg:px-8 flex items-center justify-between gap-4 bg-white/90 dark:bg-[#060B16]/90 backdrop-blur-md border-b border-slate-200 dark:border-slate-800/90 no-print">
@@ -279,8 +458,16 @@ export const TopHeader: React.FC<TopBarProps> = ({
         })}
       </nav>
 
-      <div className="flex items-center gap-2 shrink-0 relative">
-        <OfflineStatusBadge isOnline={isOnline} language={language} />
+      <div ref={headerActionsRef} className="flex items-center gap-2 shrink-0 relative">
+        <OfflineStatusBadge
+          isOnline={effectiveOnline}
+          language={language}
+          isOpen={offlineInfoOpen}
+          onToggle={() => {
+            setNotifOpen(false);
+            setOfflineInfoOpen((prev) => !prev);
+          }}
+        />
 
         <button
           type="button"
@@ -296,6 +483,7 @@ export const TopHeader: React.FC<TopBarProps> = ({
         <button
           type="button"
           onClick={() => {
+            setOfflineInfoOpen(false);
             setNotifOpen((prev) => !prev);
             onMarkNoticesRead();
           }}
@@ -326,6 +514,124 @@ export const TopHeader: React.FC<TopBarProps> = ({
         >
           {theme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
         </button>
+
+        {!effectiveOnline && offlineInfoOpen && (
+          <div
+            id="offline-mode-popover"
+            role="region"
+            aria-label={bi(language, 'অফলাইন মোডে উপলব্ধ ক্যাশড রিসোর্স', 'Cached resources available offline')}
+            className="absolute right-0 top-12 w-[calc(100vw-2rem)] max-w-md rounded-2xl bg-white dark:bg-[#0D1426] border border-amber-500/40 shadow-2xl p-4 space-y-3 z-50"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-xl bg-amber-500/15 text-amber-600 dark:text-amber-300 flex items-center justify-center shrink-0">
+                  <WifiOff className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    {bi(language, 'অফলাইন মোড সক্রিয়', 'Offline Mode Active')}
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 leading-snug">
+                    {bi(
+                      language,
+                      'ইন্টারনেট সংযোগ বিচ্ছিন্ন। আপনার ডিভাইসে বর্তমানে ক্যাশ করা রিসোর্সসমূহ:',
+                      'No internet connection detected. Cached resources currently ready on this device:'
+                    )}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => void refreshCacheInventory()}
+                  disabled={inspectingCache}
+                  title={bi(language, 'ক্যাশ আবার যাচাই করুন', 'Re-scan cached resources')}
+                  aria-label={bi(language, 'ক্যাশ আবার যাচাই করুন', 'Re-scan cached resources')}
+                  className="min-h-[32px] min-w-[32px] flex items-center justify-center rounded-lg text-slate-400 hover:text-cyan-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${inspectingCache ? 'animate-spin' : ''}`} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOfflineInfoOpen(false)}
+                  aria-label={bi(language, 'বন্ধ করুন', 'Close')}
+                  className="min-h-[32px] min-w-[32px] flex items-center justify-center rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-white"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {cacheSnapshot && (
+              <div className="px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 text-[11px] text-slate-600 dark:text-slate-300 flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span>
+                  {cacheSnapshot.swCacheAvailable
+                    ? bi(
+                        language,
+                        `অ্যাপ শেল ক্যাশড (${fmtCount(cacheSnapshot.swCachedAssetsCount)} ফাইল)`,
+                        `App Shell Cached (${cacheSnapshot.swCachedAssetsCount} files)`
+                      )
+                    : bi(language, 'লোকাল স্টোরেজ ও IndexedDB সক্রিয়', 'Local Storage & IndexedDB active')}
+                </span>
+                {cacheSnapshot.cachedNoticesCount > 0 && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>
+                      {bi(
+                        language,
+                        `${fmtCount(cacheSnapshot.cachedNoticesCount)}টি নোটিশ ক্যাশড`,
+                        `${cacheSnapshot.cachedNoticesCount} cached notices`
+                      )}
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-64 overflow-y-auto">
+              {offlineAvailableFeatures.map((feat) => {
+                const FeatIcon = feat.icon;
+                return (
+                  <button
+                    key={feat.view}
+                    type="button"
+                    onClick={() => {
+                      setOfflineInfoOpen(false);
+                      onSelectView(feat.view);
+                    }}
+                    className="min-h-[44px] flex items-start gap-2 p-2 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-cyan-500/50 hover:bg-slate-50 dark:hover:bg-slate-800/60 text-left transition-colors"
+                  >
+                    <FeatIcon className="w-4 h-4 text-cyan-600 dark:text-cyan-400 shrink-0 mt-0.5" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-semibold text-slate-900 dark:text-white truncate flex items-center gap-1">
+                        <span className="truncate">{bi(language, feat.titleBn, feat.titleEn)}</span>
+                        {feat.cachedReady && (
+                          <CheckCircle2 className="w-3 h-3 text-emerald-500 shrink-0" />
+                        )}
+                      </p>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                        {bi(language, feat.detailBn, feat.detailEn)}
+                      </p>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="pt-2.5 border-t border-slate-200 dark:border-slate-800 space-y-1">
+              <p className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+                {bi(language, 'ইন্টারনেট প্রয়োজন:', 'Requires internet to resume:')}
+              </p>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                {bi(
+                  language,
+                  'এআই টিউটর · কমিউনিটি ফোরাম · BTEB লাইভ রেজাল্ট · ক্লাউড সিঙ্ক',
+                  'AI Tutor · Student Community · Live BTEB Result · Cloud Sync'
+                )}
+              </p>
+            </div>
+          </div>
+        )}
 
         {notifOpen && (
           <div className="absolute right-0 top-12 w-80 sm:w-96 rounded-2xl bg-white dark:bg-[#0D1426] border border-slate-200 dark:border-slate-800 shadow-2xl p-4 space-y-3 z-50">

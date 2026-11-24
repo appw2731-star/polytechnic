@@ -48,10 +48,10 @@ export const VIEW_TITLES: Record<string, { bn: string; en: string; subBn: string
     subEn: "Ohm's Law, AC/DC Power, Energy Bill, Resistors & Formulas",
   },
   profile: {
-    bn: 'প্রোফাইল ও অ্যাকাউন্ট',
-    en: 'Profile & Account',
-    subBn: 'Supabase সাইন ইন, Google OAuth, প্রোফাইল ও অ্যাডমিন পোর্টাল',
-    subEn: 'Supabase Auth, Google Sign-in, profile privacy & Admin access',
+    bn: 'স্টুডেন্ট প্রোফাইল ও অ্যাকাউন্ট',
+    en: 'Student Profile & Account',
+    subBn: 'কভার ফটো, প্রোফাইল ছবি, নতুন প্রোফাইল খোলা ও কমিউনিটি পোস্ট',
+    subEn: 'Cover photo, avatar, profile creation & timeline posts',
   },
   subjects: {
     bn: 'অধ্যায় ও সিলেবাস',
@@ -66,10 +66,10 @@ export const VIEW_TITLES: Record<string, { bn: string; en: string; subBn: string
     subEn: 'Weekly study tasks & priority planner',
   },
   timer: {
-    bn: 'ক্লক ও স্টাডি টাইমার',
-    en: 'Clock & Study Timer',
-    subBn: 'বাংলাদেশ সময়, পোমোডোরো, স্টপওয়াচ ও রিমাইন্ডার',
-    subEn: 'Dhaka Clock, Pomodoro, Stopwatch & Reminders',
+    bn: 'অ্যালার্ম, ক্লক ও স্টাডি টাইমার',
+    en: 'Alarm, Clock & Study Timer',
+    subBn: 'স্টাডি অ্যালার্ম, স্নুজ, বাংলাদেশ সময়, পোমোডোরো ও স্টপওয়াচ',
+    subEn: 'Study Alarms, Snooze, Dhaka Clock, Pomodoro & Stopwatch',
   },
   quiz: {
     bn: 'MCQ ও মডেল টেস্ট',
@@ -84,10 +84,10 @@ export const VIEW_TITLES: Record<string, { bn: string; en: string; subBn: string
     subEn: 'Personal study notes & shared resources',
   },
   community: {
-    bn: 'স্টুডেন্ট কমিউনিটি',
-    en: 'Student Community',
-    subBn: 'প্রশ্ন-উত্তর ও ডিপার্টমেন্টভিত্তিক আলোচনা',
-    subEn: 'Q&A forum & peer technical discussions',
+    bn: 'স্টুডেন্ট কমিউনিটি ফিড',
+    en: 'Student Community Feed',
+    subBn: 'পোস্ট, ছবি, লাইক, মন্তব্য ও সহপাঠীদের প্রোফাইল',
+    subEn: 'Posts, photos, likes, comments & student profiles',
   },
   progress: {
     bn: 'অগ্রগতি পরিসংখ্যান',

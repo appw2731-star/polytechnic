@@ -1,19 +1,31 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  BookOpen,
+  Building2,
   Camera,
   CheckCircle2,
   Eye,
   EyeOff,
+  GraduationCap,
+  ImagePlus,
   KeyRound,
   Lock,
   LogIn,
   LogOut,
   Mail,
+  MessageSquare,
+  Pencil,
+  Send,
   Shield,
   ShieldCheck,
+  ThumbsUp,
+  Trash2,
   UserPlus,
+  Users,
+  X,
 } from 'lucide-react';
 import { DEPARTMENTS, SEMESTER_LABELS, SEMESTER_LABELS_EN } from '../data/curriculum';
+import { BANGLADESH_POLYTECHNICS } from '../data/polytechnics';
 import { bi } from '../i18n/translations';
 import {
   formatFirebaseAuthError,
@@ -22,16 +34,20 @@ import {
   sendPasswordResetFirebase,
   signInWithEmailFirebase,
   signInWithGoogleUnified,
+  syncFirebaseUserToSupabaseProfile,
 } from '../lib/firebaseAuth';
 import { apiClient, setStoredToken } from '../services/apiClient';
 import {
   AppView,
   AuthUser,
+  CommunityPost,
   DepartmentId,
   LanguageMode,
   SemesterNumber,
   UserSettings,
 } from '../types/study';
+import { formatDateBn, toBnDigits } from '../utils/formatBn';
+import { compressImageFile } from '../utils/imageCompress';
 
 interface ProfileAuthViewProps {
   language: LanguageMode;
@@ -62,16 +78,17 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   onNavigate,
   onAdminClaimed,
 }) => {
-  const [authTab, setAuthTab] = useState<'login' | 'register' | 'forgot' | 'claim-admin'>('login');
+  const [authTab, setAuthTab] = useState<'register' | 'login' | 'forgot' | 'claim-admin'>('register');
+  const [profileTab, setProfileTab] = useState<'posts' | 'about'>('posts');
+
+  // Auth form fields
   const [fullName, setFullName] = useState(localSettings.studentName || '');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [department, setDepartment] = useState<DepartmentId>(localSettings.department);
   const [semester, setSemester] = useState<SemesterNumber>(localSettings.semester);
-  const [collegeName, setCollegeName] = useState('');
+  const [collegeName, setCollegeName] = useState(localSettings.collegeName || '');
   const [rollNumber, setRollNumber] = useState('');
-
-  // Password recovery reset field
   const [newPassword, setNewPassword] = useState('');
 
   // Editable Profile State
@@ -79,22 +96,40 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   const [editDept, setEditDept] = useState(currentUser?.department || localSettings.department);
   const [editSem, setEditSem] = useState(currentUser?.semester || localSettings.semester);
   const [editCollege, setEditCollege] = useState(
-    currentUser?.collegeName || currentUser?.instituteName || ''
+    currentUser?.collegeName || currentUser?.instituteName || localSettings.collegeName || ''
   );
   const [editRoll, setEditRoll] = useState(currentUser?.rollNumber || '');
   const [editBio, setEditBio] = useState(currentUser?.bio || '');
   const [editGender, setEditGender] = useState<'' | 'male' | 'female'>(currentUser?.gender || '');
   const [editShowGender, setEditShowGender] = useState<boolean>(Boolean(currentUser?.showGender));
   const [editVisibility, setEditVisibility] = useState<'public' | 'department' | 'private'>(
-    currentUser?.profileVisibility || 'department'
+    currentUser?.profileVisibility || 'public'
   );
-  const [editAvatarUrl, setEditAvatarUrl] = useState(currentUser?.avatarUrl || '');
+  const [editAvatarUrl, setEditAvatarUrl] = useState(
+    currentUser?.avatarUrl || localSettings.avatarDataUrl || ''
+  );
+  const [editCoverUrl, setEditCoverUrl] = useState(
+    currentUser?.coverUrl || localSettings.coverDataUrl || ''
+  );
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const [uploadingCover, setUploadingCover] = useState(false);
+
+  // Facebook-style Profile Timeline Posts
+  const [myPosts, setMyPosts] = useState<CommunityPost[]>([]);
+  const [postsLoading, setPostsLoading] = useState(false);
+  const [postBody, setPostBody] = useState('');
+  const [postSubjectTag, setPostSubjectTag] = useState('');
+  const [postImage, setPostImage] = useState<string>('');
+  const [posting, setPosting] = useState(false);
 
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const coverInputRef = useRef<HTMLInputElement | null>(null);
+  const postImageInputRef = useRef<HTMLInputElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -106,9 +141,52 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setEditBio(currentUser.bio || '');
     setEditGender(currentUser.gender || '');
     setEditShowGender(Boolean(currentUser.showGender));
-    setEditVisibility(currentUser.profileVisibility || 'department');
-    setEditAvatarUrl(currentUser.avatarUrl || '');
+    setEditVisibility(currentUser.profileVisibility || 'public');
+    setEditAvatarUrl(currentUser.avatarUrl || localSettings.avatarDataUrl || '');
+    setEditCoverUrl(currentUser.coverUrl || localSettings.coverDataUrl || '');
+  }, [currentUser, localSettings.avatarDataUrl, localSettings.coverDataUrl]);
+
+  const loadMyPosts = useCallback(async () => {
+    if (!currentUser) {
+      setMyPosts([]);
+      return;
+    }
+    setPostsLoading(true);
+    try {
+      const res = await apiClient.getPublicProfile(currentUser.id);
+      setMyPosts(res.posts || []);
+    } catch {
+      try {
+        const all = await apiClient.getCommunityPosts(false);
+        setMyPosts(all.posts.filter((p) => p.authorId === currentUser.id));
+      } catch {
+        // Offline or unavailable
+      }
+    } finally {
+      setPostsLoading(false);
+    }
   }, [currentUser]);
+
+  useEffect(() => {
+    void loadMyPosts();
+  }, [loadMyPosts]);
+
+  const isFirebaseEmailFallbackError = (err: unknown): boolean => {
+    const code =
+      err && typeof err === 'object' && 'code' in err ? String((err as { code?: string }).code) : '';
+    return (
+      !code ||
+      code === 'auth/operation-not-allowed' ||
+      code === 'auth/configuration-not-found' ||
+      code === 'auth/unauthorized-domain' ||
+      code === 'auth/network-request-failed' ||
+      code === 'auth/internal-error' ||
+      code === 'auth/invalid-api-key' ||
+      code === 'auth/user-not-found' ||
+      code === 'auth/invalid-credential' ||
+      code === 'auth/wrong-password'
+    );
+  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -119,28 +197,31 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       if (isFirebaseAuthConfigured) {
         try {
           const cred = await signInWithEmailFirebase(email, password);
-          const synced = await apiClient.firebaseSync({ idToken: cred.idToken });
+          const synced = await syncFirebaseUserToSupabaseProfile(cred.user);
           setStoredToken(synced.token);
           onAuthSuccess(synced.user);
           setSuccessMsg(bi(language, 'সফলভাবে সাইন ইন হয়েছে!', 'Signed in successfully!'));
           return;
         } catch (fbErr: unknown) {
-          const code =
-            fbErr && typeof fbErr === 'object' && 'code' in fbErr
-              ? String((fbErr as { code?: string }).code)
-              : '';
-          if (
-            code === 'auth/user-not-found' ||
-            code === 'auth/invalid-credential' ||
-            code === 'auth/wrong-password'
-          ) {
+          if (isFirebaseEmailFallbackError(fbErr)) {
             try {
               const res = await apiClient.login(email, password);
               setStoredToken(res.token);
               onAuthSuccess(res.user);
               setSuccessMsg(bi(language, 'সফলভাবে সাইন ইন হয়েছে!', 'Signed in successfully!'));
               return;
-            } catch {
+            } catch (localErr) {
+              const fbCode =
+                fbErr && typeof fbErr === 'object' && 'code' in fbErr
+                  ? String((fbErr as { code?: string }).code)
+                  : '';
+              if (
+                fbCode === 'auth/operation-not-allowed' ||
+                fbCode === 'auth/configuration-not-found' ||
+                fbCode === 'auth/unauthorized-domain'
+              ) {
+                throw localErr;
+              }
               throw new Error(formatFirebaseAuthError(fbErr, language));
             }
           }
@@ -166,20 +247,55 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setLoading(true);
     try {
       if (isFirebaseAuthConfigured) {
-        const cred = await registerWithEmailFirebase(email, password, fullName);
-        const synced = await apiClient.firebaseSync({
-          idToken: cred.idToken,
-          fullName: fullName.trim(),
-          department,
-          semester,
-          collegeName: collegeName.trim(),
-          rollNumber: rollNumber.trim(),
-        });
-        setStoredToken(synced.token);
-        onAuthSuccess(synced.user);
-        setSuccessMsg(
-          bi(language, 'নতুন অ্যাকাউন্ট তৈরি ও সাইন ইন সম্পন্ন!', 'Account created & signed in!')
-        );
+        try {
+          const cred = await registerWithEmailFirebase(email, password, fullName);
+          const synced = await syncFirebaseUserToSupabaseProfile(cred.user, {
+            fullName: fullName.trim(),
+            department,
+            semester,
+            collegeName: collegeName.trim(),
+            rollNumber: rollNumber.trim(),
+          });
+          setStoredToken(synced.token);
+          onAuthSuccess(synced.user);
+          setSuccessMsg(
+            bi(
+              language,
+              'আপনার স্টুডেন্ট প্রোফাইল তৈরি হয়েছে! এখন কমিউনিটিতে পোস্ট করতে পারবেন।',
+              'Your student profile is ready! You can now post in the community.'
+            )
+          );
+          return;
+        } catch (fbErr: unknown) {
+          const fbCode =
+            fbErr && typeof fbErr === 'object' && 'code' in fbErr
+              ? String((fbErr as { code?: string }).code)
+              : '';
+          // Preserve real validation errors like weak-password or email-already-in-use
+          if (fbCode === 'auth/email-already-in-use' || fbCode === 'auth/weak-password' || fbCode === 'auth/invalid-email') {
+            throw new Error(formatFirebaseAuthError(fbErr, language));
+          }
+          // Fall back cleanly to built-in Polytechnic Hub account registration
+          const res = await apiClient.register({
+            fullName,
+            email,
+            password,
+            department,
+            semester,
+            instituteName: collegeName,
+            rollNumber,
+          });
+          setStoredToken(res.token);
+          onAuthSuccess(res.user);
+          setSuccessMsg(
+            bi(
+              language,
+              'আপনার স্টুডেন্ট প্রোফাইল তৈরি হয়েছে! এখন কমিউনিটিতে পোস্ট করতে পারবেন।',
+              'Your student profile is ready! You can now post in the community.'
+            )
+          );
+          return;
+        }
       } else {
         const res = await apiClient.register({
           fullName,
@@ -192,15 +308,19 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
         });
         setStoredToken(res.token);
         onAuthSuccess(res.user);
-        setSuccessMsg(bi(language, 'নতুন অ্যাকাউন্ট তৈরি হয়েছে!', 'Student account created!'));
+        setSuccessMsg(
+          bi(
+            language,
+            'আপনার স্টুডেন্ট প্রোফাইল তৈরি হয়েছে! এখন কমিউনিটিতে পোস্ট করতে পারবেন।',
+            'Your student profile is ready! You can now post in the community.'
+          )
+        );
       }
     } catch (err) {
       setErrorMsg(
-        isFirebaseAuthConfigured
-          ? formatFirebaseAuthError(err, language)
-          : err instanceof Error
-            ? err.message
-            : 'Registration failed'
+        err instanceof Error
+          ? err.message
+          : bi(language, 'অ্যাকাউন্ট তৈরি করতে সমস্যা হয়েছে।', 'Registration failed')
       );
     } finally {
       setLoading(false);
@@ -214,8 +334,8 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       setErrorMsg(
         bi(
           language,
-          'Google সাইন-ইন চালু করতে .env-এ Firebase Web Config (VITE_FIREBASE_API_KEY, VITE_FIREBASE_AUTH_DOMAIN, VITE_FIREBASE_PROJECT_ID, VITE_FIREBASE_APP_ID) যোগ করুন এবং Firebase Console-এ বর্তমান ডোমেইন Authorized domains-এ যুক্ত করুন।',
-          'To enable Google Sign-In, configure VITE_FIREBASE_API_KEY, VITE_FIREBASE_AUTH_DOMAIN, VITE_FIREBASE_PROJECT_ID, and VITE_FIREBASE_APP_ID in .env and add your app domain under Firebase Console -> Authentication -> Authorized domains.'
+          'Google সাইন-ইন কনফিগার করা নেই — নিচের ফর্ম দিয়ে দ্রুত নতুন প্রোফাইল খুলুন অথবা লগইন করুন।',
+          'Google Sign-In is not configured — use the Email form below to create your profile.'
         )
       );
       return;
@@ -223,28 +343,35 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
 
     setLoading(true);
     try {
-      const outcome = await signInWithGoogleUnified();
-      if (outcome.redirected) {
-        // Browser will navigate to Google OAuth and return via consumeGoogleRedirectResult
-        return;
-      }
-      if (!outcome.idToken) {
-        throw new Error('Missing Firebase ID token after Google Sign-In.');
-      }
-      const synced = await apiClient.firebaseSync({
-        idToken: outcome.idToken,
+      const outcome = await signInWithGoogleUnified({
         department,
         semester,
-        collegeName: collegeName.trim(),
-        rollNumber: rollNumber.trim(),
+        collegeName: collegeName.trim() || undefined,
+        rollNumber: rollNumber.trim() || undefined,
       });
-      setStoredToken(synced.token);
-      onAuthSuccess(synced.user);
+      if (outcome.redirected) return;
+      if (!outcome.syncedUser || !outcome.token) {
+        throw new Error('Missing synced user profile after Google Sign-In.');
+      }
+      setStoredToken(outcome.token);
+      onAuthSuccess(outcome.syncedUser);
       setSuccessMsg(
-        bi(language, 'Google অ্যাকাউন্ট দিয়ে সফলভাবে লগইন হয়েছে!', 'Signed in with Google!')
+        bi(language, 'Google অ্যাকাউন্ট দিয়ে প্রোফাইল চালু হয়েছে!', 'Signed in with Google!')
       );
     } catch (err) {
-      setErrorMsg(formatFirebaseAuthError(err, language));
+      const code =
+        err && typeof err === 'object' && 'code' in err ? String((err as { code?: string }).code) : '';
+      if (code === 'auth/unauthorized-domain' || code === 'auth/operation-not-allowed') {
+        setErrorMsg(
+          bi(
+            language,
+            `${formatFirebaseAuthError(err, language)} — বিকল্প হিসেবে নিচের ইমেইল ফর্ম দিয়ে সাথে সাথে নতুন প্রোফাইল খুলতে বা লগইন করতে পারবেন।`,
+            `${formatFirebaseAuthError(err, language)} — You can still create your profile or sign in immediately using the Email form below.`
+          )
+        );
+      } else {
+        setErrorMsg(formatFirebaseAuthError(err, language));
+      }
     } finally {
       setLoading(false);
     }
@@ -270,8 +397,8 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       setSuccessMsg(
         bi(
           language,
-          'পাসওয়ার্ড রিসেট লিংক আপনার ইমেইলে পাঠানো হয়েছে। ইনবক্স বা স্প্যাম ফোল্ডার দেখুন।',
-          'Password reset link sent! Check your email inbox or spam folder.'
+          'পাসওয়ার্ড রিসেট লিংক আপনার ইমেইলে পাঠানো হয়েছে।',
+          'Password reset link sent to your email.'
         )
       );
     } catch (err) {
@@ -288,53 +415,105 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   };
 
   const handleAvatarUpload = async (file: File | null) => {
-    if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      setErrorMsg(bi(language, 'শুধুমাত্র ইমেজ ফাইল (JPG/PNG/WebP) নির্বাচন করুন।', 'Please select an image file.'));
-      return;
-    }
-    if (file.size > 3 * 1024 * 1024) {
-      setErrorMsg(bi(language, 'ছবির আকার ৩ MB-এর কম হতে হবে।', 'Avatar image must be under 3 MB.'));
-      return;
-    }
-    if (!currentUser) return;
-
+    if (!file || !currentUser) return;
     setUploadingAvatar(true);
     setErrorMsg(null);
     try {
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const img = new Image();
-          img.onload = () => {
-            const maxDim = 256;
-            const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.max(1, Math.round(img.width * scale));
-            canvas.height = Math.max(1, Math.round(img.height * scale));
-            const ctx = canvas.getContext('2d');
-            if (!ctx) {
-              reject(new Error('Canvas unavailable'));
-              return;
-            }
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            resolve(canvas.toDataURL('image/jpeg', 0.82));
-          };
-          img.onerror = () => reject(new Error('Invalid image file'));
-          img.src = String(reader.result || '');
-        };
-        reader.onerror = () => reject(new Error('Could not read file'));
-        reader.readAsDataURL(file);
-      });
-
+      const dataUrl = await compressImageFile(file, { maxWidth: 280, maxHeight: 280, quality: 0.84 });
       const res = await apiClient.updateProfile({ avatarUrl: dataUrl });
       setEditAvatarUrl(res.user.avatarUrl || dataUrl);
       onAuthSuccess(res.user);
+      onUpdateLocalSettings({ avatarDataUrl: dataUrl });
       setSuccessMsg(bi(language, 'প্রোফাইল ছবি আপডেট হয়েছে!', 'Profile photo updated!'));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Avatar upload failed');
     } finally {
       setUploadingAvatar(false);
+    }
+  };
+
+  const handleCoverUpload = async (file: File | null) => {
+    if (!file || !currentUser) return;
+    setUploadingCover(true);
+    setErrorMsg(null);
+    try {
+      const dataUrl = await compressImageFile(file, { maxWidth: 1100, maxHeight: 420, quality: 0.8 });
+      const res = await apiClient.updateProfile({ coverUrl: dataUrl });
+      setEditCoverUrl(res.user.coverUrl || dataUrl);
+      onAuthSuccess(res.user);
+      onUpdateLocalSettings({ coverDataUrl: dataUrl });
+      setSuccessMsg(bi(language, 'কভার ফটো আপডেট হয়েছে!', 'Cover photo updated!'));
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Cover upload failed');
+    } finally {
+      setUploadingCover(false);
+    }
+  };
+
+  const handleSelectPostPhoto = async (file: File | null) => {
+    if (!file) return;
+    setErrorMsg(null);
+    try {
+      const dataUrl = await compressImageFile(file, { maxWidth: 960, maxHeight: 960, quality: 0.78 });
+      setPostImage(dataUrl);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not attach image');
+    }
+  };
+
+  const handlePublishFromProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser) return;
+    if (!postBody.trim() && !postImage) {
+      setErrorMsg(bi(language, 'পোস্টের লেখা বা একটি ছবি যোগ করুন।', 'Write something or add a photo.'));
+      return;
+    }
+
+    setPosting(true);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    try {
+      const res = await apiClient.createCommunityPost({
+        body: postBody.trim(),
+        imageUrl: postImage || undefined,
+        department: currentUser.department || localSettings.department,
+        semester: currentUser.semester || localSettings.semester,
+        subjectTag: postSubjectTag.trim(),
+      });
+      setMyPosts((prev) => [res.post, ...prev]);
+      setPostBody('');
+      setPostSubjectTag('');
+      setPostImage('');
+      setSuccessMsg(
+        bi(
+          language,
+          'পোস্টটি আপনার প্রোফাইল ও স্টুডেন্ট কমিউনিটিতে প্রকাশিত হয়েছে!',
+          'Published to your profile and Student Community!'
+        )
+      );
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not publish post');
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  const handleToggleLikeMyPost = async (postId: string) => {
+    try {
+      const res = await apiClient.toggleLikeCommunityPost(postId);
+      setMyPosts((prev) => prev.map((p) => (p.id === postId ? res.post : p)));
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleDeleteMyPost = async (postId: string) => {
+    try {
+      await apiClient.deleteCommunityPost(postId);
+      setMyPosts((prev) => prev.filter((p) => p.id !== postId));
+      setSuccessMsg(bi(language, 'পোস্ট মুছে ফেলা হয়েছে।', 'Post deleted.'));
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not delete post');
     }
   };
 
@@ -357,13 +536,17 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
         showGender: editShowGender,
         profileVisibility: editVisibility,
         avatarUrl: editAvatarUrl,
+        coverUrl: editCoverUrl,
       });
       onAuthSuccess(res.user);
 
       onUpdateLocalSettings({
         studentName: editName.trim() || currentUser.fullName,
+        collegeName: editCollege.trim() || currentUser.collegeName || currentUser.instituteName,
         department: editDept as DepartmentId,
         semester: Number(editSem) as SemesterNumber,
+        avatarDataUrl: res.user.avatarUrl || editAvatarUrl || localSettings.avatarDataUrl,
+        coverDataUrl: res.user.coverUrl || editCoverUrl || localSettings.coverDataUrl,
       });
       setSuccessMsg(bi(language, 'প্রোফাইল সংরক্ষণ সম্পন্ন হয়েছে!', 'Profile updated!'));
     } catch (err) {
@@ -400,30 +583,30 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     }
   };
 
-  return (
-    <div className="max-w-3xl space-y-6">
-      <div>
-        <h1 className="text-xl lg:text-2xl font-bold text-slate-900 dark:text-white">
-          {bi(language, 'শিক্ষার্থী প্রোফাইল ও অ্যাকাউন্ট', 'Student Profile & Account')}
-        </h1>
-        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          {bi(
-            language,
-            'Firebase Auth, Google Sign-in, প্রোফাইল ছবি, প্রাইভেসি নিয়ন্ত্রণ এবং অ্যাডমিন পোর্টাল',
-            'Firebase Auth, Google Sign-in, profile avatar, privacy controls & Admin access'
-          )}
-        </p>
-      </div>
+  const currentDeptObj = DEPARTMENTS.find(
+    (d) => d.id === (currentUser?.department || localSettings.department)
+  );
+  const currentSemNum = (currentUser?.semester || localSettings.semester) as SemesterNumber;
 
+  return (
+    <div className="max-w-4xl mx-auto space-y-5">
       {errorMsg && (
-        <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-xs text-red-600 dark:text-red-300">
-          {errorMsg}
+        <div className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 text-xs text-red-600 dark:text-red-300 flex items-center justify-between gap-2">
+          <span>{errorMsg}</span>
+          <button type="button" onClick={() => setErrorMsg(null)} aria-label="Close error">
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
       {successMsg && (
-        <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-700 dark:text-emerald-300 flex items-center gap-2">
-          <CheckCircle2 className="w-4 h-4 shrink-0" />
-          <span>{successMsg}</span>
+        <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-700 dark:text-emerald-300 flex items-center justify-between gap-2">
+          <span className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+            <span>{successMsg}</span>
+          </span>
+          <button type="button" onClick={() => setSuccessMsg(null)} aria-label="Close notice">
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
 
@@ -456,383 +639,427 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       )}
 
       {currentUser ? (
-        <div className="space-y-6">
-          {/* Active Profile Card */}
-          <div className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 flex flex-wrap items-center justify-between gap-4">
-            <div className="flex items-center gap-4">
-              <div className="relative">
+        <div className="space-y-5">
+          {/* Facebook-Style Cover + Avatar Header Card */}
+          <section className="rounded-3xl overflow-hidden bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 shadow-sm">
+            {/* Cover Banner */}
+            <div className="relative h-40 sm:h-52 w-full bg-gradient-to-br from-[#0f172a] via-[#134e6f] to-[#0e7490]">
+              {editCoverUrl && (
                 <img
-                  src={editAvatarUrl || currentUser.avatarUrl || DEFAULT_AVATAR}
-                  alt={currentUser.fullName}
-                  referrerPolicy="no-referrer"
-                  onError={(e) => {
-                    e.currentTarget.src = DEFAULT_AVATAR;
-                  }}
-                  className="w-16 h-16 rounded-2xl object-cover border border-slate-200 dark:border-slate-700 bg-slate-800"
+                  src={editCoverUrl}
+                  alt={bi(language, 'কভার ফটো', 'Cover photo')}
+                  className="w-full h-full object-cover"
                 />
-                <input
-                  ref={avatarInputRef}
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={(e) => void handleAvatarUpload(e.target.files?.[0] ?? null)}
-                />
+              )}
+              <div className="absolute inset-0 bg-gradient-to-t from-slate-950/60 via-transparent to-transparent" />
+
+              <input
+                ref={coverInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => void handleCoverUpload(e.target.files?.[0] ?? null)}
+              />
+              <button
+                type="button"
+                disabled={uploadingCover}
+                onClick={() => coverInputRef.current?.click()}
+                className="absolute bottom-3 right-3 min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-slate-950/75 hover:bg-slate-950/90 text-white text-xs font-semibold backdrop-blur-xs border border-white/15"
+              >
+                <Camera className="w-3.5 h-3.5" />
+                <span>
+                  {uploadingCover
+                    ? bi(language, 'আপলোড হচ্ছে...', 'Uploading...')
+                    : bi(language, 'কভার ফটো পরিবর্তন', 'Edit Cover Photo')}
+                </span>
+              </button>
+            </div>
+
+            {/* Avatar + Name + Action Row */}
+            <div className="px-5 sm:px-6 pb-5">
+              <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 -mt-12 sm:-mt-14 relative z-10">
+                <div className="flex flex-col sm:flex-row sm:items-end gap-4">
+                  <div className="relative w-24 h-24 sm:w-28 sm:h-28 shrink-0">
+                    <img
+                      src={editAvatarUrl || currentUser.avatarUrl || DEFAULT_AVATAR}
+                      alt={currentUser.fullName}
+                      referrerPolicy="no-referrer"
+                      onError={(e) => {
+                        e.currentTarget.src = DEFAULT_AVATAR;
+                      }}
+                      className="w-full h-full rounded-full object-cover ring-4 ring-white dark:ring-[#111827] bg-slate-800 shadow-lg"
+                    />
+                    <input
+                      ref={avatarInputRef}
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) => void handleAvatarUpload(e.target.files?.[0] ?? null)}
+                    />
+                    <button
+                      type="button"
+                      disabled={uploadingAvatar}
+                      onClick={() => avatarInputRef.current?.click()}
+                      title={bi(language, 'প্রোফাইল ছবি পরিবর্তন করুন', 'Change profile photo')}
+                      className="absolute bottom-0.5 right-0.5 w-9 h-9 rounded-full bg-cyan-600 hover:bg-cyan-500 text-white flex items-center justify-center shadow-md ring-2 ring-white dark:ring-[#111827]"
+                    >
+                      <Camera className="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  <div className="space-y-1 pb-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h1 className="text-xl sm:text-2xl font-extrabold text-slate-900 dark:text-white tracking-tight">
+                        {currentUser.fullName}
+                      </h1>
+                      {currentUser.role === 'admin' && (
+                        <span className="inline-flex items-center gap-1 text-xs font-bold text-cyan-600 dark:text-cyan-400">
+                          <ShieldCheck className="w-4 h-4" />
+                          Admin
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300">
+                      {currentUser.collegeName || currentUser.instituteName || bi(language, 'পলিটেকনিক শিক্ষার্থী', 'Polytechnic Student')}
+                      {' · '}
+                      {language === 'en' ? currentDeptObj?.nameEn : currentDeptObj?.nameBn}
+                      {' · '}
+                      {language === 'en' ? SEMESTER_LABELS_EN[currentSemNum] : SEMESTER_LABELS[currentSemNum]}
+                    </p>
+                    {currentUser.bio && (
+                      <p className="text-xs text-slate-500 dark:text-slate-400 max-w-xl">
+                        {currentUser.bio}
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                {/* Primary Profile Buttons */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setProfileTab('posts');
+                      window.setTimeout(() => composerRef.current?.focus(), 60);
+                    }}
+                    className="min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>{bi(language, 'নতুন পোস্ট লিখুন', 'Create Post')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setProfileTab(profileTab === 'about' ? 'posts' : 'about')}
+                    className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 text-xs font-semibold"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                    <span>{bi(language, 'প্রোফাইল এডিট', 'Edit Profile')}</span>
+                  </button>
+                  {currentUser.role === 'admin' && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('admin')}
+                      className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold"
+                    >
+                      <Shield className="w-3.5 h-3.5" />
+                      <span>Admin</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void onLogout()}
+                    className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span>{bi(language, 'লগ আউট', 'Logout')}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Facebook-Style Profile Tabs */}
+              <div className="mt-5 pt-2 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setProfileTab('posts')}
+                    className={`min-h-[42px] px-4 text-xs sm:text-sm font-bold border-b-2 transition-colors ${
+                      profileTab === 'posts'
+                        ? 'border-blue-600 text-blue-600 dark:text-cyan-400 dark:border-cyan-400'
+                        : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    {bi(language, 'পোস্টসমূহ', 'Posts')} ({language === 'bn' ? toBnDigits(myPosts.length) : myPosts.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setProfileTab('about')}
+                    className={`min-h-[42px] px-4 text-xs sm:text-sm font-bold border-b-2 transition-colors ${
+                      profileTab === 'about'
+                        ? 'border-blue-600 text-blue-600 dark:text-cyan-400 dark:border-cyan-400'
+                        : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    {bi(language, 'পরিচিতি ও এডিট', 'About & Edit')}
+                  </button>
+                </div>
                 <button
                   type="button"
-                  disabled={uploadingAvatar}
-                  onClick={() => avatarInputRef.current?.click()}
-                  title={bi(language, 'ছবি পরিবর্তন করুন', 'Change avatar')}
-                  className="absolute -bottom-1.5 -right-1.5 w-7 h-7 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white flex items-center justify-center shadow"
+                  onClick={() => onNavigate('community')}
+                  className="text-xs font-semibold text-cyan-600 dark:text-cyan-400 hover:underline inline-flex items-center gap-1"
                 >
-                  <Camera className="w-3.5 h-3.5" />
+                  <Users className="w-3.5 h-3.5" />
+                  <span>{bi(language, 'কমিউনিটি ফিড দেখুন', 'Community Feed')}</span>
                 </button>
               </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                    {currentUser.fullName}
-                  </h2>
-                  {currentUser.role === 'admin' && (
-                    <span className="inline-flex items-center gap-1 text-[11px] font-bold text-cyan-600 dark:text-cyan-400">
-                      <ShieldCheck className="w-3.5 h-3.5" />
-                      Admin
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-slate-500">{currentUser.email}</p>
-                {currentUser.showGender && currentUser.gender && (
-                  <p className="text-[11px] text-slate-400 mt-0.5 capitalize">
-                    {currentUser.gender}
+            </div>
+          </section>
+
+          {profileTab === 'posts' ? (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+              {/* Left Intro Card (Facebook-style Sidebar) */}
+              <aside className="lg:col-span-4 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-3.5">
+                <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                  {bi(language, 'পরিচিতি (Intro)', 'Intro')}
+                </h2>
+                {currentUser.bio && (
+                  <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                    {currentUser.bio}
                   </p>
+                )}
+                <ul className="space-y-2.5 text-xs text-slate-600 dark:text-slate-300">
+                  <li className="flex items-start gap-2.5">
+                    <Building2 className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
+                    <span>
+                      {bi(language, 'অধ্যয়নরত:', 'Studies at')}{' '}
+                      <strong className="text-slate-900 dark:text-white">
+                        {currentUser.collegeName || currentUser.instituteName || bi(language, 'পলিটেকনিক ইনস্টিটিউট', 'Polytechnic Institute')}
+                      </strong>
+                    </span>
+                  </li>
+                  <li className="flex items-start gap-2.5">
+                    <GraduationCap className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
+                    <span>
+                      {language === 'en' ? currentDeptObj?.nameEn : currentDeptObj?.nameBn}
+                      {' · '}
+                      {language === 'en' ? SEMESTER_LABELS_EN[currentSemNum] : SEMESTER_LABELS[currentSemNum]}
+                    </span>
+                  </li>
+                  {currentUser.rollNumber && (
+                    <li className="flex items-start gap-2.5">
+                      <BookOpen className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
+                      <span>
+                        {bi(language, 'বোর্ড রোল:', 'BTEB Roll:')}{' '}
+                        <span className="font-mono font-semibold text-slate-900 dark:text-white">
+                          {currentUser.rollNumber}
+                        </span>
+                      </span>
+                    </li>
+                  )}
+                </ul>
+                <button
+                  type="button"
+                  onClick={() => setProfileTab('about')}
+                  className="w-full min-h-[40px] rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-200"
+                >
+                  {bi(language, 'পরিচিতি হালনাগাদ করুন', 'Edit Details')}
+                </button>
+              </aside>
+
+              {/* Right Timeline: Composer + Own Posts */}
+              <div className="lg:col-span-8 space-y-4">
+                {/* Facebook-style Quick Post Composer */}
+                <form
+                  onSubmit={(e) => void handlePublishFromProfile(e)}
+                  className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-4 sm:p-5 space-y-3.5"
+                >
+                  <div className="flex items-start gap-3">
+                    <img
+                      src={editAvatarUrl || currentUser.avatarUrl || DEFAULT_AVATAR}
+                      alt={currentUser.fullName}
+                      className="w-10 h-10 rounded-full object-cover shrink-0 bg-slate-800"
+                    />
+                    <textarea
+                      ref={composerRef}
+                      rows={3}
+                      value={postBody}
+                      onChange={(e) => setPostBody(e.target.value)}
+                      placeholder={bi(
+                        language,
+                        `${currentUser.fullName.split(' ')[0]}, স্টুডেন্ট কমিউনিটিতে কী শেয়ার করতে চান? প্রশ্ন, নোট বা পড়াশোনার আপডেট লিখুন...`,
+                        `What's on your mind, ${currentUser.fullName.split(' ')[0]}? Share a question, lab note, or study tip...`
+                      )}
+                      className="flex-1 px-3.5 py-2.5 rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-white resize-none focus:outline-none focus:border-cyan-500"
+                    />
+                  </div>
+
+                  {postImage && (
+                    <div className="relative rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-800">
+                      <img src={postImage} alt="Attachment" className="w-full max-h-72 object-cover" />
+                      <button
+                        type="button"
+                        onClick={() => setPostImage('')}
+                        className="absolute top-2 right-2 w-8 h-8 rounded-full bg-slate-950/75 text-white flex items-center justify-center hover:bg-slate-950"
+                        aria-label="Remove image"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        ref={postImageInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          void handleSelectPostPhoto(e.target.files?.[0] ?? null);
+                          e.target.value = '';
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => postImageInputRef.current?.click()}
+                        className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-slate-800 text-xs font-semibold text-emerald-600 dark:text-emerald-400"
+                      >
+                        <ImagePlus className="w-4 h-4" />
+                        <span>{bi(language, 'ছবি যোগ করুন', 'Photo')}</span>
+                      </button>
+                      <input
+                        type="text"
+                        value={postSubjectTag}
+                        onChange={(e) => setPostSubjectTag(e.target.value)}
+                        placeholder={bi(language, 'বিষয় কোড (ঐচ্ছিক)', 'Subject tag (optional)')}
+                        className="min-h-[38px] w-40 px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={posting || (!postBody.trim() && !postImage)}
+                      className="min-h-[40px] inline-flex items-center gap-1.5 px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-bold"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>
+                        {posting
+                          ? bi(language, 'প্রকাশ হচ্ছে...', 'Posting...')
+                          : bi(language, 'পোস্ট করুন', 'Post')}
+                      </span>
+                    </button>
+                  </div>
+                </form>
+
+                {/* User's Own Posts Feed */}
+                {postsLoading ? (
+                  <div className="p-6 text-center text-xs text-slate-500">
+                    {bi(language, 'আপনার পোস্ট লোড হচ্ছে...', 'Loading your posts...')}
+                  </div>
+                ) : myPosts.length === 0 ? (
+                  <div className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
+                    <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                      {bi(language, 'আপনি এখনো কোনো পোস্ট করেননি', 'You have not posted yet')}
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {bi(
+                        language,
+                        'উপরের বক্সে আপনার পড়াশোনার প্রশ্ন, নোট বা ছবি পোস্ট করলে তা স্টুডেন্ট কমিউনিটিতে সবার কাছে পৌঁছে যাবে।',
+                        'Share a study question, note, or photo above and it will appear on your timeline and in Student Community.'
+                      )}
+                    </p>
+                  </div>
+                ) : (
+                  myPosts.map((post) => {
+                    const likes = post.likedByUserIds || [];
+                    const hasLiked = likes.includes(currentUser.id);
+                    return (
+                      <article
+                        key={post.id}
+                        className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-4 sm:p-5 space-y-3"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-center gap-3">
+                            <img
+                              src={editAvatarUrl || currentUser.avatarUrl || DEFAULT_AVATAR}
+                              alt={post.authorName}
+                              className="w-10 h-10 rounded-full object-cover bg-slate-800"
+                            />
+                            <div>
+                              <p className="text-sm font-bold text-slate-900 dark:text-white">
+                                {post.authorName}
+                              </p>
+                              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                                {formatDateBn(post.createdAt)}
+                                {post.subjectTag ? ` · ${post.subjectTag}` : ''}
+                              </p>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => void handleDeleteMyPost(post.id)}
+                            title={bi(language, 'পোস্ট মুছুন', 'Delete post')}
+                            className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-500/10"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+
+                        {post.body && (
+                          <p className="text-sm text-slate-700 dark:text-slate-200 whitespace-pre-wrap leading-relaxed">
+                            {post.body}
+                          </p>
+                        )}
+                        {post.imageUrl && (
+                          <img
+                            src={post.imageUrl}
+                            alt={post.title}
+                            className="w-full max-h-96 object-cover rounded-2xl border border-slate-200 dark:border-slate-800"
+                          />
+                        )}
+
+                        <div className="pt-2.5 border-t border-slate-200 dark:border-slate-800 flex items-center gap-3 text-xs">
+                          <button
+                            type="button"
+                            onClick={() => void handleToggleLikeMyPost(post.id)}
+                            className={`min-h-[36px] px-3 rounded-xl inline-flex items-center gap-1.5 font-semibold transition-colors ${
+                              hasLiked
+                                ? 'text-blue-600 dark:text-cyan-400 bg-blue-500/10'
+                                : 'text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            <ThumbsUp className="w-3.5 h-3.5" />
+                            <span>
+                              {bi(language, 'লাইক', 'Like')} ({likes.length})
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onNavigate('community')}
+                            className="min-h-[36px] px-3 rounded-xl inline-flex items-center gap-1.5 font-semibold text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          >
+                            <MessageSquare className="w-3.5 h-3.5" />
+                            <span>
+                              {post.replies.length} {bi(language, 'মন্তব্য', 'Comments')}
+                            </span>
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })
                 )}
               </div>
             </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              {currentUser.role === 'admin' && (
-                <button
-                  type="button"
-                  onClick={() => onNavigate('admin')}
-                  className="min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold"
-                >
-                  <Shield className="w-4 h-4" />
-                  <span>{bi(language, 'অ্যাডমিন প্যানেল', 'Open Admin Panel')}</span>
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => void onLogout()}
-                className="min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                <LogOut className="w-4 h-4" />
-                <span>{bi(language, 'লগ আউট', 'Logout')}</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Update Profile Form */}
-          <form
-            onSubmit={handleSaveProfile}
-            className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
-          >
-            <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-              {bi(language, 'প্রোফাইল ও প্রাইভেসি তথ্য হালনাগাদ', 'Update Profile & Privacy')}
-            </h3>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-500">
-                  {bi(language, 'পূর্ণ নাম', 'Full Name')}
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                />
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-500">
-                  {bi(language, 'ডিপার্টমেন্ট / টেকনোলজি', 'Department')}
-                </label>
-                <select
-                  value={editDept}
-                  onChange={(e) => setEditDept(e.target.value)}
-                  className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                >
-                  {DEPARTMENTS.map((d) => (
-                    <option key={d.id} value={d.id}>
-                      {language === 'en' ? d.nameEn : d.nameBn}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-500">
-                  {bi(language, 'সেমিস্টার', 'Semester')}
-                </label>
-                <select
-                  value={editSem}
-                  onChange={(e) => setEditSem(Number(e.target.value))}
-                  className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                >
-                  {([1, 2, 3, 4, 5, 6, 7, 8] as SemesterNumber[]).map((s) => (
-                    <option key={s} value={s}>
-                      {language === 'en' ? SEMESTER_LABELS_EN[s] : SEMESTER_LABELS[s]}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-500">
-                  {bi(language, 'বোর্ড রোল নম্বর', 'BTEB Roll Number')}
-                </label>
-                <input
-                  type="text"
-                  value={editRoll}
-                  onChange={(e) => setEditRoll(e.target.value)}
-                  placeholder="654321"
-                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-mono"
-                />
-              </div>
-
-              <div className="space-y-1 sm:col-span-2">
-                <label className="text-xs font-medium text-slate-500">
-                  {bi(language, 'পলিটেকনিক ইনস্টিটিউটের নাম', 'College / Polytechnic Institute')}
-                </label>
-                <input
-                  type="text"
-                  value={editCollege}
-                  onChange={(e) => setEditCollege(e.target.value)}
-                  placeholder="e.g. Dhaka Polytechnic Institute"
-                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                />
-              </div>
-
-              <div className="space-y-1 sm:col-span-2">
-                <label className="text-xs font-medium text-slate-500">
-                  {bi(language, 'বায়ো (সংক্ষিপ্ত পরিচয়)', 'Bio')}
-                </label>
-                <textarea
-                  rows={2}
-                  value={editBio}
-                  onChange={(e) => setEditBio(e.target.value)}
-                  placeholder={bi(language, 'আপনার লক্ষ্য ও আগ্রহের বিষয় লিখুন...', 'Your diploma focus & goals...')}
-                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm resize-none"
-                />
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-500">
-                  {bi(language, 'লিঙ্গ (ঐচ্ছিক)', 'Gender (Optional)')}
-                </label>
-                <select
-                  value={editGender}
-                  onChange={(e) => setEditGender(e.target.value as '' | 'male' | 'female')}
-                  className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                >
-                  <option value="">{bi(language, 'নির্বাচন না করা', 'Prefer not to say')}</option>
-                  <option value="male">{bi(language, 'পুরুষ (Male)', 'Male')}</option>
-                  <option value="female">{bi(language, 'নারী (Female)', 'Female')}</option>
-                </select>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-500 flex items-center gap-1">
-                  <Lock className="w-3.5 h-3.5" />
-                  <span>{bi(language, 'প্রোফাইল প্রাইভেসি', 'Profile Visibility')}</span>
-                </label>
-                <select
-                  value={editVisibility}
-                  onChange={(e) =>
-                    setEditVisibility(e.target.value as 'public' | 'department' | 'private')
-                  }
-                  className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                >
-                  <option value="public">{bi(language, 'সবার জন্য দৃশ্যমান (Public)', 'Public')}</option>
-                  <option value="department">
-                    {bi(language, 'ডিপার্টমেন্ট ভিত্তিক (Department)', 'Department Only')}
-                  </option>
-                  <option value="private">{bi(language, 'শুধু নিজে (Private)', 'Private')}</option>
-                </select>
-              </div>
-            </div>
-
-            <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={editShowGender}
-                onChange={(e) => setEditShowGender(e.target.checked)}
-                className="rounded border-slate-400"
-              />
-              {editShowGender ? (
-                <Eye className="w-3.5 h-3.5 text-cyan-500" />
-              ) : (
-                <EyeOff className="w-3.5 h-3.5 text-slate-400" />
-              )}
-              <span>
-                {bi(language, 'প্রোফাইলে লিঙ্গ তথ্য প্রদর্শন করুন', 'Display gender on my profile')}
-              </span>
-            </label>
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="min-h-[42px] px-5 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-bold"
+          ) : (
+            /* About & Edit Profile Form */
+            <form
+              onSubmit={handleSaveProfile}
+              className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-4"
             >
-              {bi(language, 'পরিবর্তন সংরক্ষণ করুন', 'Save Profile')}
-            </button>
-          </form>
-        </div>
-      ) : (
-        <div className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-5">
-          {/* Tabs */}
-          <div className="flex flex-wrap gap-2 p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-            <button
-              type="button"
-              onClick={() => setAuthTab('login')}
-              className={`flex-1 min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold ${
-                authTab === 'login'
-                  ? 'bg-white dark:bg-slate-800 text-cyan-600 dark:text-cyan-400'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              <LogIn className="w-3.5 h-3.5 inline mr-1" />
-              {bi(language, 'সাইন ইন', 'Sign In')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setAuthTab('register')}
-              className={`flex-1 min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold ${
-                authTab === 'register'
-                  ? 'bg-white dark:bg-slate-800 text-cyan-600 dark:text-cyan-400'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              <UserPlus className="w-3.5 h-3.5 inline mr-1" />
-              {bi(language, 'নতুন অ্যাকাউন্ট', 'Sign Up')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setAuthTab('forgot')}
-              className={`flex-1 min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold ${
-                authTab === 'forgot'
-                  ? 'bg-white dark:bg-slate-800 text-cyan-600 dark:text-cyan-400'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              <Mail className="w-3.5 h-3.5 inline mr-1" />
-              {bi(language, 'পাসওয়ার্ড ভুলে গেছি', 'Forgot')}
-            </button>
-            {!hasAdmin && (
-              <button
-                type="button"
-                onClick={() => setAuthTab('claim-admin')}
-                className={`flex-1 min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold ${
-                  authTab === 'claim-admin'
-                    ? 'bg-white dark:bg-slate-800 text-cyan-600 dark:text-cyan-400'
-                    : 'text-slate-600 dark:text-slate-400'
-                }`}
-              >
-                <KeyRound className="w-3.5 h-3.5 inline mr-1" />
-                Admin Setup
-              </button>
-            )}
-          </div>
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                {bi(language, 'প্রোফাইল ও প্রাইভেসি তথ্য হালনাগাদ', 'Update Profile & Privacy')}
+              </h3>
 
-          {/* Google OAuth Sign-In (Visible on both Sign In and Sign Up) */}
-          {(authTab === 'login' || authTab === 'register') && (
-            <div className="space-y-3">
-              <button
-                type="button"
-                disabled={loading}
-                onClick={() => void handleGoogleSignIn()}
-                className="w-full min-h-[46px] inline-flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 hover:border-cyan-500 text-sm font-semibold text-slate-800 dark:text-white shadow-xs transition-colors disabled:opacity-60"
-              >
-                <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0" aria-hidden="true">
-                  <path
-                    fill="#4285F4"
-                    d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
-                  />
-                  <path
-                    fill="#34A853"
-                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
-                  />
-                  <path
-                    fill="#FBBC05"
-                    d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
-                  />
-                  <path
-                    fill="#EA4335"
-                    d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
-                  />
-                </svg>
-                <span>
-                  {loading
-                    ? bi(language, 'Google-এ সংযুক্ত হচ্ছে...', 'Connecting with Google...')
-                    : bi(language, 'Google দিয়ে চালিয়ে যান', 'Continue with Google')}
-                </span>
-              </button>
-              {!isFirebaseAuthConfigured && (
-                <p className="text-[11px] text-amber-600 dark:text-amber-300 text-center">
-                  {bi(
-                    language,
-                    'Google Sign-In সক্রিয় করতে Firebase Web Env Keys প্রয়োজন — নিচে ইমেইল ও পাসওয়ার্ড দিয়ে এখনই লগইন/সাইনআপ করা যাবে।',
-                    'Google Sign-In requires Firebase Web Env Keys; Email & Password login works immediately below.'
-                  )}
-                </p>
-              )}
-              <div className="flex items-center gap-3 text-[11px] text-slate-400">
-                <div className="flex-1 h-px bg-slate-200 dark:bg-slate-800" />
-                <span>{bi(language, 'অথবা ইমেইল ব্যবহার করুন', 'OR USE EMAIL')}</span>
-                <div className="flex-1 h-px bg-slate-200 dark:bg-slate-800" />
-              </div>
-            </div>
-          )}
-
-          {authTab === 'login' && (
-            <form onSubmit={handleLogin} className="space-y-3.5">
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-500">Email</label>
-                <input
-                  type="email"
-                  required
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="student@example.com"
-                  className="w-full min-h-[44px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                />
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-500">Password</label>
-                <input
-                  type="password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="w-full min-h-[44px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                />
-              </div>
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full min-h-[44px] rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-sm font-bold"
-              >
-                {loading
-                  ? bi(language, 'প্রক্রিয়া চলছে...', 'Signing in...')
-                  : bi(language, 'সাইন ইন করুন', 'Sign In')}
-              </button>
-            </form>
-          )}
-
-          {authTab === 'register' && (
-            <form onSubmit={handleRegister} className="space-y-3.5">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                 <div className="space-y-1">
                   <label className="text-xs font-medium text-slate-500">
                     {bi(language, 'পূর্ণ নাম', 'Full Name')}
@@ -840,41 +1067,19 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                   <input
                     type="text"
                     required
-                    value={fullName}
-                    onChange={(e) => setFullName(e.target.value)}
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
                     className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
                   />
                 </div>
-                <div className="space-y-1">
-                  <label className="text-xs font-medium text-slate-500">Email</label>
-                  <input
-                    type="email"
-                    required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                  />
-                </div>
+
                 <div className="space-y-1">
                   <label className="text-xs font-medium text-slate-500">
-                    {bi(language, 'পাসওয়ার্ড (কমপক্ষে ৬ অক্ষর)', 'Password (min 6 chars)')}
-                  </label>
-                  <input
-                    type="password"
-                    required
-                    minLength={6}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <label className="text-xs font-medium text-slate-500">
-                    {bi(language, 'ডিপার্টমেন্ট', 'Department')}
+                    {bi(language, 'ডিপার্টমেন্ট / টেকনোলজি', 'Department')}
                   </label>
                   <select
-                    value={department}
-                    onChange={(e) => setDepartment(e.target.value as DepartmentId)}
+                    value={editDept}
+                    onChange={(e) => setEditDept(e.target.value)}
                     className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
                   >
                     {DEPARTMENTS.map((d) => (
@@ -884,13 +1089,14 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                     ))}
                   </select>
                 </div>
+
                 <div className="space-y-1">
                   <label className="text-xs font-medium text-slate-500">
                     {bi(language, 'সেমিস্টার', 'Semester')}
                   </label>
                   <select
-                    value={semester}
-                    onChange={(e) => setSemester(Number(e.target.value) as SemesterNumber)}
+                    value={editSem}
+                    onChange={(e) => setEditSem(Number(e.target.value))}
                     className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
                   >
                     {([1, 2, 3, 4, 5, 6, 7, 8] as SemesterNumber[]).map((s) => (
@@ -900,103 +1106,449 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                     ))}
                   </select>
                 </div>
+
                 <div className="space-y-1">
                   <label className="text-xs font-medium text-slate-500">
-                    {bi(language, 'কলেজ / পলিটেকনিক', 'College / Institute')}
+                    {bi(language, 'বোর্ড রোল নম্বর', 'BTEB Roll Number')}
                   </label>
                   <input
                     type="text"
-                    value={collegeName}
-                    onChange={(e) => setCollegeName(e.target.value)}
-                    placeholder="e.g. Dhaka Polytechnic Institute"
+                    value={editRoll}
+                    onChange={(e) => setEditRoll(e.target.value)}
+                    placeholder="654321"
+                    className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-mono"
+                  />
+                </div>
+
+                <div className="space-y-1 sm:col-span-2">
+                  <label className="text-xs font-medium text-slate-500">
+                    {bi(language, 'পলিটেকনিক ইনস্টিটিউটের নাম', 'College / Polytechnic Institute')}
+                  </label>
+                  <input
+                    type="text"
+                    list="bd-polytechnics-list"
+                    value={editCollege}
+                    onChange={(e) => setEditCollege(e.target.value)}
+                    placeholder={bi(language, 'যেমন: বগুড়া পলিটেকনিক ইনস্টিটিউট', 'e.g. Bogura / Dhaka Polytechnic Institute')}
                     className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
                   />
                 </div>
+
+                <div className="space-y-1 sm:col-span-2">
+                  <label className="text-xs font-medium text-slate-500">
+                    {bi(language, 'বায়ো (সংক্ষিপ্ত পরিচয়)', 'Bio')}
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={editBio}
+                    onChange={(e) => setEditBio(e.target.value)}
+                    placeholder={bi(language, 'আপনার লক্ষ্য ও আগ্রহের বিষয় লিখুন...', 'Your diploma focus & goals...')}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm resize-none"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-medium text-slate-500">
+                    {bi(language, 'লিঙ্গ (ঐচ্ছিক)', 'Gender (Optional)')}
+                  </label>
+                  <select
+                    value={editGender}
+                    onChange={(e) => setEditGender(e.target.value as '' | 'male' | 'female')}
+                    className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                  >
+                    <option value="">{bi(language, 'নির্বাচন না করা', 'Prefer not to say')}</option>
+                    <option value="male">{bi(language, 'পুরুষ (Male)', 'Male')}</option>
+                    <option value="female">{bi(language, 'নারী (Female)', 'Female')}</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-medium text-slate-500 flex items-center gap-1">
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>{bi(language, 'প্রোফাইল প্রাইভেসি', 'Profile Visibility')}</span>
+                  </label>
+                  <select
+                    value={editVisibility}
+                    onChange={(e) =>
+                      setEditVisibility(e.target.value as 'public' | 'department' | 'private')
+                    }
+                    className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                  >
+                    <option value="public">{bi(language, 'সবার জন্য দৃশ্যমান (Public)', 'Public')}</option>
+                    <option value="department">
+                      {bi(language, 'ডিপার্টমেন্ট ভিত্তিক (Department)', 'Department Only')}
+                    </option>
+                    <option value="private">{bi(language, 'শুধু নিজে (Private)', 'Private')}</option>
+                  </select>
+                </div>
               </div>
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full min-h-[44px] rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-sm font-bold"
-              >
-                {loading
-                  ? bi(language, 'অ্যাকাউন্ট তৈরি হচ্ছে...', 'Creating account...')
-                  : bi(language, 'নিবন্ধন সম্পন্ন করুন', 'Create Account')}
-              </button>
-            </form>
-          )}
 
-          {authTab === 'forgot' && (
-            <form onSubmit={handleForgotPassword} className="space-y-3.5">
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                {bi(
-                  language,
-                  'আপনার নিবন্ধিত ইমেইল লিখুন। পাসওয়ার্ড রিসেট করার লিংক পাঠানো হবে।',
-                  'Enter your registered email address to receive a password reset link.'
+              <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={editShowGender}
+                  onChange={(e) => setEditShowGender(e.target.checked)}
+                  className="rounded border-slate-400"
+                />
+                {editShowGender ? (
+                  <Eye className="w-3.5 h-3.5 text-cyan-500" />
+                ) : (
+                  <EyeOff className="w-3.5 h-3.5 text-slate-400" />
                 )}
-              </p>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="student@example.com"
-                className="w-full min-h-[44px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-              />
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full min-h-[44px] rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-sm font-bold"
-              >
-                {bi(language, 'রিসেট লিংক পাঠান', 'Send Password Reset Link')}
-              </button>
-            </form>
-          )}
+                <span>
+                  {bi(language, 'প্রোফাইলে লিঙ্গ তথ্য প্রদর্শন করুন', 'Display gender on my profile')}
+                </span>
+              </label>
 
-          {authTab === 'claim-admin' && !hasAdmin && (
-            <form onSubmit={handleClaimFirstAdmin} className="space-y-3.5">
-              <p className="text-xs text-amber-600 dark:text-amber-300 bg-amber-500/10 border border-amber-500/30 p-3 rounded-xl">
-                {bi(
-                  language,
-                  'প্ল্যাটফর্মে এখনো কোনো লোকাল অ্যাডমিন নেই। প্রথম অ্যাডমিন অ্যাকাউন্ট তৈরি করলে আপনি Formula Hub, AI Config, Notices ও User Roles পরিচালনা করতে পারবেন।',
-                  'No local administrator is configured yet. Claim the first Admin role to manage Formulas, AI Config, Notices & Users.'
-                )}
-              </p>
-              <input
-                type="text"
-                required
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                placeholder="Admin Name"
-                className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-              />
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="admin@polytechnichub.com"
-                className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-              />
-              <input
-                type="password"
-                required
-                minLength={6}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Strong Admin Password (min 6 chars)"
-                className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-              />
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full min-h-[44px] rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-bold"
+                className="min-h-[44px] px-5 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-bold"
               >
-                Claim First Admin Account
+                {bi(language, 'পরিবর্তন সংরক্ষণ করুন', 'Save Profile')}
               </button>
             </form>
           )}
         </div>
+      ) : (
+        /* Facebook-Style Split Create Profile / Sign In View */
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <div className="lg:col-span-5 space-y-4 lg:pt-4">
+            <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 dark:text-white tracking-tight">
+              {bi(language, 'আপনার পলিটেকনিক স্টুডেন্ট প্রোফাইল খুলুন', 'Create Your Polytechnic Student Profile')}
+            </h1>
+            <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+              {bi(
+                language,
+                'ফেসবুকের মতো নিজের কভার ফটো, প্রোফাইল ছবি, ইনস্টিটিউট ও ডিপার্টমেন্ট পরিচিতি সাজান এবং স্টুডেন্ট কমিউনিটিতে প্রশ্ন, নোট ও ছবি পোস্ট করুন।',
+                'Set up your cover photo, avatar, institute & department profile like Facebook, and share posts, photos, and questions in the Student Community.'
+              )}
+            </p>
+            <ul className="space-y-2.5 text-xs text-slate-600 dark:text-slate-300 pt-1">
+              <li className="flex items-center gap-2.5">
+                <CheckCircle2 className="w-4 h-4 text-cyan-500 shrink-0" />
+                <span>{bi(language, 'নিজস্ব কভার ফটো, প্রোফাইল ছবি ও বায়ো', 'Custom cover photo, profile avatar & bio')}</span>
+              </li>
+              <li className="flex items-center gap-2.5">
+                <CheckCircle2 className="w-4 h-4 text-cyan-500 shrink-0" />
+                <span>{bi(language, 'স্টুডেন্ট কমিউনিটিতে পোস্ট, ছবি, লাইক ও মন্তব্য', 'Post text & photos, like & comment in Community')}</span>
+              </li>
+              <li className="flex items-center gap-2.5">
+                <CheckCircle2 className="w-4 h-4 text-cyan-500 shrink-0" />
+                <span>{bi(language, 'বাংলাদেশের সব পলিটেকনিক ও ১৫টি ডিপার্টমেন্ট সাপোর্ট', 'Supports all Bangladesh Polytechnics & 15 departments')}</span>
+              </li>
+            </ul>
+          </div>
+
+          <div className="lg:col-span-7 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-5 shadow-sm">
+            {/* Tabs */}
+            <div className="flex flex-wrap gap-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => setAuthTab('register')}
+                className={`flex-1 min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-bold ${
+                  authTab === 'register'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                <UserPlus className="w-3.5 h-3.5 inline mr-1" />
+                {bi(language, 'নতুন প্রোফাইল খুলুন', 'Create Profile')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthTab('login')}
+                className={`flex-1 min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-bold ${
+                  authTab === 'login'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                <LogIn className="w-3.5 h-3.5 inline mr-1" />
+                {bi(language, 'সাইন ইন', 'Sign In')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthTab('forgot')}
+                className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold ${
+                  authTab === 'forgot'
+                    ? 'bg-white dark:bg-slate-800 text-cyan-600 dark:text-cyan-400'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                <Mail className="w-3.5 h-3.5 inline mr-1" />
+                {bi(language, 'রিসেট', 'Reset')}
+              </button>
+              {!hasAdmin && (
+                <button
+                  type="button"
+                  onClick={() => setAuthTab('claim-admin')}
+                  className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold ${
+                    authTab === 'claim-admin'
+                      ? 'bg-white dark:bg-slate-800 text-cyan-600 dark:text-cyan-400'
+                      : 'text-slate-600 dark:text-slate-400'
+                  }`}
+                >
+                  <KeyRound className="w-3.5 h-3.5 inline mr-1" />
+                  Admin
+                </button>
+              )}
+            </div>
+
+            {/* Google OAuth Sign-In */}
+            {(authTab === 'login' || authTab === 'register') && (
+              <div className="space-y-3">
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={() => void handleGoogleSignIn()}
+                  className="w-full min-h-[46px] inline-flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 hover:border-cyan-500 text-sm font-semibold text-slate-800 dark:text-white shadow-xs transition-colors disabled:opacity-60"
+                >
+                  <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0" aria-hidden="true">
+                    <path
+                      fill="#4285F4"
+                      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                    />
+                    <path
+                      fill="#EA4335"
+                      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                    />
+                  </svg>
+                  <span>
+                    {loading
+                      ? bi(language, 'Google-এ সংযুক্ত হচ্ছে...', 'Connecting with Google...')
+                      : bi(language, 'Google দিয়ে এক ক্লিকে প্রোফাইল খুলুন', 'Continue with Google')}
+                  </span>
+                </button>
+                <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                  <div className="flex-1 h-px bg-slate-200 dark:bg-slate-800" />
+                  <span>{bi(language, 'অথবা ইমেইল দিয়ে', 'OR WITH EMAIL')}</span>
+                  <div className="flex-1 h-px bg-slate-200 dark:bg-slate-800" />
+                </div>
+              </div>
+            )}
+
+            {authTab === 'login' && (
+              <form onSubmit={handleLogin} className="space-y-3.5">
+                <div className="space-y-1">
+                  <label className="text-xs font-medium text-slate-500">Email</label>
+                  <input
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="student@example.com"
+                    className="w-full min-h-[44px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs font-medium text-slate-500">Password</label>
+                  <input
+                    type="password"
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full min-h-[44px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full min-h-[46px] rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-bold"
+                >
+                  {loading
+                    ? bi(language, 'প্রক্রিয়া চলছে...', 'Signing in...')
+                    : bi(language, 'সাইন ইন করুন', 'Sign In')}
+                </button>
+              </form>
+            )}
+
+            {authTab === 'register' && (
+              <form onSubmit={handleRegister} className="space-y-3.5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-slate-500">
+                      {bi(language, 'পূর্ণ নাম', 'Full Name')}
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={fullName}
+                      onChange={(e) => setFullName(e.target.value)}
+                      placeholder={bi(language, 'যেমন: রাকিব হাসান', 'e.g. Rokib Hasan')}
+                      className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-slate-500">Email</label>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="student@example.com"
+                      className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-slate-500">
+                      {bi(language, 'পাসওয়ার্ড (কমপক্ষে ৬ অক্ষর)', 'Password (min 6 chars)')}
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-slate-500">
+                      {bi(language, 'ডিপার্টমেন্ট', 'Department')}
+                    </label>
+                    <select
+                      value={department}
+                      onChange={(e) => setDepartment(e.target.value as DepartmentId)}
+                      className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                    >
+                      {DEPARTMENTS.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {language === 'en' ? d.nameEn : d.nameBn}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-slate-500">
+                      {bi(language, 'সেমিস্টার', 'Semester')}
+                    </label>
+                    <select
+                      value={semester}
+                      onChange={(e) => setSemester(Number(e.target.value) as SemesterNumber)}
+                      className="w-full min-h-[42px] px-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                    >
+                      {([1, 2, 3, 4, 5, 6, 7, 8] as SemesterNumber[]).map((s) => (
+                        <option key={s} value={s}>
+                          {language === 'en' ? SEMESTER_LABELS_EN[s] : SEMESTER_LABELS[s]}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-slate-500">
+                      {bi(language, 'পলিটেকনিক ইনস্টিটিউট', 'Polytechnic Institute')}
+                    </label>
+                    <input
+                      type="text"
+                      list="bd-polytechnics-list"
+                      value={collegeName}
+                      onChange={(e) => setCollegeName(e.target.value)}
+                      placeholder={bi(language, 'যেমন: বগুড়া পলিটেকনিক ইনস্টিটিউট', 'e.g. Bogura / Dhaka Polytechnic')}
+                      className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                    />
+                  </div>
+                </div>
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full min-h-[46px] rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-sm font-bold"
+                >
+                  {loading
+                    ? bi(language, 'প্রোফাইল তৈরি হচ্ছে...', 'Creating profile...')
+                    : bi(language, 'নতুন স্টুডেন্ট প্রোফাইল খুলুন', 'Create New Student Profile')}
+                </button>
+              </form>
+            )}
+
+            {authTab === 'forgot' && (
+              <form onSubmit={handleForgotPassword} className="space-y-3.5">
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {bi(
+                    language,
+                    'আপনার নিবন্ধিত ইমেইল লিখুন। পাসওয়ার্ড রিসেট করার লিংক পাঠানো হবে।',
+                    'Enter your registered email address to receive a password reset link.'
+                  )}
+                </p>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="student@example.com"
+                  className="w-full min-h-[44px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                />
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full min-h-[44px] rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-sm font-bold"
+                >
+                  {bi(language, 'রিসেট লিংক পাঠান', 'Send Password Reset Link')}
+                </button>
+              </form>
+            )}
+
+            {authTab === 'claim-admin' && !hasAdmin && (
+              <form onSubmit={handleClaimFirstAdmin} className="space-y-3.5">
+                <p className="text-xs text-amber-600 dark:text-amber-300 bg-amber-500/10 border border-amber-500/30 p-3 rounded-xl">
+                  {bi(
+                    language,
+                    'প্ল্যাটফর্মে এখনো কোনো লোকাল অ্যাডমিন নেই। প্রথম অ্যাডমিন অ্যাকাউন্ট তৈরি করলে আপনি Formula Hub, AI Config, Notices ও User Roles পরিচালনা করতে পারবেন।',
+                    'No local administrator is configured yet. Claim the first Admin role to manage Formulas, AI Config, Notices & Users.'
+                  )}
+                </p>
+                <input
+                  type="text"
+                  required
+                  value={fullName}
+                  onChange={(e) => setFullName(e.target.value)}
+                  placeholder="Admin Name"
+                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                />
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="admin@polytechnichub.com"
+                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                />
+                <input
+                  type="password"
+                  required
+                  minLength={6}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Strong Admin Password (min 6 chars)"
+                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
+                />
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full min-h-[44px] rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-bold"
+                >
+                  Claim First Admin Account
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
       )}
+
+      <datalist id="bd-polytechnics-list">
+        {BANGLADESH_POLYTECHNICS.map((poly) => (
+          <option key={poly.id} value={language === 'en' ? poly.nameEn : poly.nameBn} />
+        ))}
+      </datalist>
     </div>
   );
 };
