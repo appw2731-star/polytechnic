@@ -1209,14 +1209,24 @@ export default function App() {
   const handleProfileUpdated = (updatedUser: AuthUser) => {
     setCachedAuthUser(updatedUser);
     setCurrentUser(updatedUser);
-    handleUpdateSettings({
-      studentName: updatedUser.fullName,
-      collegeName: updatedUser.collegeName ?? updatedUser.instituteName ?? '',
-      avatarDataUrl: updatedUser.avatarUrl || state.settings.avatarDataUrl,
-      coverDataUrl: updatedUser.coverUrl || state.settings.coverDataUrl,
-      department: (updatedUser.department as DepartmentId) || state.settings.department,
-      semester: (updatedUser.semester as SemesterNumber) || state.settings.semester,
-    });
+    setState((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        studentName: updatedUser.fullName || prev.settings.studentName,
+        collegeName: updatedUser.collegeName ?? updatedUser.instituteName ?? '',
+        avatarDataUrl:
+          updatedUser.avatarUrl !== undefined
+            ? updatedUser.avatarUrl
+            : prev.settings.avatarDataUrl,
+        coverDataUrl:
+          updatedUser.coverUrl !== undefined
+            ? updatedUser.coverUrl
+            : prev.settings.coverDataUrl,
+        department: (updatedUser.department as DepartmentId) || prev.settings.department,
+        semester: (updatedUser.semester as SemesterNumber) || prev.settings.semester,
+      },
+    }));
     void syncUserProfileToFirestore(updatedUser).catch((err) => {
       console.warn('Firestore profile mirror notice:', err instanceof Error ? err.message : err);
     });
@@ -1256,13 +1266,34 @@ export default function App() {
   const handleUpdateHeroProfile = async (
     partial: HeroProfileChangePayload
   ): Promise<ProfileUpdateResult> => {
-    handleUpdateSettings({
+    const previousUser = currentUserRef.current;
+    const previousSettings = settingsRef.current;
+
+    // Optimistically sync both local settings AND currentUser so Dashboard, Sidebar & Profile reflect edits immediately
+    const optimisticSettingsPatch: Partial<StudyMateState['settings']> = {
       ...(partial.studentName !== undefined ? { studentName: partial.studentName } : {}),
       ...(partial.collegeName !== undefined ? { collegeName: partial.collegeName } : {}),
       ...(partial.department !== undefined ? { department: partial.department } : {}),
       ...(partial.semester !== undefined ? { semester: partial.semester } : {}),
       ...(partial.avatarDataUrl !== undefined ? { avatarDataUrl: partial.avatarDataUrl } : {}),
-    });
+    };
+    handleUpdateSettings(optimisticSettingsPatch);
+
+    if (previousUser) {
+      const optimisticUser: AuthUser = {
+        ...previousUser,
+        ...(partial.studentName !== undefined ? { fullName: partial.studentName } : {}),
+        ...(partial.collegeName !== undefined
+          ? { collegeName: partial.collegeName, instituteName: partial.collegeName }
+          : {}),
+        ...(partial.department !== undefined ? { department: partial.department } : {}),
+        ...(partial.semester !== undefined ? { semester: partial.semester } : {}),
+        ...(partial.avatarDataUrl !== undefined ? { avatarUrl: partial.avatarDataUrl } : {}),
+        updatedAt: new Date().toISOString(),
+      };
+      setCurrentUser(optimisticUser);
+      setCachedAuthUser(optimisticUser);
+    }
 
     const result = await profileUpdateService.updateHeroProfile(
       {
@@ -1272,13 +1303,51 @@ export default function App() {
         semester: partial.semester,
         avatarUrl: partial.avatarDataUrl,
       },
-      isOnline
+      isOnline,
+      previousUser
     );
 
-    if (result.user) {
-      setCachedAuthUser(result.user);
-      setCurrentUser(result.user);
+    if (result.error) {
+      // Roll back optimistic state if validation or database commit failed
+      handleUpdateSettings({
+        studentName: previousSettings.studentName,
+        collegeName: previousSettings.collegeName,
+        department: previousSettings.department,
+        semester: previousSettings.semester,
+        avatarDataUrl: previousSettings.avatarDataUrl,
+      });
+      if (previousUser) {
+        setCurrentUser(previousUser);
+        setCachedAuthUser(previousUser);
+      }
+      return result;
     }
+
+    if (result.user) {
+      const committed = result.user;
+      setCachedAuthUser(committed);
+      setCurrentUser(committed);
+      setState((prev) => ({
+        ...prev,
+        settings: {
+          ...prev.settings,
+          studentName: committed.fullName || prev.settings.studentName,
+          collegeName:
+            committed.collegeName ?? committed.instituteName ?? prev.settings.collegeName,
+          department: (committed.department as DepartmentId) || prev.settings.department,
+          semester: (committed.semester as SemesterNumber) || prev.settings.semester,
+          avatarDataUrl:
+            committed.avatarUrl !== undefined
+              ? committed.avatarUrl
+              : prev.settings.avatarDataUrl,
+          coverDataUrl:
+            committed.coverUrl !== undefined
+              ? committed.coverUrl
+              : prev.settings.coverDataUrl,
+        },
+      }));
+    }
+
     return result;
   };
 

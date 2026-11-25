@@ -17,6 +17,11 @@ import {
 } from 'firebase/auth';
 import { auth as firebaseAuth, FIREBASE_RUNTIME_CONFIG, isFirebaseConfigured } from '../firebase';
 import { ApiError, apiClient, getStoredToken, setStoredToken } from '../services/apiClient';
+import {
+  fetchUserProfileFromFirestore,
+  isVerifiedFirebaseSession,
+  syncUserProfileToFirestore,
+} from '../services/firestoreService';
 import { isSupabaseConfigured, isSupabaseMissingRelationError, supabase } from './supabaseClient';
 import type { AuthUser, LanguageMode } from '../types/study';
 
@@ -233,10 +238,57 @@ export function setCachedAuthUser(user: AuthUser | null): void {
   }
 }
 
+function mergeFirestoreProfileOntoUser(
+  baseUser: AuthUser,
+  fsProfile: Partial<AuthUser> | null,
+  fbUser?: User | null
+): AuthUser {
+  const email = (baseUser.email || fsProfile?.email || fbUser?.email || '').trim().toLowerCase();
+  const isOwnerAdmin = Boolean(fbUser?.emailVerified && email === 'webrokib@gmail.com');
+
+  if (!fsProfile) {
+    return {
+      ...baseUser,
+      email: email || baseUser.email,
+      role: isOwnerAdmin ? 'admin' : baseUser.role,
+    };
+  }
+
+  const mergedCollege =
+    (fsProfile.collegeName || '').trim() ||
+    (baseUser.collegeName || baseUser.instituteName || '').trim();
+
+  return {
+    ...baseUser,
+    firebaseUid: baseUser.firebaseUid || fsProfile.firebaseUid || fbUser?.uid,
+    authProvider: fsProfile.authProvider || baseUser.authProvider,
+    email: email || baseUser.email,
+    fullName: (fsProfile.fullName || '').trim() || baseUser.fullName,
+    department: fsProfile.department || baseUser.department,
+    semester: fsProfile.semester || baseUser.semester,
+    collegeName: mergedCollege,
+    instituteName: mergedCollege,
+    rollNumber:
+      fsProfile.rollNumber !== undefined && fsProfile.rollNumber !== ''
+        ? fsProfile.rollNumber
+        : baseUser.rollNumber,
+    bio: fsProfile.bio !== undefined && fsProfile.bio !== '' ? fsProfile.bio : baseUser.bio,
+    avatarUrl: fsProfile.avatarUrl || baseUser.avatarUrl,
+    coverUrl: fsProfile.coverUrl || baseUser.coverUrl,
+    gender: fsProfile.gender || baseUser.gender,
+    showGender:
+      fsProfile.showGender !== undefined ? fsProfile.showGender : baseUser.showGender,
+    profileVisibility: fsProfile.profileVisibility || baseUser.profileVisibility,
+    role: isOwnerAdmin || fsProfile.role === 'admin' ? 'admin' : baseUser.role,
+    updatedAt: fsProfile.updatedAt || baseUser.updatedAt,
+  };
+}
+
 /**
  * Validates `getStoredToken()` structurally and against `/api/auth/me` before
  * setting authenticated state across browser refreshes. Clears malformed, expired,
- * or 401/403-rejected tokens while preserving valid unexpired offline sessions.
+ * or 401/403-rejected tokens while preserving valid unexpired offline or static-hosted sessions,
+ * and overlays any saved Cloud Firestore profile customizations (including cover photo).
  */
 export async function validateStoredSessionToken(): Promise<SessionValidationResult> {
   const token = getStoredToken();
@@ -252,22 +304,46 @@ export async function validateStoredSessionToken(): Promise<SessionValidationRes
     return { status: 'invalid' };
   }
 
+  const fbAuth = getFirebaseAuthInstance();
+  if (fbAuth && typeof fbAuth.authStateReady === 'function') {
+    await fbAuth.authStateReady().catch(() => {});
+  }
+  const activeFbUser = fbAuth?.currentUser ?? null;
+
   try {
-    const me = await apiClient.getMe();
-    setCachedAuthUser(me.user);
+    const [me, fsProfile] = await Promise.all([
+      apiClient.getMe(),
+      activeFbUser ? fetchUserProfileFromFirestore(activeFbUser.uid).catch(() => null) : Promise.resolve(null),
+    ]);
+    const mergedUser = mergeFirestoreProfileOntoUser(me.user, fsProfile, activeFbUser);
+    setCachedAuthUser(mergedUser);
     return {
       status: 'valid',
-      user: me.user,
+      user: mergedUser,
       token,
     };
   } catch (err) {
     if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+      // If Firebase Auth still has an active user, let step 3 (reconcileFirebaseSession) recover cleanly
       setStoredToken(null);
       setCachedAuthUser(null);
       return { status: 'invalid' };
     }
 
-    const cached = getCachedAuthUser(parsed.sub);
+    const cached = getCachedAuthUser(parsed.sub) || getCachedAuthUser();
+    if (activeFbUser) {
+      const fsProfile = await fetchUserProfileFromFirestore(activeFbUser.uid).catch(() => null);
+      if (cached) {
+        const merged = mergeFirestoreProfileOntoUser(cached, fsProfile, activeFbUser);
+        setCachedAuthUser(merged);
+        return {
+          status: 'valid',
+          user: merged,
+          token,
+        };
+      }
+    }
+
     if (cached) {
       return {
         status: 'offline',
@@ -644,9 +720,10 @@ export async function syncFirebaseUserToSupabaseProfile(
   fbUser: User,
   context?: GoogleSignInContext
 ): Promise<FirebaseProfileSyncResult> {
-  const [idToken, mapping] = await Promise.all([
+  const [idToken, mapping, firestoreProfile] = await Promise.all([
     fbUser.getIdToken(true),
     resolveCanonicalFirebaseMapping(fbUser, context),
+    fetchUserProfileFromFirestore(fbUser.uid).catch(() => null),
   ]);
 
   let canonicalUser: AuthUser;
@@ -655,11 +732,11 @@ export async function syncFirebaseUserToSupabaseProfile(
   try {
     const synced = await apiClient.firebaseSync({
       idToken,
-      fullName: mapping.fullName,
-      department: mapping.department,
-      semester: mapping.semester,
-      collegeName: mapping.collegeName,
-      rollNumber: mapping.rollNumber,
+      fullName: firestoreProfile?.fullName || mapping.fullName,
+      department: firestoreProfile?.department || mapping.department,
+      semester: firestoreProfile?.semester || mapping.semester,
+      collegeName: firestoreProfile?.collegeName || mapping.collegeName,
+      rollNumber: firestoreProfile?.rollNumber || mapping.rollNumber,
       authProvider: mapping.authProvider,
     });
 
@@ -667,7 +744,7 @@ export async function syncFirebaseUserToSupabaseProfile(
       throw new Error('Server issued an invalid or expired session token.');
     }
 
-    canonicalUser = {
+    const baseSynced: AuthUser = {
       ...synced.user,
       id: synced.user.id || mapping.canonicalProfileId,
       email: synced.user.email || mapping.email || fbUser.email || '',
@@ -676,19 +753,19 @@ export async function syncFirebaseUserToSupabaseProfile(
       firebaseUid: synced.user.firebaseUid || mapping.firebaseUid,
       authProvider: synced.user.authProvider || mapping.authProvider,
     };
+    canonicalUser = mergeFirestoreProfileOntoUser(baseSynced, firestoreProfile, fbUser);
     sessionToken = synced.token;
   } catch (syncErr) {
     // Resilient fallback: Firebase Auth ALREADY authenticated this user (Google/Facebook).
-    // Never bounce the user back to the logged-out screen due to a transient backend sync hiccup;
-    // keep them signed in using their verified Firebase ID token (which the backend accepts directly)
-    // and let subsequent requests / profile edits reconcile cleanly.
+    // Keep them signed in using their verified Firebase ID token and Cloud Firestore profile
+    // so both preview and statically published deployments work seamlessly.
     console.warn(
       '[Firebase Auth] /api/auth/firebase-sync fallback active:',
       syncErr instanceof Error ? syncErr.message : syncErr
     );
     const now = new Date().toISOString();
-    const cached = getCachedAuthUser(mapping.canonicalProfileId);
-    canonicalUser = {
+    const cached = getCachedAuthUser(mapping.canonicalProfileId) || getCachedAuthUser(fbUser.uid);
+    const fallbackUser: AuthUser = {
       id: cached?.id || mapping.canonicalProfileId,
       firebaseUid: mapping.firebaseUid,
       authProvider: mapping.authProvider,
@@ -711,11 +788,17 @@ export async function syncFirebaseUserToSupabaseProfile(
       createdAt: cached?.createdAt || now,
       updatedAt: now,
     };
+    canonicalUser = mergeFirestoreProfileOntoUser(fallbackUser, firestoreProfile, fbUser);
     sessionToken = idToken;
   }
 
   setStoredToken(sessionToken);
   setCachedAuthUser(canonicalUser);
+
+  // Initialize Cloud Firestore profile document for brand-new verified users
+  if (!firestoreProfile && isVerifiedFirebaseSession()) {
+    void syncUserProfileToFirestore(canonicalUser).catch(() => {});
+  }
 
   // Best-effort client-side Supabase profile reconciliation when an active Supabase session exists
   if (isSupabaseConfigured && supabase && UUID_REGEX.test(canonicalUser.id)) {

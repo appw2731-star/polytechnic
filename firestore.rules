@@ -23,7 +23,10 @@ service cloud.firestore {
     }
 
     function isVerifiedUser() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isSignedIn() && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.firebase.sign_in_provider == 'facebook.com'
+      );
     }
 
     function isValidId(id) {
@@ -35,10 +38,11 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isVerifiedUser() && (
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
-        request.auth.token.email == 'webrokib@gmail.com'
-      );
+      return isSignedIn() &&
+        request.auth.token.email_verified == true && (
+          exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+          request.auth.token.email == 'webrokib@gmail.com'
+        );
     }
 
     function isValidDepartment(dept) {
@@ -58,18 +62,84 @@ service cloud.firestore {
       ]) &&
       data.keys().hasOnly([
         'uid', 'fullName', 'email', 'department', 'semester',
-        'collegeName', 'rollNumber', 'bio', 'role', 'createdAt', 'updatedAt'
+        'collegeName', 'rollNumber', 'bio', 'avatarUrl', 'coverUrl',
+        'gender', 'showGender', 'profileVisibility', 'authProvider',
+        'role', 'createdAt', 'updatedAt'
       ]) &&
       isValidId(data.uid) &&
       data.uid == pathUserId &&
       data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 100 &&
-      data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+      data.email is string && data.email.size() <= 160 &&
       isValidDepartment(data.department) &&
       isValidSemester(data.semester) &&
       (!('collegeName' in data) || (data.collegeName is string && data.collegeName.size() <= 160)) &&
       (!('rollNumber' in data) || (data.rollNumber is string && data.rollNumber.size() <= 40)) &&
       (!('bio' in data) || (data.bio is string && data.bio.size() <= 400)) &&
+      (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 250000)) &&
+      (!('coverUrl' in data) || (data.coverUrl is string && data.coverUrl.size() <= 350000)) &&
+      (!('gender' in data) || (data.gender in ['', 'male', 'female'])) &&
+      (!('showGender' in data) || data.showGender is bool) &&
+      (!('profileVisibility' in data) || (data.profileVisibility in ['public', 'department', 'private'])) &&
+      (!('authProvider' in data) || (data.authProvider in ['google', 'facebook', 'email'])) &&
       (data.role == 'student' || data.role == 'admin') &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidPublicProfile(data, pathUserId) {
+      return data.keys().hasAll([
+        'uid', 'fullName', 'department', 'semester', 'role', 'profileVisibility', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid', 'fullName', 'department', 'semester',
+        'collegeName', 'bio', 'avatarUrl', 'coverUrl',
+        'role', 'profileVisibility', 'updatedAt'
+      ]) &&
+      isValidId(data.uid) &&
+      data.uid == pathUserId &&
+      data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 100 &&
+      isValidDepartment(data.department) &&
+      isValidSemester(data.semester) &&
+      (!('collegeName' in data) || (data.collegeName is string && data.collegeName.size() <= 160)) &&
+      (!('bio' in data) || (data.bio is string && data.bio.size() <= 400)) &&
+      (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 250000)) &&
+      (!('coverUrl' in data) || (data.coverUrl is string && data.coverUrl.size() <= 350000)) &&
+      (data.role == 'student' || data.role == 'admin') &&
+      (data.profileVisibility in ['public', 'department', 'private']) &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidCommunityPost(data, postId) {
+      return data.keys().hasAll([
+        'id', 'authorId', 'authorName', 'department', 'semester',
+        'title', 'body', 'likedByUserIds', 'replies', 'isHidden',
+        'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'authorId', 'authorName', 'authorAvatarUrl', 'authorCollegeName',
+        'authorDepartment', 'authorRole', 'department', 'semester', 'subjectTag',
+        'title', 'body', 'imageUrl', 'likedByUserIds', 'replies', 'isHidden',
+        'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == postId &&
+      isValidId(data.authorId) &&
+      data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 100 &&
+      (!('authorAvatarUrl' in data) || (data.authorAvatarUrl is string && data.authorAvatarUrl.size() <= 250000)) &&
+      (!('authorCollegeName' in data) || (data.authorCollegeName is string && data.authorCollegeName.size() <= 160)) &&
+      (!('authorDepartment' in data) || isValidDepartment(data.authorDepartment)) &&
+      (!('authorRole' in data) || (data.authorRole == 'student' || data.authorRole == 'admin')) &&
+      isValidDepartment(data.department) &&
+      isValidSemester(data.semester) &&
+      (!('subjectTag' in data) || (data.subjectTag is string && data.subjectTag.size() <= 60)) &&
+      data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+      data.body is string && data.body.size() <= 4000 &&
+      (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 450000)) &&
+      data.likedByUserIds is list && data.likedByUserIds.size() <= 500 &&
+      (data.likedByUserIds.size() == 0 || data.likedByUserIds[0] is string) &&
+      data.replies is list && data.replies.size() <= 100 &&
+      (data.replies.size() == 0 || data.replies[0] is map) &&
+      data.isHidden is bool &&
       data.createdAt is timestamp &&
       data.updatedAt is timestamp;
     }
@@ -144,6 +214,107 @@ service cloud.firestore {
     }
 
     // -----------------------------------------------------------------------
+    // Collection: /publicProfiles/{userId} (Non-PII Split Collection)
+    // -----------------------------------------------------------------------
+    match /publicProfiles/{userId} {
+      allow get: if isValidId(userId) && (existing().profileVisibility != 'private' || isOwner(userId) || isAdmin());
+      allow list: if existing().profileVisibility != 'private' || isAdmin();
+
+      allow create: if isVerifiedUser() &&
+        isValidId(userId) &&
+        isValidPublicProfile(incoming(), userId) &&
+        incoming().updatedAt == request.time &&
+        (
+          (isOwner(userId) && incoming().role == 'student') ||
+          isAdmin()
+        );
+
+      allow update: if isVerifiedUser() &&
+        isValidId(userId) &&
+        isValidPublicProfile(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            isOwner(userId) &&
+            incoming().role == existing().role &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'department', 'semester', 'collegeName', 'bio',
+              'avatarUrl', 'coverUrl', 'profileVisibility', 'updatedAt'
+            ])
+          ) ||
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'department', 'semester', 'collegeName', 'bio',
+              'avatarUrl', 'coverUrl', 'profileVisibility', 'role', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /communityPosts/{postId}
+    // -----------------------------------------------------------------------
+    match /communityPosts/{postId} {
+      allow get: if isValidId(postId) && (existing().isHidden == false || isOwner(existing().authorId) || isAdmin());
+      allow list: if existing().isHidden == false || isAdmin();
+
+      allow create: if isVerifiedUser() &&
+        isValidId(postId) &&
+        isValidCommunityPost(incoming(), postId) &&
+        incoming().authorId == request.auth.uid &&
+        incoming().isHidden == false &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().authorRole == 'student' ||
+          isAdmin()
+        );
+
+      allow update: if isVerifiedUser() &&
+        isValidId(postId) &&
+        isValidCommunityPost(incoming(), postId) &&
+        incoming().id == existing().id &&
+        incoming().authorId == existing().authorId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Action 1: Author edits own post or propagates profile updates
+          (
+            isOwner(existing().authorId) &&
+            incoming().isHidden == existing().isHidden &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'title', 'body', 'subjectTag', 'department', 'semester', 'imageUrl',
+              'authorName', 'authorAvatarUrl', 'authorCollegeName', 'authorDepartment',
+              'updatedAt'
+            ])
+          ) ||
+          // Action 2: Authenticated student likes or replies
+          (
+            existing().isHidden == false &&
+            incoming().isHidden == existing().isHidden &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'likedByUserIds', 'replies', 'updatedAt'
+            ])
+          ) ||
+          // Action 3: Admin moderation
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'isHidden', 'title', 'body', 'likedByUserIds', 'replies', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerifiedUser() &&
+        isValidId(postId) &&
+        (isOwner(existing().authorId) || isAdmin());
+    }
+
+    // -----------------------------------------------------------------------
     // Collection: /users/{userId} (PII Isolated)
     // -----------------------------------------------------------------------
     match /users/{userId} {
@@ -171,13 +342,17 @@ service cloud.firestore {
             isOwner(userId) &&
             incoming().role == existing().role &&
             incoming().diff(existing()).affectedKeys().hasOnly([
-              'fullName', 'department', 'semester', 'collegeName', 'rollNumber', 'bio', 'updatedAt'
+              'fullName', 'department', 'semester', 'collegeName', 'rollNumber', 'bio',
+              'avatarUrl', 'coverUrl', 'gender', 'showGender', 'profileVisibility', 'authProvider',
+              'updatedAt'
             ])
           ) ||
           (
             isAdmin() &&
             incoming().diff(existing()).affectedKeys().hasOnly([
-              'fullName', 'department', 'semester', 'collegeName', 'rollNumber', 'bio', 'role', 'updatedAt'
+              'fullName', 'department', 'semester', 'collegeName', 'rollNumber', 'bio',
+              'avatarUrl', 'coverUrl', 'gender', 'showGender', 'profileVisibility', 'authProvider',
+              'role', 'updatedAt'
             ])
           )
         );

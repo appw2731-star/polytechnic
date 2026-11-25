@@ -3,9 +3,22 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import os from 'os';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DATA_DIR = path.resolve(__dirname, '..', '.data');
+const DATA_DIR = (() => {
+  const preferred = path.resolve(__dirname, '..', '.data');
+  try {
+    fs.mkdirSync(preferred, { recursive: true });
+    fs.accessSync(preferred, fs.constants.W_OK);
+    return preferred;
+  } catch {
+    const tmpDir = path.join(os.tmpdir(), 'polytechnic_hub_data');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    return tmpDir;
+  }
+})();
 const DB_FILE = path.join(DATA_DIR, 'polytechnic_hub.json');
 
 export type UserRole = 'student' | 'admin';

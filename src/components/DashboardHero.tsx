@@ -43,6 +43,11 @@ export interface DashboardHeroProps {
 }
 
 const CUSTOM_COLLEGE_VALUE = '__CUSTOM_POLYTECHNIC__';
+const PLACEHOLDER_COLLEGES = new Set([
+  'পলিটেকনিক ইনস্টিটিউট যোগ করুন',
+  'আপনার পলিটেকনিক ইনস্টিটিউট যোগ করুন',
+  'Add your Polytechnic Institute',
+]);
 
 export const DashboardHero: React.FC<DashboardHeroProps> = ({
   initialName = 'শিক্ষার্থী',
@@ -70,7 +75,7 @@ export const DashboardHero: React.FC<DashboardHeroProps> = ({
     isKnownInstitute ? institute : CUSTOM_COLLEGE_VALUE
   );
   const [customCollegeDraft, setCustomCollegeDraft] = useState(
-    isKnownInstitute ? '' : institute
+    isKnownInstitute || PLACEHOLDER_COLLEGES.has(institute) ? '' : institute
   );
   const [draftDepartment, setDraftDepartment] = useState<DepartmentId>(initialDepartment);
   const [draftSemester, setDraftSemester] = useState<SemesterNumber>(initialSemester);
@@ -91,7 +96,7 @@ export const DashboardHero: React.FC<DashboardHeroProps> = ({
     if (!isEditingAcademic) {
       const known = BANGLADESH_POLYTECHNICS.some((p) => p.nameBn === collegeName);
       setSelectedPreset(known ? collegeName : CUSTOM_COLLEGE_VALUE);
-      setCustomCollegeDraft(known ? '' : collegeName);
+      setCustomCollegeDraft(known || PLACEHOLDER_COLLEGES.has(collegeName) ? '' : collegeName);
     }
   }, [collegeName, isEditingAcademic]);
 
@@ -138,11 +143,29 @@ export const DashboardHero: React.FC<DashboardHeroProps> = ({
     try {
       const result = await onUpdateHeroProfile(partial);
       if (result && result.error) {
+        setName(initialName);
+        setInstitute(collegeName);
+        setDepartment(initialDepartment);
+        setSemester(initialSemester);
+        setAvatarUrl(initialAvatarUrl);
         setStatusError(result.error);
       } else {
+        if (result?.user) {
+          if (result.user.fullName) setName(result.user.fullName);
+          const committedCollege = result.user.collegeName || result.user.instituteName;
+          if (committedCollege) setInstitute(committedCollege);
+          if (result.user.department) setDepartment(result.user.department as DepartmentId);
+          if (result.user.semester) setSemester(result.user.semester as SemesterNumber);
+          if (result.user.avatarUrl !== undefined) setAvatarUrl(result.user.avatarUrl);
+        }
         showTransientSaved(successLabel);
       }
     } catch (err) {
+      setName(initialName);
+      setInstitute(collegeName);
+      setDepartment(initialDepartment);
+      setSemester(initialSemester);
+      setAvatarUrl(initialAvatarUrl);
       setStatusError(err instanceof Error ? err.message : 'তথ্য সংরক্ষণে সমস্যা হয়েছে।');
     } finally {
       setSaving(false);
@@ -532,7 +555,9 @@ export const DashboardHero: React.FC<DashboardHeroProps> = ({
                     onClick={() => {
                       const known = BANGLADESH_POLYTECHNICS.some((p) => p.nameBn === institute);
                       setSelectedPreset(known ? institute : CUSTOM_COLLEGE_VALUE);
-                      setCustomCollegeDraft(known ? '' : institute);
+                      setCustomCollegeDraft(
+                        known || PLACEHOLDER_COLLEGES.has(institute) ? '' : institute
+                      );
                       setDraftDepartment(department);
                       setDraftSemester(semester);
                       setPolyQuery('');

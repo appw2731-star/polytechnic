@@ -18,8 +18,6 @@
         },
         "email": {
           "type": "string",
-          "format": "email",
-          "minLength": 3,
           "maxLength": 160
         },
         "department": {
@@ -44,6 +42,29 @@
           "type": "string",
           "maxLength": 400
         },
+        "avatarUrl": {
+          "type": "string",
+          "maxLength": 250000
+        },
+        "coverUrl": {
+          "type": "string",
+          "maxLength": 350000
+        },
+        "gender": {
+          "type": "string",
+          "enum": ["", "male", "female"]
+        },
+        "showGender": {
+          "type": "boolean"
+        },
+        "profileVisibility": {
+          "type": "string",
+          "enum": ["public", "department", "private"]
+        },
+        "authProvider": {
+          "type": "string",
+          "enum": ["google", "facebook", "email"]
+        },
         "role": {
           "type": "string",
           "enum": ["student", "admin"]
@@ -64,6 +85,169 @@
         "department",
         "semester",
         "role",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PublicProfile": {
+      "title": "PublicProfile",
+      "description": "Non-PII public profile card (no email or rollNumber) displayed in Student Community.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100
+        },
+        "department": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "semester": {
+          "type": "integer"
+        },
+        "collegeName": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "bio": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "avatarUrl": {
+          "type": "string",
+          "maxLength": 250000
+        },
+        "coverUrl": {
+          "type": "string",
+          "maxLength": 350000
+        },
+        "role": {
+          "type": "string",
+          "enum": ["student", "admin"]
+        },
+        "profileVisibility": {
+          "type": "string",
+          "enum": ["public", "department", "private"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "fullName",
+        "department",
+        "semester",
+        "role",
+        "profileVisibility",
+        "updatedAt"
+      ]
+    },
+    "CommunityPost": {
+      "title": "CommunityPost",
+      "description": "Student Community post with optional compressed image, likes, and replies.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "authorAvatarUrl": {
+          "type": "string",
+          "maxLength": 250000
+        },
+        "authorCollegeName": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "authorDepartment": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "authorRole": {
+          "type": "string",
+          "enum": ["student", "admin"]
+        },
+        "department": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "semester": {
+          "type": "integer"
+        },
+        "subjectTag": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "imageUrl": {
+          "type": "string",
+          "maxLength": 450000
+        },
+        "likedByUserIds": {
+          "type": "array"
+        },
+        "replies": {
+          "type": "array"
+        },
+        "isHidden": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "authorId",
+        "authorName",
+        "department",
+        "semester",
+        "title",
+        "body",
+        "likedByUserIds",
+        "replies",
+        "isHidden",
         "createdAt",
         "updatedAt"
       ]
@@ -220,7 +404,15 @@
   "firestore": {
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/UserProfile" },
-      "description": "Owner-isolated student profile documents containing PII (email, rollNumber)."
+      "description": "Owner-isolated student profile documents containing PII (email, rollNumber) and custom avatar/cover."
+    },
+    "/publicProfiles/{userId}": {
+      "schema": { "$ref": "#/entities/PublicProfile" },
+      "description": "Non-PII split-collection student profile cards (avatar, cover, college, department, bio) for Community."
+    },
+    "/communityPosts/{postId}": {
+      "schema": { "$ref": "#/entities/CommunityPost" },
+      "description": "Student Community posts with likes and replies persisted across all published environments."
     },
     "/users/{userId}/studyNotes/{noteId}": {
       "schema": { "$ref": "#/entities/PersonalStudyNote" },

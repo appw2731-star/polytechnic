@@ -204,7 +204,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       setProfileTab('about');
     }
 
-    const syncKey = `${currentUser.id}:${currentUser.updatedAt || ''}:${currentUser.fullName}:${currentUser.department}:${currentUser.semester}`;
+    const syncKey = `${currentUser.id}:${currentUser.updatedAt || ''}:${currentUser.fullName}:${currentUser.department}:${currentUser.semester}:${currentUser.collegeName || ''}:${(currentUser.coverUrl || '').length}:${(currentUser.avatarUrl || '').length}`;
     if (lastSyncedUserKeyRef.current === syncKey) return;
     lastSyncedUserKeyRef.current = syncKey;
 
@@ -226,14 +226,17 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       setMyPosts([]);
       return;
     }
+    const ownIds = new Set(
+      [currentUser.id, currentUser.firebaseUid].filter((x): x is string => Boolean(x))
+    );
     setPostsLoading(true);
     try {
-      const res = await apiClient.getPublicProfile(currentUser.id);
-      setMyPosts(res.posts || []);
+      const all = await apiClient.getCommunityPosts(false);
+      setMyPosts(all.posts.filter((p) => ownIds.has(p.authorId)));
     } catch {
       try {
-        const all = await apiClient.getCommunityPosts(false);
-        setMyPosts(all.posts.filter((p) => p.authorId === currentUser.id));
+        const res = await apiClient.getPublicProfile(currentUser.firebaseUid || currentUser.id);
+        setMyPosts(res.posts || []);
       } catch {
         // Offline or unavailable
       }
@@ -568,11 +571,17 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setUploadingAvatar(true);
     setErrorMsg(null);
     try {
-      const dataUrl = await compressImageFile(file, { maxWidth: 280, maxHeight: 280, quality: 0.84 });
+      const dataUrl = await compressImageFile(file, {
+        maxWidth: 280,
+        maxHeight: 280,
+        quality: 0.8,
+        maxChars: 220000,
+      });
       const res = await apiClient.updateProfile({ avatarUrl: dataUrl });
-      setEditAvatarUrl(res.user.avatarUrl || dataUrl);
-      applyProfileUpdated(res.user);
-      onUpdateLocalSettings({ avatarDataUrl: dataUrl });
+      const finalAvatar = res.user.avatarUrl || dataUrl;
+      setEditAvatarUrl(finalAvatar);
+      applyProfileUpdated({ ...res.user, avatarUrl: finalAvatar });
+      onUpdateLocalSettings({ avatarDataUrl: finalAvatar });
       setSuccessMsg(bi(language, 'প্রোফাইল ছবি আপডেট হয়েছে!', 'Profile photo updated!'));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Avatar upload failed');
@@ -586,14 +595,37 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     setUploadingCover(true);
     setErrorMsg(null);
     try {
-      const dataUrl = await compressImageFile(file, { maxWidth: 1100, maxHeight: 420, quality: 0.8 });
+      const dataUrl = await compressImageFile(file, {
+        maxWidth: 960,
+        maxHeight: 360,
+        quality: 0.76,
+        maxChars: 320000,
+      });
       const res = await apiClient.updateProfile({ coverUrl: dataUrl });
-      setEditCoverUrl(res.user.coverUrl || dataUrl);
-      applyProfileUpdated(res.user);
-      onUpdateLocalSettings({ coverDataUrl: dataUrl });
+      const finalCover = res.user.coverUrl || dataUrl;
+      setEditCoverUrl(finalCover);
+      applyProfileUpdated({ ...res.user, coverUrl: finalCover });
+      onUpdateLocalSettings({ coverDataUrl: finalCover });
       setSuccessMsg(bi(language, 'কভার ফটো আপডেট হয়েছে!', 'Cover photo updated!'));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Cover upload failed');
+    } finally {
+      setUploadingCover(false);
+    }
+  };
+
+  const handleRemoveCoverPhoto = async () => {
+    if (!currentUser || !editCoverUrl) return;
+    setUploadingCover(true);
+    setErrorMsg(null);
+    try {
+      const res = await apiClient.updateProfile({ coverUrl: '' });
+      setEditCoverUrl('');
+      applyProfileUpdated({ ...res.user, coverUrl: '' });
+      onUpdateLocalSettings({ coverDataUrl: '' });
+      setSuccessMsg(bi(language, 'কভার ফটো মুছে ফেলা হয়েছে।', 'Cover photo removed.'));
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not remove cover photo');
     } finally {
       setUploadingCover(false);
     }
@@ -603,7 +635,12 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     if (!file) return;
     setErrorMsg(null);
     try {
-      const dataUrl = await compressImageFile(file, { maxWidth: 960, maxHeight: 960, quality: 0.78 });
+      const dataUrl = await compressImageFile(file, {
+        maxWidth: 840,
+        maxHeight: 840,
+        quality: 0.74,
+        maxChars: 420000,
+      });
       setPostImage(dataUrl);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Could not attach image');
@@ -823,21 +860,40 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                 type="file"
                 accept="image/*"
                 className="hidden"
-                onChange={(e) => void handleCoverUpload(e.target.files?.[0] ?? null)}
+                onChange={(e) => {
+                  void handleCoverUpload(e.target.files?.[0] ?? null);
+                  e.target.value = '';
+                }}
               />
-              <button
-                type="button"
-                disabled={uploadingCover}
-                onClick={() => coverInputRef.current?.click()}
-                className="absolute bottom-3 right-3 min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-slate-950/75 hover:bg-slate-950/90 text-white text-xs font-semibold backdrop-blur-xs border border-white/15"
-              >
-                <Camera className="w-3.5 h-3.5" />
-                <span>
-                  {uploadingCover
-                    ? bi(language, 'আপলোড হচ্ছে...', 'Uploading...')
-                    : bi(language, 'কভার ফটো পরিবর্তন', 'Edit Cover Photo')}
-                </span>
-              </button>
+              <div className="absolute bottom-3 right-3 flex items-center gap-2">
+                {editCoverUrl && (
+                  <button
+                    type="button"
+                    disabled={uploadingCover}
+                    onClick={() => void handleRemoveCoverPhoto()}
+                    title={bi(language, 'কভার ফটো মুছুন', 'Remove Cover Photo')}
+                    className="min-h-[38px] inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-slate-950/75 hover:bg-red-600/90 text-white text-xs font-semibold backdrop-blur-xs border border-white/15"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">{bi(language, 'মুছুন', 'Remove')}</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={uploadingCover}
+                  onClick={() => coverInputRef.current?.click()}
+                  className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-slate-950/75 hover:bg-slate-950/90 text-white text-xs font-semibold backdrop-blur-xs border border-white/15"
+                >
+                  <Camera className="w-3.5 h-3.5" />
+                  <span>
+                    {uploadingCover
+                      ? bi(language, 'আপলোড হচ্ছে...', 'Uploading...')
+                      : editCoverUrl
+                        ? bi(language, 'কভার ফটো পরিবর্তন', 'Edit Cover Photo')
+                        : bi(language, 'কভার ফটো যোগ করুন', 'Add Cover Photo')}
+                  </span>
+                </button>
+              </div>
             </div>
 
             {/* Avatar + Name + Action Row */}
@@ -859,7 +915,10 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                       type="file"
                       accept="image/*"
                       className="hidden"
-                      onChange={(e) => void handleAvatarUpload(e.target.files?.[0] ?? null)}
+                      onChange={(e) => {
+                        void handleAvatarUpload(e.target.files?.[0] ?? null);
+                        e.target.value = '';
+                      }}
                     />
                     <button
                       type="button"
@@ -1170,7 +1229,9 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                 ) : (
                   myPosts.map((post) => {
                     const likes = post.likedByUserIds || [];
-                    const hasLiked = likes.includes(currentUser.id);
+                    const hasLiked =
+                      likes.includes(currentUser.id) ||
+                      Boolean(currentUser.firebaseUid && likes.includes(currentUser.firebaseUid));
                     return (
                       <article
                         key={post.id}
@@ -1279,6 +1340,80 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
               <h3 className="text-base font-bold text-slate-900 dark:text-white">
                 {bi(language, 'প্রোফাইল ও প্রাইভেসি তথ্য হালনাগাদ', 'Update Profile & Privacy')}
               </h3>
+
+              {/* Cover Photo & Profile Photo Customization Card */}
+              <div className="rounded-2xl bg-slate-50 dark:bg-slate-900/75 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-bold text-slate-900 dark:text-white">
+                      {bi(language, 'কভার ফটো ও প্রোফাইল ছবি', 'Cover Photo & Profile Photo')}
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      {bi(
+                        language,
+                        'যেকোনো JPG/PNG ছবি বাছুন — স্বয়ংক্রিয়ভাবে অপ্টিমাইজ হয়ে ক্লাউডে সংরক্ষিত হবে।',
+                        'Choose any JPG/PNG photo — automatically optimized and saved to cloud.'
+                      )}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="relative h-28 sm:h-32 w-full rounded-xl overflow-hidden bg-gradient-to-br from-[#0f172a] via-[#134e6f] to-[#0e7490] border border-slate-200 dark:border-slate-700">
+                  {editCoverUrl ? (
+                    <img
+                      src={editCoverUrl}
+                      alt={bi(language, 'কভার ফটো প্রিভিউ', 'Cover photo preview')}
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-xs text-white/80 font-medium">
+                      {bi(language, 'এখনো কোনো কভার ফটো যুক্ত হয়নি', 'No cover photo added yet')}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={uploadingCover}
+                    onClick={() => coverInputRef.current?.click()}
+                    className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-bold"
+                  >
+                    <Camera className="w-3.5 h-3.5" />
+                    <span>
+                      {uploadingCover
+                        ? bi(language, 'আপলোড হচ্ছে...', 'Uploading...')
+                        : editCoverUrl
+                          ? bi(language, 'কভার ফটো পরিবর্তন', 'Change Cover Photo')
+                          : bi(language, 'কভার ফটো আপলোড করুন', 'Upload Cover Photo')}
+                    </span>
+                  </button>
+                  {editCoverUrl && (
+                    <button
+                      type="button"
+                      disabled={uploadingCover}
+                      onClick={() => void handleRemoveCoverPhoto()}
+                      className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 hover:bg-red-500/10 text-xs font-semibold"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>{bi(language, 'কভার মুছুন', 'Remove Cover')}</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={uploadingAvatar}
+                    onClick={() => avatarInputRef.current?.click()}
+                    className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 text-xs font-semibold"
+                  >
+                    <ImagePlus className="w-3.5 h-3.5 text-cyan-500" />
+                    <span>
+                      {uploadingAvatar
+                        ? bi(language, 'আপলোড হচ্ছে...', 'Uploading...')
+                        : bi(language, 'প্রোফাইল ছবি পরিবর্তন', 'Change Profile Photo')}
+                    </span>
+                  </button>
+                </div>
+              </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                 {(currentUser.email || connectedProviderLabel) && (

@@ -154,9 +154,10 @@ export const CommunityView: React.FC<CommunityViewProps> = ({
     if (!file) return;
     try {
       const dataUrl = await compressImageFile(file, {
-        maxWidth: 960,
-        maxHeight: 960,
-        quality: 0.78,
+        maxWidth: 840,
+        maxHeight: 840,
+        quality: 0.74,
+        maxChars: 420000,
       });
       setPostImage(dataUrl);
     } catch (err) {
@@ -287,7 +288,11 @@ export const CommunityView: React.FC<CommunityViewProps> = ({
   };
 
   const handleOpenAuthorProfile = async (userId: string) => {
-    if (currentUser && currentUser.id === userId) {
+    if (
+      currentUser &&
+      (currentUser.id === userId ||
+        (currentUser.firebaseUid && currentUser.firebaseUid === userId))
+    ) {
       onNavigate('profile');
       return;
     }
@@ -589,10 +594,18 @@ export const CommunityView: React.FC<CommunityViewProps> = ({
             const authorBio = authorProfile?.bio || '';
 
             const postDeptLabel = DEPARTMENTS.find((d) => d.id === post.department);
-            const canDelete =
-              currentUser && (currentUser.id === post.authorId || currentUser.role === 'admin');
+            const canDelete = Boolean(
+              currentUser &&
+                (currentUser.id === post.authorId ||
+                  (currentUser.firebaseUid && currentUser.firebaseUid === post.authorId) ||
+                  currentUser.role === 'admin')
+            );
             const likedUsers = post.likedByUserIds || [];
-            const isLiked = Boolean(currentUser && likedUsers.includes(currentUser.id));
+            const isLiked = Boolean(
+              currentUser &&
+                (likedUsers.includes(currentUser.id) ||
+                  (currentUser.firebaseUid && likedUsers.includes(currentUser.firebaseUid)))
+            );
             const showDistinctTitle =
               post.title &&
               post.body &&

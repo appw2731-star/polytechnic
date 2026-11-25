@@ -1,6 +1,16 @@
 import { auth as firebaseAuth } from '../firebase';
 import { getActiveAccessToken } from '../lib/supabaseClient';
 import {
+  createCommunityPostInFirestore,
+  deleteCommunityPostInFirestore,
+  fetchCommunityPostsFromFirestore,
+  fetchPublicProfileFromFirestore,
+  isVerifiedFirebaseSession,
+  replyCommunityPostInFirestore,
+  syncUserProfileToFirestore,
+  toggleLikeCommunityPostInFirestore,
+} from './firestoreService';
+import {
   AdminAiConfig,
   AdminPushDashboardData,
   AdminUsageMetrics,
@@ -25,6 +35,68 @@ import {
 } from '../types/study';
 
 const TOKEN_STORAGE_KEY = 'polytechnic_hub_auth_token_v1';
+const CACHED_USER_STORAGE_KEY = 'polytechnic_hub_cached_user_v1';
+
+function readCachedUserSnapshot(): AuthUser | null {
+  try {
+    const raw = window.localStorage.getItem(CACHED_USER_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as AuthUser;
+      if (parsed && typeof parsed.id === 'string' && parsed.id) {
+        return parsed;
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  const fbUser = firebaseAuth?.currentUser;
+  if (!fbUser) return null;
+  const email = (fbUser.email || fbUser.providerData?.[0]?.email || '').trim().toLowerCase();
+  const isFacebook = fbUser.providerData?.some((p) => p.providerId === 'facebook.com');
+  const now = new Date().toISOString();
+  return {
+    id: fbUser.uid,
+    firebaseUid: fbUser.uid,
+    authProvider: isFacebook ? 'facebook' : 'google',
+    fullName: fbUser.displayName?.trim() || (email ? email.split('@')[0] : 'Student'),
+    email,
+    role: fbUser.emailVerified && email === 'webrokib@gmail.com' ? 'admin' : 'student',
+    avatarUrl: fbUser.photoURL?.trim() || '',
+    coverUrl: '',
+    gender: '',
+    showGender: false,
+    bio: '',
+    department: 'power',
+    semester: 4,
+    collegeName: '',
+    instituteName: '',
+    rollNumber: '',
+    profileVisibility: 'public',
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function writeCachedUserSnapshot(user: AuthUser): void {
+  try {
+    window.localStorage.setItem(CACHED_USER_STORAGE_KEY, JSON.stringify(user));
+  } catch {
+    // ignore
+  }
+}
+
+function mergePostsById(primary: CommunityPost[], secondary: CommunityPost[]): CommunityPost[] {
+  const byId = new Map<string, CommunityPost>();
+  for (const post of secondary) {
+    if (post?.id) byId.set(post.id, post);
+  }
+  for (const post of primary) {
+    if (post?.id) byId.set(post.id, post);
+  }
+  return Array.from(byId.values()).sort((a, b) =>
+    (b.createdAt || '').localeCompare(a.createdAt || '')
+  );
+}
 
 export interface BootstrapResponse {
   notices: PlatformNotice[];
@@ -114,6 +186,21 @@ async function recoverFirebaseSessionToken(): Promise<string | null> {
   }
 }
 
+async function parseJsonApiResponse<T>(res: Response): Promise<T> {
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    throw new ApiError(
+      res.ok ? 'Backend API is unavailable on this host.' : `Request failed (${res.status})`,
+      res.ok ? 503 : res.status
+    );
+  }
+  const data = (await res.json().catch(() => ({}))) as T & { error?: string };
+  if (!res.ok) {
+    throw new ApiError(data.error || `Request failed (${res.status})`, res.status);
+  }
+  return data;
+}
+
 async function apiRequest<T>(path: string, init: RequestInit = {}, allowAuthRetry = true): Promise<T> {
   const token = await getUnifiedAuthToken();
   const headers: Record<string, string> = {
@@ -133,19 +220,11 @@ async function apiRequest<T>(path: string, init: RequestInit = {}, allowAuthRetr
         Authorization: `Bearer ${recoveredToken}`,
       };
       const retryRes = await fetch(path, { ...init, headers: retryHeaders });
-      const retryData = (await retryRes.json().catch(() => ({}))) as T & { error?: string };
-      if (!retryRes.ok) {
-        throw new ApiError(retryData.error || `Request failed (${retryRes.status})`, retryRes.status);
-      }
-      return retryData;
+      return parseJsonApiResponse<T>(retryRes);
     }
   }
 
-  const data = (await res.json().catch(() => ({}))) as T & { error?: string };
-  if (!res.ok) {
-    throw new ApiError(data.error || `Request failed (${res.status})`, res.status);
-  }
-  return data;
+  return parseJsonApiResponse<T>(res);
 }
 
 export const apiClient = {
@@ -206,7 +285,7 @@ export const apiClient = {
     return apiRequest('/api/auth/me');
   },
 
-  updateProfile(
+  async updateProfile(
     payload: Partial<
       Pick<
         AuthUser,
@@ -224,11 +303,84 @@ export const apiClient = {
         | 'coverUrl'
       >
     >
-  ): Promise<{ user: AuthUser }> {
-    return apiRequest('/api/auth/profile', {
-      method: 'PATCH',
-      body: JSON.stringify(payload),
-    });
+  ): Promise<{ user: AuthUser; syncedToSupabase?: boolean }> {
+    const baseSnapshot = readCachedUserSnapshot();
+    const nowIso = new Date().toISOString();
+    const resolvedCollege =
+      payload.collegeName !== undefined
+        ? payload.collegeName
+        : payload.instituteName !== undefined
+          ? payload.instituteName
+          : baseSnapshot?.collegeName || baseSnapshot?.instituteName || '';
+
+    const optimisticUser: AuthUser | null = baseSnapshot
+      ? {
+          ...baseSnapshot,
+          ...payload,
+          fullName:
+            payload.fullName !== undefined ? payload.fullName.trim() : baseSnapshot.fullName,
+          collegeName: resolvedCollege,
+          instituteName: resolvedCollege,
+          avatarUrl:
+            payload.avatarUrl !== undefined ? payload.avatarUrl : baseSnapshot.avatarUrl,
+          coverUrl:
+            payload.coverUrl !== undefined ? payload.coverUrl : baseSnapshot.coverUrl,
+          firebaseUid: baseSnapshot.firebaseUid || firebaseAuth?.currentUser?.uid || undefined,
+          updatedAt: nowIso,
+        }
+      : null;
+
+    const canSyncFirestore = Boolean(optimisticUser && isVerifiedFirebaseSession());
+
+    const [serverRes, firestoreRes] = await Promise.allSettled([
+      apiRequest<{ user: AuthUser; syncedToSupabase?: boolean }>('/api/auth/profile', {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      }),
+      canSyncFirestore && optimisticUser
+        ? syncUserProfileToFirestore(optimisticUser)
+        : Promise.resolve(),
+    ]);
+
+    if (serverRes.status === 'fulfilled' && serverRes.value?.user) {
+      const mergedUser: AuthUser = {
+        ...serverRes.value.user,
+        firebaseUid:
+          serverRes.value.user.firebaseUid ||
+          optimisticUser?.firebaseUid ||
+          firebaseAuth?.currentUser?.uid ||
+          undefined,
+        coverUrl:
+          payload.coverUrl !== undefined
+            ? payload.coverUrl
+            : serverRes.value.user.coverUrl || optimisticUser?.coverUrl || '',
+        avatarUrl:
+          payload.avatarUrl !== undefined
+            ? payload.avatarUrl
+            : serverRes.value.user.avatarUrl || optimisticUser?.avatarUrl || '',
+      };
+      writeCachedUserSnapshot(mergedUser);
+      if (isVerifiedFirebaseSession() && firestoreRes.status === 'rejected') {
+        void syncUserProfileToFirestore(mergedUser).catch(() => {});
+      }
+      return {
+        user: mergedUser,
+        syncedToSupabase: Boolean(serverRes.value.syncedToSupabase),
+      };
+    }
+
+    if (canSyncFirestore && optimisticUser && firestoreRes.status === 'fulfilled') {
+      writeCachedUserSnapshot(optimisticUser);
+      return { user: optimisticUser, syncedToSupabase: false };
+    }
+
+    if (serverRes.status === 'rejected') {
+      throw serverRes.reason;
+    }
+    if (firestoreRes.status === 'rejected') {
+      throw firestoreRes.reason;
+    }
+    throw new Error('প্রোফাইল আপডেট করা যায়নি। আবার চেষ্টা করুন।');
   },
 
   ensureProfile(payload?: {
@@ -249,11 +401,43 @@ export const apiClient = {
     });
   },
 
-  getPublicProfile(userId: string): Promise<{
+  async getPublicProfile(userId: string): Promise<{
     profile: PublicStudentProfile;
     posts: CommunityPost[];
   }> {
-    return apiRequest(`/api/users/${encodeURIComponent(userId)}/public-profile`);
+    const [fsRes, apiRes] = await Promise.allSettled([
+      fetchPublicProfileFromFirestore(userId),
+      apiRequest<{ profile: PublicStudentProfile; posts: CommunityPost[] }>(
+        `/api/users/${encodeURIComponent(userId)}/public-profile`
+      ),
+    ]);
+
+    const fsData = fsRes.status === 'fulfilled' ? fsRes.value : null;
+    const apiData = apiRes.status === 'fulfilled' ? apiRes.value : null;
+
+    if (fsData && apiData) {
+      const mergedPosts = mergePostsById(fsData.posts, apiData.posts);
+      return {
+        profile: {
+          ...apiData.profile,
+          fullName: fsData.profile.fullName || apiData.profile.fullName,
+          avatarUrl: fsData.profile.avatarUrl || apiData.profile.avatarUrl,
+          coverUrl: fsData.profile.coverUrl || apiData.profile.coverUrl,
+          bio: fsData.profile.bio || apiData.profile.bio,
+          collegeName: fsData.profile.collegeName || apiData.profile.collegeName,
+          department: fsData.profile.department || apiData.profile.department,
+          semester: fsData.profile.semester || apiData.profile.semester,
+          postsCount: mergedPosts.length,
+        },
+        posts: mergedPosts,
+      };
+    }
+
+    if (fsData) return fsData;
+    if (apiData) return apiData;
+
+    if (apiRes.status === 'rejected') throw apiRes.reason;
+    throw new Error('প্রোফাইল পাওয়া যায়নি।');
   },
 
   // Community
@@ -277,12 +461,24 @@ export const apiClient = {
     return apiRequest(`/api/community/profiles?ids=${q}`);
   },
 
-  getCommunityPosts(includeHidden = false): Promise<{ posts: CommunityPost[] }> {
+  async getCommunityPosts(includeHidden = false): Promise<{ posts: CommunityPost[] }> {
     const q = includeHidden ? '?includeHidden=1' : '';
-    return apiRequest(`/api/community/posts${q}`);
+    const [fsRes, apiRes] = await Promise.allSettled([
+      fetchCommunityPostsFromFirestore(includeHidden),
+      apiRequest<{ posts: CommunityPost[] }>(`/api/community/posts${q}`),
+    ]);
+
+    const fsPosts = fsRes.status === 'fulfilled' ? fsRes.value : [];
+    const apiPosts = apiRes.status === 'fulfilled' ? apiRes.value.posts || [] : [];
+
+    if (fsRes.status === 'rejected' && apiRes.status === 'rejected') {
+      throw apiRes.reason;
+    }
+
+    return { posts: mergePostsById(fsPosts, apiPosts) };
   },
 
-  createCommunityPost(payload: {
+  async createCommunityPost(payload: {
     title?: string;
     body: string;
     imageUrl?: string;
@@ -290,19 +486,46 @@ export const apiClient = {
     semester: number;
     subjectTag?: string;
   }): Promise<{ post: CommunityPost }> {
+    if (isVerifiedFirebaseSession()) {
+      const authorSnapshot = readCachedUserSnapshot();
+      if (authorSnapshot) {
+        const post = await createCommunityPostInFirestore(authorSnapshot, payload);
+        return { post };
+      }
+    }
+
     return apiRequest('/api/community/posts', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
   },
 
-  toggleLikeCommunityPost(postId: string): Promise<{ post: CommunityPost }> {
+  async toggleLikeCommunityPost(postId: string): Promise<{ post: CommunityPost }> {
+    if (isVerifiedFirebaseSession()) {
+      try {
+        const post = await toggleLikeCommunityPostInFirestore(postId);
+        return { post };
+      } catch {
+        // Fallback to Express backend for legacy non-Firestore posts
+      }
+    }
     return apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/like`, {
       method: 'POST',
     });
   },
 
-  replyCommunityPost(postId: string, body: string): Promise<{ post: CommunityPost }> {
+  async replyCommunityPost(postId: string, body: string): Promise<{ post: CommunityPost }> {
+    if (isVerifiedFirebaseSession()) {
+      const authorSnapshot = readCachedUserSnapshot();
+      if (authorSnapshot) {
+        try {
+          const post = await replyCommunityPostInFirestore(postId, authorSnapshot, body);
+          return { post };
+        } catch {
+          // Fallback to Express backend for legacy non-Firestore posts
+        }
+      }
+    }
     return apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/reply`, {
       method: 'POST',
       body: JSON.stringify({ body }),
@@ -315,7 +538,19 @@ export const apiClient = {
     });
   },
 
-  deleteCommunityPost(postId: string): Promise<{ deleted: boolean }> {
+  async deleteCommunityPost(postId: string): Promise<{ deleted: boolean }> {
+    if (isVerifiedFirebaseSession()) {
+      const [fsDel, apiDel] = await Promise.allSettled([
+        deleteCommunityPostInFirestore(postId),
+        apiRequest<{ deleted: boolean }>(`/api/community/posts/${encodeURIComponent(postId)}`, {
+          method: 'DELETE',
+        }),
+      ]);
+      if (fsDel.status === 'fulfilled' || apiDel.status === 'fulfilled') {
+        return { deleted: true };
+      }
+      throw fsDel.reason;
+    }
     return apiRequest(`/api/community/posts/${encodeURIComponent(postId)}`, {
       method: 'DELETE',
     });

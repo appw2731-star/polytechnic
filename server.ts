@@ -38,7 +38,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
-const isProduction = process.env.NODE_ENV === 'production';
+const DIST_DIR = path.resolve(__dirname, 'dist');
+const isProduction =
+  process.env.NODE_ENV === 'production' ||
+  Boolean(process.env.K_SERVICE) ||
+  (process.env.npm_lifecycle_event !== 'dev' && fs.existsSync(path.join(DIST_DIR, 'index.html')));
 const SERVER_STARTED_AT = Date.now();
 const PRIMARY_ADMIN_EMAIL = (process.env.ADMIN_EMAIL?.trim() || 'webrokib@gmail.com').toLowerCase();
 
@@ -618,7 +622,7 @@ function mapSupabaseProfileRow(row: Record<string, unknown>): PublicUser {
 
 async function createServer() {
   const app = express();
-  app.use(express.json({ limit: '5mb' }));
+  app.use(express.json({ limit: '10mb' }));
 
   dbStore.load();
 
@@ -1401,9 +1405,17 @@ async function createServer() {
 
     const finalUser = updated ?? auth;
 
+    let syncedToSupabase = false;
+
     if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && !finalUser.id.startsWith('usr-')) {
       try {
-        const sbBody: Record<string, unknown> = {
+        const sbHeaders = {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=representation',
+        };
+        const sbFullBody: Record<string, unknown> = {
           id: finalUser.id,
           email: finalUser.email,
           full_name: finalUser.fullName,
@@ -1420,40 +1432,116 @@ async function createServer() {
           updated_at: finalUser.updatedAt,
         };
         if (finalUser.firebaseUid) {
-          sbBody.firebase_uid = finalUser.firebaseUid;
+          sbFullBody.firebase_uid = finalUser.firebaseUid;
         }
-        const patchRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(finalUser.id)}`,
-          {
-            method: 'PATCH',
-            headers: {
-              apikey: SUPABASE_SERVICE_ROLE_KEY,
-              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-              'Content-Type': 'application/json',
-              Prefer: 'return=representation',
-            },
-            body: JSON.stringify(sbBody),
+        const sbCoreBody: Record<string, unknown> = {
+          id: finalUser.id,
+          email: finalUser.email,
+          full_name: finalUser.fullName,
+          department: finalUser.department,
+          semester: finalUser.semester,
+          college_name: finalUser.collegeName,
+          avatar_url: finalUser.avatarUrl,
+          updated_at: finalUser.updatedAt,
+        };
+
+        const patchSupabaseByFilter = async (
+          filterQuery: string,
+          payloadBody: Record<string, unknown>
+        ): Promise<{ ok: boolean; count: number; status: number }> => {
+          const patchRes = await fetch(
+            `${SUPABASE_URL.replace(/\/+$/, '')}/rest/v1/profiles?${filterQuery}`,
+            {
+              method: 'PATCH',
+              headers: sbHeaders,
+              body: JSON.stringify(payloadBody),
+            }
+          );
+          if (!patchRes.ok) {
+            return { ok: false, count: 0, status: patchRes.status };
           }
+          const rows = (await patchRes.json().catch(() => [])) as unknown[];
+          return { ok: true, count: Array.isArray(rows) ? rows.length : 0, status: patchRes.status };
+        };
+
+        // 1. Try PATCH by canonical id (retry with core columns on 400 schema mismatch)
+        let patchOutcome = await patchSupabaseByFilter(
+          `id=eq.${encodeURIComponent(finalUser.id)}`,
+          sbFullBody
         );
-        const patchedRows = patchRes.ok ? ((await patchRes.json().catch(() => [])) as unknown[]) : [];
-        if (!patchRes.ok || patchedRows.length === 0) {
-          await fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=id`, {
-            method: 'POST',
-            headers: {
-              apikey: SUPABASE_SERVICE_ROLE_KEY,
-              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-              'Content-Type': 'application/json',
-              Prefer: 'resolution=merge-duplicates',
-            },
-            body: JSON.stringify(sbBody),
-          }).catch(() => {});
+        if (!patchOutcome.ok && patchOutcome.status === 400) {
+          patchOutcome = await patchSupabaseByFilter(
+            `id=eq.${encodeURIComponent(finalUser.id)}`,
+            sbCoreBody
+          );
+        }
+
+        if (patchOutcome.ok && patchOutcome.count > 0) {
+          syncedToSupabase = true;
+        }
+
+        // 2. If 0 rows matched by id, try matching existing row by firebase_uid or email (avoids unique email conflict)
+        if (!syncedToSupabase && finalUser.firebaseUid) {
+          const { id: _ignoredId, ...noIdFull } = sbFullBody;
+          const byFb = await patchSupabaseByFilter(
+            `firebase_uid=eq.${encodeURIComponent(finalUser.firebaseUid)}`,
+            noIdFull
+          );
+          if (byFb.ok && byFb.count > 0) {
+            syncedToSupabase = true;
+          }
+        }
+
+        if (!syncedToSupabase && finalUser.email) {
+          const { id: _ignoredId, ...noIdFull } = sbFullBody;
+          const { id: _ignoredCoreId, ...noIdCore } = sbCoreBody;
+          let byEmail = await patchSupabaseByFilter(
+            `email=ilike.${encodeURIComponent(finalUser.email)}`,
+            noIdFull
+          );
+          if (!byEmail.ok && byEmail.status === 400) {
+            byEmail = await patchSupabaseByFilter(
+              `email=ilike.${encodeURIComponent(finalUser.email)}`,
+              noIdCore
+            );
+          }
+          if (byEmail.ok && byEmail.count > 0) {
+            syncedToSupabase = true;
+          }
+        }
+
+        // 3. If row still does not exist, upsert cleanly (with core column fallback)
+        if (!syncedToSupabase) {
+          const upsertHeaders = {
+            ...sbHeaders,
+            Prefer: 'resolution=merge-duplicates,return=representation',
+          };
+          let upsertRes = await fetch(
+            `${SUPABASE_URL.replace(/\/+$/, '')}/rest/v1/profiles?on_conflict=id`,
+            {
+              method: 'POST',
+              headers: upsertHeaders,
+              body: JSON.stringify(sbFullBody),
+            }
+          );
+          if (!upsertRes.ok && upsertRes.status === 400) {
+            upsertRes = await fetch(
+              `${SUPABASE_URL.replace(/\/+$/, '')}/rest/v1/profiles?on_conflict=id`,
+              {
+                method: 'POST',
+                headers: upsertHeaders,
+                body: JSON.stringify(sbCoreBody),
+              }
+            );
+          }
+          syncedToSupabase = upsertRes.ok;
         }
       } catch {
         // local dbStore remains consistent if Supabase network request fails
       }
     }
 
-    res.json({ user: finalUser });
+    res.json({ user: finalUser, syncedToSupabase });
   });
 
   // =========================================================================
