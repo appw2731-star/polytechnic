@@ -206,6 +206,8 @@ export default function App() {
   const [swUpdateHandler, setSwUpdateHandler] = useState<(() => void) | null>(null);
 
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const currentUserRef = useRef<AuthUser | null>(null);
+  currentUserRef.current = currentUser;
   const languageRef = useRef(state.settings.language);
   languageRef.current = state.settings.language;
   const settingsRef = useRef(state.settings);
@@ -516,14 +518,30 @@ export default function App() {
 
     const hydrateUnifiedAuth = async () => {
       try {
-        // 1. Complete any pending Firebase Google OAuth redirect (mobile / popup-blocked)
+        // 1. Complete any pending Firebase Google/Facebook OAuth redirect (popup-blocked fallback)
         try {
           const redirectCred = await consumeGoogleRedirectResult();
           if (redirectCred?.syncedUser && mounted) {
+            const u = redirectCred.syncedUser;
             setStoredToken(redirectCred.token);
-            setCachedAuthUser(redirectCred.syncedUser);
-            setCurrentUser(redirectCred.syncedUser);
-            const ensuredUser = await verifyHydratedSupabaseProfile(redirectCred.syncedUser);
+            setCachedAuthUser(u);
+            setCurrentUser(u);
+            setState((prev) => ({
+              ...prev,
+              settings: {
+                ...prev.settings,
+                studentName: u.fullName || prev.settings.studentName,
+                collegeName: u.collegeName || u.instituteName || '',
+                avatarDataUrl: u.avatarUrl || prev.settings.avatarDataUrl,
+                coverDataUrl: u.coverUrl || prev.settings.coverDataUrl,
+                department: (u.department as DepartmentId) || prev.settings.department,
+                semester: (u.semester as SemesterNumber) || prev.settings.semester,
+              },
+            }));
+            if (!u.collegeName && !u.instituteName) {
+              setActiveView('profile');
+            }
+            const ensuredUser = await verifyHydratedSupabaseProfile(u);
             if (mounted) {
               void syncSupabaseUserContext(ensuredUser);
             }
@@ -532,7 +550,7 @@ export default function App() {
         } catch (err) {
           if (mounted) {
             setInAppToast({
-              title: 'Google Sign-In',
+              title: 'Sign-In',
               body: formatFirebaseAuthError(err, languageRef.current),
               category: 'IMPORTANT',
               targetView: 'profile',
@@ -576,15 +594,29 @@ export default function App() {
 
     void hydrateUnifiedAuth();
 
-    // 4. Keep Firebase Auth state synchronized after initial hydration if token is missing or expired
+    // 4. Keep Firebase Auth state synchronized after initial hydration whenever React state lacks currentUser or token is invalid
     const unsubscribeFb = subscribeFirebaseAuth((fbUser) => {
       if (!mounted || hydrating || !fbUser) return;
-      if (isStoredTokenStructurallyValid(getStoredToken())) return;
+      if (currentUserRef.current && isStoredTokenStructurallyValid(getStoredToken())) return;
 
       void syncFirebaseUserToSupabaseProfile(fbUser)
         .then(async (synced) => {
           if (!mounted) return;
+          setStoredToken(synced.token);
+          setCachedAuthUser(synced.user);
           setCurrentUser(synced.user);
+          setState((prev) => ({
+            ...prev,
+            settings: {
+              ...prev.settings,
+              studentName: synced.user.fullName || prev.settings.studentName,
+              collegeName: synced.user.collegeName || synced.user.instituteName || prev.settings.collegeName,
+              avatarDataUrl: synced.user.avatarUrl || prev.settings.avatarDataUrl,
+              coverDataUrl: synced.user.coverUrl || prev.settings.coverDataUrl,
+              department: (synced.user.department as DepartmentId) || prev.settings.department,
+              semester: (synced.user.semester as SemesterNumber) || prev.settings.semester,
+            },
+          }));
           const ensuredUser = await verifyHydratedSupabaseProfile(synced.user);
           if (mounted) {
             void syncSupabaseUserContext(ensuredUser);
@@ -1179,7 +1211,7 @@ export default function App() {
     setCurrentUser(updatedUser);
     handleUpdateSettings({
       studentName: updatedUser.fullName,
-      collegeName: updatedUser.collegeName || updatedUser.instituteName || state.settings.collegeName,
+      collegeName: updatedUser.collegeName ?? updatedUser.instituteName ?? '',
       avatarDataUrl: updatedUser.avatarUrl || state.settings.avatarDataUrl,
       coverDataUrl: updatedUser.coverUrl || state.settings.coverDataUrl,
       department: (updatedUser.department as DepartmentId) || state.settings.department,
@@ -1195,7 +1227,7 @@ export default function App() {
     setCurrentUser(user);
     handleUpdateSettings({
       studentName: user.fullName,
-      collegeName: user.collegeName || user.instituteName || state.settings.collegeName,
+      collegeName: user.collegeName || user.instituteName || '',
       avatarDataUrl: user.avatarUrl || state.settings.avatarDataUrl,
       coverDataUrl: user.coverUrl || state.settings.coverDataUrl,
       department: (user.department as DepartmentId) || state.settings.department,
@@ -1205,7 +1237,7 @@ export default function App() {
       fullName: user.fullName || settingsRef.current.studentName,
       department: user.department || settingsRef.current.department,
       semester: user.semester || settingsRef.current.semester,
-      collegeName: user.collegeName || user.instituteName || settingsRef.current.collegeName,
+      collegeName: user.collegeName || user.instituteName || undefined,
       rollNumber: user.rollNumber || undefined,
     })
       .then((res) => {
@@ -1574,7 +1606,6 @@ export default function App() {
               onUpdateSettings={handleUpdateSettings}
               onUpdatePushPreferences={handleUpdatePushPreferences}
               onNavigate={setActiveView}
-              onResetDemo={() => setState(storageService.resetToDemo())}
               onClearAll={() => setState(storageService.clearAll())}
             />
           )}

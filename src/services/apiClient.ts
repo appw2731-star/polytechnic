@@ -182,6 +182,7 @@ export const apiClient = {
     semester?: number;
     collegeName?: string;
     rollNumber?: string;
+    authProvider?: 'google' | 'facebook' | 'email';
   }): Promise<{ token: string; user: AuthUser }> {
     return apiRequest('/api/auth/firebase-sync', {
       method: 'POST',

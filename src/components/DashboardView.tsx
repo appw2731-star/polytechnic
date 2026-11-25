@@ -264,12 +264,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     },
   ];
 
-  const displayName = currentUser?.fullName || state.settings.studentName || 'Rokib Hasan';
+  const displayName =
+    currentUser?.fullName ||
+    state.settings.studentName ||
+    bi(lang, 'পলিটেকনিক শিক্ষার্থী', 'Polytechnic Student');
   const displayCollege =
     currentUser?.collegeName ||
     currentUser?.instituteName ||
     state.settings.collegeName ||
-    'ঢাকা পলিটেকনিক ইনস্টিটিউট';
+    bi(lang, 'আপনার পলিটেকনিক ইনস্টিটিউট যোগ করুন', 'Add your Polytechnic Institute');
   const displayAvatar = currentUser?.avatarUrl || state.settings.avatarDataUrl || '';
 
   return (

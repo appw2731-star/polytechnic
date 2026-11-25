@@ -28,6 +28,7 @@ export interface DbUser {
   rollNumber: string;
   profileVisibility: 'public' | 'department' | 'private';
   firebaseUid?: string;
+  authProvider?: 'google' | 'facebook' | 'email';
   isDisabled?: boolean;
   createdAt: string;
   updatedAt: string;
@@ -334,6 +335,7 @@ export interface TokenPayload {
   department?: string;
   semester?: number;
   firebaseUid?: string;
+  authProvider?: 'google' | 'facebook' | 'email';
 }
 
 export function signAuthToken(user: DbUser): string {
@@ -346,6 +348,7 @@ export function signAuthToken(user: DbUser): string {
     department: user.department,
     semester: user.semester,
     firebaseUid: user.firebaseUid,
+    authProvider: user.authProvider,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
@@ -377,49 +380,11 @@ function createInitialDb(): DatabaseSchema {
   const now = new Date().toISOString();
   return {
     users: [],
-    notices: [
-      {
-        id: 'notice-bteb-probidhan',
-        title: 'BTEB প্রবিধান-২০২২ ও অফিশিয়াল ওয়েবসাইট পোর্টাল',
-        body: 'ডিপ্লোমা-ইন-ইঞ্জিনিয়ারিং প্রবিধান-২০২২ অনুযায়ী সিলেবাস ও একাডেমিক বিজ্ঞপ্তির জন্য বাংলাদেশ কারিগরি শিক্ষা বোর্ডের (BTEB) অফিশিয়াল ওয়েবসাইট অনুসরণ করুন। আপনার ব্যক্তিগত PDF সমূহ "আমার PDF লাইব্রেরি" তে নিরাপদে সংরক্ষণ করুন।',
-        category: 'general',
-        officialLink: 'https://bteb.gov.bd/',
-        pinned: true,
-        createdAt: now,
-      },
-      {
-        id: 'notice-bteb-result-portal',
-        title: 'BTEB অফিশিয়াল রেজাল্ট যাচাই নির্দেশিকা',
-        body: 'যেকোনো সেমিস্টার পরীক্ষার ফলাফল দেখতে Polytechnic Hub-এর BTEB Result সেকশন ব্যবহার করে সরাসরি অফিশিয়াল রেজাল্ট পোর্টালে (result.bteb.gov.bd) রোল ও রেগুলেশন দিয়ে যাচাই করুন।',
-        category: 'result',
-        officialLink: 'https://result.bteb.gov.bd/result-search',
-        pinned: false,
-        createdAt: now,
-      },
-    ],
+    notices: [],
     sharedNotes: [],
     userPdfs: [],
     mcqs: [],
-    communityPosts: [
-      {
-        id: 'post-welcome-power',
-        authorId: 'system-guide',
-        authorName: 'Polytechnic Hub Editorial',
-        authorDepartment: 'power',
-        authorRole: 'admin',
-        department: 'power',
-        semester: 4,
-        subjectTag: '27141 — IC Engine',
-        title: 'ফোর-স্ট্রোক ডিজেল ইঞ্জিনে ভালভ ওভারল্যাপ (Valve Overlap) কেন রাখা হয়?',
-        body: 'পাওয়ার টেকনোলজির শিক্ষার্থীদের জন্য পরীক্ষার একটি গুরুত্বপূর্ণ প্রশ্ন: Exhaust স্ট্রোকের শেষ প্রান্তে এবং Suction স্ট্রোকের শুরুতে ইনলেট ও এগজস্ট ভালভ কিছু ডিগ্রি একসাথে খোলা থাকে। এতে সিলিন্ডার থেকে পোড়া গ্যাস সম্পূর্ণ বের হতে (Scavenging) সাহায্য করে। আপনাদের প্র্যাকটিক্যাল ক্লাসের অভিজ্ঞতা বা প্রশ্ন এখানে শেয়ার করুন।',
-        authorCollegeName: 'Polytechnic Hub Editorial',
-        likedByUserIds: [],
-        reportsCount: 0,
-        isHidden: false,
-        replies: [],
-        createdAt: now,
-      },
-    ],
+    communityPosts: [],
     customFormulas: [],
     deletedFormulaIds: [],
     deviceTokens: [],

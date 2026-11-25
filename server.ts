@@ -40,6 +40,11 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 const SERVER_STARTED_AT = Date.now();
+const PRIMARY_ADMIN_EMAIL = (process.env.ADMIN_EMAIL?.trim() || 'webrokib@gmail.com').toLowerCase();
+
+function isPrimaryAdminEmail(email?: string | null): boolean {
+  return Boolean(email && email.trim().toLowerCase() === PRIMARY_ADMIN_EMAIL);
+}
 
 const SUPABASE_URL = (process.env.VITE_SUPABASE_URL || '').trim().replace(/\/+$/, '');
 const SUPABASE_ANON_KEY = (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
@@ -230,8 +235,7 @@ async function verifySupabaseToken(token: string): Promise<PublicUser | null> {
       // profiles table may not exist yet; continue with defaults
     }
 
-    const adminEnvEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-    if (adminEnvEmail && authUser.email?.toLowerCase() === adminEnvEmail) {
+    if (isPrimaryAdminEmail(authUser.email)) {
       profileRole = 'admin';
     }
 
@@ -296,12 +300,24 @@ interface VerifiedFirebaseClaims {
   emailVerified: boolean;
   name: string;
   picture: string;
+  provider: 'google' | 'facebook' | 'email';
 }
 
+const ACCEPTED_FIREBASE_PROJECT_IDS = Array.from(
+  new Set(
+    [
+      FIREBASE_PROJECT_ID,
+      String(FIREBASE_APPLET_CONFIG.projectId || '').trim(),
+      (process.env.VITE_FIREBASE_PROJECT_ID || '').trim(),
+      (process.env.FIREBASE_PROJECT_ID || '').trim(),
+    ].filter(Boolean)
+  )
+);
+
 async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFirebaseClaims | null> {
-  if (!FIREBASE_PROJECT_ID) {
+  if (ACCEPTED_FIREBASE_PROJECT_IDS.length === 0) {
     throw new Error(
-      'Server VITE_FIREBASE_PROJECT_ID (or FIREBASE_PROJECT_ID) is not configured for Firebase token verification.'
+      'Server VITE_FIREBASE_PROJECT_ID (or firebase-applet-config.json) is not configured for Firebase token verification.'
     );
   }
   const parts = idToken.split('.');
@@ -348,9 +364,21 @@ async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFirebaseC
   const sub = String(payload.sub || '');
 
   if (!sub || sub.length > 128) return null;
-  if (aud !== FIREBASE_PROJECT_ID) return null;
-  if (iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) return null;
+  if (!ACCEPTED_FIREBASE_PROJECT_IDS.includes(aud)) return null;
+  if (iss !== `https://securetoken.google.com/${aud}`) return null;
   if (exp <= nowSec || iat > nowSec + 300) return null;
+
+  const fbMeta =
+    payload.firebase && typeof payload.firebase === 'object'
+      ? (payload.firebase as { sign_in_provider?: string })
+      : {};
+  const signInProvider = String(fbMeta.sign_in_provider || '').toLowerCase();
+  const provider: 'google' | 'facebook' | 'email' =
+    signInProvider === 'facebook.com'
+      ? 'facebook'
+      : signInProvider === 'google.com'
+        ? 'google'
+        : 'email';
 
   return {
     uid: sub,
@@ -358,6 +386,7 @@ async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFirebaseC
     emailVerified: Boolean(payload.email_verified),
     name: String(payload.name || ''),
     picture: String(payload.picture || ''),
+    provider,
   };
 }
 
@@ -400,20 +429,25 @@ async function resolveBearerUser(
     }
 
     // Re-hydrate user cleanly when the token signature is valid (e.g., after container restart)
-    if (localPayload.email) {
+    if (localPayload.email || localPayload.firebaseUid) {
       const now = new Date().toISOString();
       const hydrated = dbStore.mutate((draft) => {
         const existing = draft.users.find(
           (u) =>
             u.id === localPayload.sub ||
-            u.email.toLowerCase() === localPayload.email!.toLowerCase()
+            (localPayload.firebaseUid && u.firebaseUid === localPayload.firebaseUid) ||
+            (localPayload.email && u.email && u.email.toLowerCase() === localPayload.email.toLowerCase())
         );
         if (existing) return existing;
         const created: DbUser = {
           id: localPayload.sub,
           firebaseUid: localPayload.firebaseUid,
-          fullName: localPayload.fullName?.trim() || localPayload.email!.split('@')[0] || 'Student',
-          email: localPayload.email!.trim().toLowerCase(),
+          authProvider: localPayload.authProvider,
+          fullName:
+            localPayload.fullName?.trim() ||
+            (localPayload.email ? localPayload.email.split('@')[0] : '') ||
+            'Student',
+          email: (localPayload.email || '').trim().toLowerCase(),
           passwordHash: '',
           role: localPayload.role === 'admin' ? 'admin' : 'student',
           avatarUrl: '',
@@ -440,31 +474,44 @@ async function resolveBearerUser(
     }
   }
 
-  // Direct Firebase ID token support (eliminates 401s for Gmail/Firebase users across refreshes or restarts)
-  if (token.split('.').length === 3 && FIREBASE_PROJECT_ID) {
+  // Direct Firebase ID token support (eliminates 401s for Google/Facebook Firebase users across refreshes or restarts)
+  if (token.split('.').length === 3 && ACCEPTED_FIREBASE_PROJECT_IDS.length > 0) {
     try {
       const fbClaims = await verifyFirebaseIdToken(token);
-      if (fbClaims && fbClaims.email) {
-        const adminEnvEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+      if (fbClaims && fbClaims.uid) {
+        const isVerifiedPrimaryAdmin = Boolean(
+          fbClaims.emailVerified && isPrimaryAdminEmail(fbClaims.email)
+        );
         const now = new Date().toISOString();
         const fbUser = dbStore.mutate((draft) => {
           let existing =
             draft.users.find((u) => u.firebaseUid === fbClaims.uid) ??
-            draft.users.find((u) => u.email.toLowerCase() === fbClaims.email);
+            (fbClaims.email
+              ? draft.users.find((u) => u.email && u.email.toLowerCase() === fbClaims.email)
+              : undefined);
           if (existing) {
             if (!existing.firebaseUid) existing.firebaseUid = fbClaims.uid;
-            if (!existing.email) existing.email = fbClaims.email;
+            if (!existing.email && fbClaims.email) existing.email = fbClaims.email;
+            if (!existing.authProvider) existing.authProvider = fbClaims.provider;
             if (!existing.avatarUrl && fbClaims.picture) existing.avatarUrl = fbClaims.picture;
+            if (isVerifiedPrimaryAdmin && existing.role !== 'admin') {
+              existing.role = 'admin';
+              existing.updatedAt = now;
+            }
             return existing;
           }
           const canonicalId = deterministicUuidFromFirebaseUid(fbClaims.uid);
           const created: DbUser = {
             id: canonicalId,
             firebaseUid: fbClaims.uid,
-            fullName: fbClaims.name?.trim() || fbClaims.email.split('@')[0] || 'Student',
-            email: fbClaims.email,
+            authProvider: fbClaims.provider,
+            fullName:
+              fbClaims.name?.trim() ||
+              (fbClaims.email ? fbClaims.email.split('@')[0] : '') ||
+              'Student',
+            email: fbClaims.email || '',
             passwordHash: '',
-            role: adminEnvEmail && fbClaims.email === adminEnvEmail ? 'admin' : 'student',
+            role: isVerifiedPrimaryAdmin ? 'admin' : 'student',
             avatarUrl: fbClaims.picture || '',
             coverUrl: '',
             gender: '',
@@ -596,10 +643,6 @@ async function createServer() {
   // =========================================================================
   app.get('/api/bootstrap', (_req: Request, res: Response) => {
     const db = dbStore.load();
-    let hasAdmin = db.users.some((u) => u.role === 'admin');
-    if (!hasAdmin && process.env.ADMIN_EMAIL) {
-      hasAdmin = true;
-    }
 
     res.json({
       notices: [...db.notices].sort(
@@ -610,7 +653,7 @@ async function createServer() {
       customFormulas: db.customFormulas,
       deletedFormulaIds: db.deletedFormulaIds,
       appConfig: db.appConfig,
-      hasAdmin,
+      hasAdmin: true,
     });
   });
 
@@ -642,6 +685,12 @@ async function createServer() {
     }
 
     const normalizedEmail = email.trim().toLowerCase();
+    if (isPrimaryAdminEmail(normalizedEmail)) {
+      res.status(403).json({
+        error: 'এই অ্যাডমিন ইমেইল দিয়ে লগইন করতে অনুগ্রহ করে Google (Gmail) সাইন-ইন ব্যবহার করুন।',
+      });
+      return;
+    }
     const db = dbStore.load();
     if (db.users.some((u) => u.email.toLowerCase() === normalizedEmail)) {
       res.status(409).json({ error: 'এই ইমেইল দিয়ে ইতিমধ্যেই অ্যাকাউন্ট তৈরি করা আছে।' });
@@ -706,7 +755,8 @@ async function createServer() {
 
   // Unified Firebase Authentication -> Canonical Profile & Supabase Sync
   app.post('/api/auth/firebase-sync', async (req: Request, res: Response) => {
-    const { idToken, fullName, department, semester, collegeName, rollNumber } = req.body ?? {};
+    const { idToken, fullName, department, semester, collegeName, rollNumber, authProvider } =
+      req.body ?? {};
     if (typeof idToken !== 'string' || idToken.trim().length < 20) {
       res.status(400).json({ error: 'Valid Firebase ID token is required.' });
       return;
@@ -722,13 +772,19 @@ async function createServer() {
       return;
     }
 
-    if (!claims || !claims.email) {
+    if (!claims || !claims.uid) {
       res.status(401).json({ error: 'Invalid or expired Firebase session. Please sign in again.' });
       return;
     }
 
-    const normalizedEmail = claims.email;
-    const adminEnvEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+    const normalizedEmail = claims.email || '';
+    const resolvedProvider: 'google' | 'facebook' | 'email' =
+      authProvider === 'facebook' || authProvider === 'google' || authProvider === 'email'
+        ? authProvider
+        : claims.provider;
+    const isVerifiedPrimaryAdmin = Boolean(
+      claims.emailVerified && isPrimaryAdminEmail(normalizedEmail)
+    );
     const now = new Date().toISOString();
 
     let supabaseProfile: Record<string, unknown> | null = null;
@@ -746,7 +802,7 @@ async function createServer() {
           const rows = (await byUidRes.json()) as Record<string, unknown>[];
           if (rows[0]) supabaseProfile = rows[0];
         }
-        if (!supabaseProfile) {
+        if (!supabaseProfile && normalizedEmail) {
           const byEmailRes = await fetch(
             `${SUPABASE_URL}/rest/v1/profiles?email=ilike.${encodeURIComponent(normalizedEmail)}&select=*`,
             { headers }
@@ -768,7 +824,9 @@ async function createServer() {
     dbStore.mutate((draft) => {
       let existing =
         draft.users.find((u) => u.firebaseUid === claims!.uid) ??
-        draft.users.find((u) => u.email.toLowerCase() === normalizedEmail);
+        (normalizedEmail
+          ? draft.users.find((u) => u.email && u.email.toLowerCase() === normalizedEmail)
+          : undefined);
 
       if (existing?.isDisabled || supabaseProfile?.is_disabled === true) {
         disabledAccount = true;
@@ -779,19 +837,19 @@ async function createServer() {
       const canonicalId = String(
         supabaseProfile?.id || validExistingUuid || deterministicUuidFromFirebaseUid(claims!.uid)
       );
-      const resolvedRole: UserRole =
-        adminEnvEmail && normalizedEmail === adminEnvEmail
+      const resolvedRole: UserRole = isVerifiedPrimaryAdmin
+        ? 'admin'
+        : supabaseProfile?.role === 'admin' || existing?.role === 'admin'
           ? 'admin'
-          : supabaseProfile?.role === 'admin' || existing?.role === 'admin'
-            ? 'admin'
-            : 'student';
+          : 'student';
 
       const cleanDisplayName =
         existing?.fullName?.trim() ||
         (supabaseProfile?.full_name ? String(supabaseProfile.full_name).trim() : '') ||
+        claims!.name?.trim() ||
         (typeof fullName === 'string' && fullName.trim()) ||
-        claims!.name ||
-        normalizedEmail.split('@')[0];
+        (normalizedEmail ? normalizedEmail.split('@')[0] : '') ||
+        'Student';
 
       const cleanAvatar =
         existing?.avatarUrl ||
@@ -830,7 +888,8 @@ async function createServer() {
         const previousId = existing.id;
         existing.id = canonicalId;
         existing.firebaseUid = claims!.uid;
-        existing.email = normalizedEmail;
+        existing.authProvider = existing.authProvider || resolvedProvider;
+        if (normalizedEmail) existing.email = normalizedEmail;
         if (!existing.fullName?.trim()) existing.fullName = cleanDisplayName;
         existing.role = resolvedRole;
         if (!existing.avatarUrl && cleanAvatar) existing.avatarUrl = cleanAvatar;
@@ -858,6 +917,7 @@ async function createServer() {
         const created: DbUser = {
           id: canonicalId,
           firebaseUid: claims!.uid,
+          authProvider: resolvedProvider,
           fullName: cleanDisplayName,
           email: normalizedEmail,
           passwordHash: '',
@@ -976,18 +1036,14 @@ async function createServer() {
 
   app.post('/api/auth/bootstrap-admin', (req: Request, res: Response) => {
     const { fullName = 'Polytechnic Hub Admin', email, password, setupSecret } = req.body ?? {};
-    const db = dbStore.load();
-    const adminExists = db.users.some((u) => u.role === 'admin');
     const configuredSecret = process.env.ADMIN_SETUP_SECRET?.trim();
 
-    if (adminExists) {
-      if (!configuredSecret || setupSecret !== configuredSecret) {
-        res.status(403).json({
-          error:
-            'Admin account already exists. Ask an existing Admin to promote your role or supply ADMIN_SETUP_SECRET.',
-        });
-        return;
-      }
+    if (!configuredSecret || setupSecret !== configuredSecret) {
+      res.status(403).json({
+        error:
+          'Admin access is restricted to the designated owner Gmail account. Sign in with Google using the owner email.',
+      });
+      return;
     }
 
     if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {

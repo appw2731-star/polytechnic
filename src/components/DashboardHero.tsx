@@ -45,8 +45,8 @@ export interface DashboardHeroProps {
 const CUSTOM_COLLEGE_VALUE = '__CUSTOM_POLYTECHNIC__';
 
 export const DashboardHero: React.FC<DashboardHeroProps> = ({
-  initialName = 'Rokib Hasan',
-  collegeName = 'ঢাকা পলিটেকনিক ইনস্টিটিউট',
+  initialName = 'শিক্ষার্থী',
+  collegeName = 'পলিটেকনিক ইনস্টিটিউট যোগ করুন',
   initialDepartment = 'power',
   initialSemester = 4,
   initialAvatarUrl = '',

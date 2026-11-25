@@ -3,10 +3,15 @@ import {
   BookOpen,
   Building2,
   Camera,
+  Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Copy,
   Eye,
   EyeOff,
   GraduationCap,
+  HelpCircle,
   ImagePlus,
   KeyRound,
   Lock,
@@ -18,6 +23,7 @@ import {
   Send,
   Shield,
   ShieldCheck,
+  Sparkles,
   ThumbsUp,
   Trash2,
   UserPlus,
@@ -28,11 +34,13 @@ import { DEPARTMENTS, SEMESTER_LABELS, SEMESTER_LABELS_EN } from '../data/curric
 import { BANGLADESH_POLYTECHNICS } from '../data/polytechnics';
 import { bi } from '../i18n/translations';
 import {
+  FIREBASE_OAUTH_REDIRECT_URI,
   formatFirebaseAuthError,
   isFirebaseAuthConfigured,
   registerWithEmailFirebase,
   sendPasswordResetFirebase,
   signInWithEmailFirebase,
+  signInWithFacebookUnified,
   signInWithGoogleUnified,
   syncFirebaseUserToSupabaseProfile,
 } from '../lib/firebaseAuth';
@@ -65,11 +73,34 @@ interface ProfileAuthViewProps {
 }
 
 const DEFAULT_AVATAR = '/src/assets/images/student_scholar_avatar_1794839047562.jpg';
+const PROFILE_SETUP_DISMISSED_KEY = 'polytechnic_hub_profile_setup_dismissed_v1';
+
+function readDismissedSetupUserIds(): string[] {
+  try {
+    const raw = localStorage.getItem(PROFILE_SETUP_DISMISSED_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function markProfileSetupDismissed(userId: string): void {
+  try {
+    const existing = readDismissedSetupUserIds();
+    if (!existing.includes(userId)) {
+      localStorage.setItem(PROFILE_SETUP_DISMISSED_KEY, JSON.stringify([...existing, userId]));
+    }
+  } catch {
+    // ignore storage quota errors
+  }
+}
 
 export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   language,
   currentUser,
-  hasAdmin,
+  hasAdmin: _hasAdmin,
   localSettings,
   isPasswordRecovery,
   onClearPasswordRecovery,
@@ -78,18 +109,18 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   onLogout,
   onUpdateLocalSettings,
   onNavigate,
-  onAdminClaimed,
+  onAdminClaimed: _onAdminClaimed,
 }) => {
-  const [authTab, setAuthTab] = useState<'register' | 'login' | 'forgot' | 'claim-admin'>('register');
+  const [authTab, setAuthTab] = useState<'register' | 'login' | 'forgot'>('register');
   const [profileTab, setProfileTab] = useState<'posts' | 'about'>('posts');
 
-  // Auth form fields
-  const [fullName, setFullName] = useState(localSettings.studentName || '');
+  // Auth form fields — always start blank (zero demo pre-fill)
+  const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [department, setDepartment] = useState<DepartmentId>(localSettings.department);
   const [semester, setSemester] = useState<SemesterNumber>(localSettings.semester);
-  const [collegeName, setCollegeName] = useState(localSettings.collegeName || '');
+  const [collegeName, setCollegeName] = useState('');
   const [rollNumber, setRollNumber] = useState('');
   const [newPassword, setNewPassword] = useState('');
 
@@ -98,7 +129,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   const [editDept, setEditDept] = useState(currentUser?.department || localSettings.department);
   const [editSem, setEditSem] = useState(currentUser?.semester || localSettings.semester);
   const [editCollege, setEditCollege] = useState(
-    currentUser?.collegeName || currentUser?.instituteName || localSettings.collegeName || ''
+    currentUser?.collegeName || currentUser?.instituteName || ''
   );
   const [editRoll, setEditRoll] = useState(currentUser?.rollNumber || '');
   const [editBio, setEditBio] = useState(currentUser?.bio || '');
@@ -125,6 +156,12 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   const [posting, setPosting] = useState(false);
 
   const [loading, setLoading] = useState(false);
+  const [activeSocialProvider, setActiveSocialProvider] = useState<'google' | 'facebook' | null>(null);
+  const [showFacebookGuide, setShowFacebookGuide] = useState(false);
+  const [copiedRedirectUri, setCopiedRedirectUri] = useState(false);
+  const [setupDismissed, setSetupDismissed] = useState<boolean>(() =>
+    currentUser ? readDismissedSetupUserIds().includes(currentUser.id) : false
+  );
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
@@ -133,6 +170,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   const postImageInputRef = useRef<HTMLInputElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const lastSyncedUserKeyRef = useRef<string>('');
+  const autoOpenedSetupForUserRef = useRef<string>('');
 
   const applyProfileUpdated = useCallback(
     (updatedUser: AuthUser) => {
@@ -148,8 +186,24 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
   useEffect(() => {
     if (!currentUser) {
       lastSyncedUserKeyRef.current = '';
+      autoOpenedSetupForUserRef.current = '';
+      setSetupDismissed(false);
       return;
     }
+    const isDismissed = readDismissedSetupUserIds().includes(currentUser.id);
+    setSetupDismissed(isDismissed);
+
+    const hasInstitute = Boolean((currentUser.collegeName || currentUser.instituteName || '').trim());
+    if (
+      currentUser.firebaseUid &&
+      !hasInstitute &&
+      !isDismissed &&
+      autoOpenedSetupForUserRef.current !== currentUser.id
+    ) {
+      autoOpenedSetupForUserRef.current = currentUser.id;
+      setProfileTab('about');
+    }
+
     const syncKey = `${currentUser.id}:${currentUser.updatedAt || ''}:${currentUser.fullName}:${currentUser.department}:${currentUser.semester}`;
     if (lastSyncedUserKeyRef.current === syncKey) return;
     lastSyncedUserKeyRef.current = syncKey;
@@ -363,13 +417,9 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     }
 
     setLoading(true);
+    setActiveSocialProvider('google');
     try {
-      const outcome = await signInWithGoogleUnified({
-        department,
-        semester,
-        collegeName: collegeName.trim() || undefined,
-        rollNumber: rollNumber.trim() || undefined,
-      });
+      const outcome = await signInWithGoogleUnified();
       if (outcome.redirected) return;
       if (!outcome.syncedUser || !outcome.token) {
         throw new Error('Missing synced user profile after Google Sign-In.');
@@ -382,8 +432,8 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       setSuccessMsg(
         bi(
           language,
-          `Google (${outcome.syncedUser.email}) দিয়ে সাইন ইন হয়েছে! নিচে থেকে আপনার প্রোফাইল কাস্টমাইজ করুন।`,
-          `Signed in with Google (${outcome.syncedUser.email})! You can customize your profile below.`
+          `স্বাগতম ${outcome.syncedUser.fullName}! আপনার Google নাম ও ছবি যুক্ত হয়েছে — নিচে থেকে প্রোফাইল কাস্টমাইজ করতে বা স্কিপ করতে পারেন।`,
+          `Welcome ${outcome.syncedUser.fullName}! Your Google name & photo are imported — customize your profile below or skip for now.`
         )
       );
     } catch (err) {
@@ -402,7 +452,78 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
       }
     } finally {
       setLoading(false);
+      setActiveSocialProvider(null);
     }
+  };
+
+  const handleFacebookSignIn = async () => {
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    if (!isFirebaseAuthConfigured) {
+      setShowFacebookGuide(true);
+      setErrorMsg(
+        bi(
+          language,
+          'Facebook লগইন চালু করতে Firebase Authentication কনফিগার থাকতে হবে। নিচের সেটআপ গাইড দেখুন।',
+          'Firebase Authentication must be configured for Facebook Login. See the setup guide below.'
+        )
+      );
+      return;
+    }
+
+    setLoading(true);
+    setActiveSocialProvider('facebook');
+    try {
+      const outcome = await signInWithFacebookUnified();
+      if (outcome.redirected) return;
+      if (!outcome.syncedUser || !outcome.token) {
+        throw new Error('Missing synced user profile after Facebook Sign-In.');
+      }
+      setStoredToken(outcome.token);
+      onAuthSuccess(outcome.syncedUser);
+      if (!outcome.syncedUser.collegeName && !outcome.syncedUser.instituteName) {
+        setProfileTab('about');
+      }
+      setSuccessMsg(
+        bi(
+          language,
+          `স্বাগতম ${outcome.syncedUser.fullName}! আপনার Facebook নাম ও ছবি যুক্ত হয়েছে — নিচে থেকে প্রোফাইল কাস্টমাইজ করতে বা স্কিপ করতে পারেন।`,
+          `Welcome ${outcome.syncedUser.fullName}! Your Facebook name & photo are imported — customize your profile below or skip for now.`
+        )
+      );
+    } catch (err) {
+      const code =
+        err && typeof err === 'object' && 'code' in err ? String((err as { code?: string }).code) : '';
+      if (
+        code === 'auth/operation-not-allowed' ||
+        code === 'auth/configuration-not-found' ||
+        code === 'auth/unauthorized-domain'
+      ) {
+        setShowFacebookGuide(true);
+      }
+      setErrorMsg(formatFirebaseAuthError(err, language));
+    } finally {
+      setLoading(false);
+      setActiveSocialProvider(null);
+    }
+  };
+
+  const handleCopyRedirectUri = async () => {
+    try {
+      await navigator.clipboard.writeText(FIREBASE_OAUTH_REDIRECT_URI);
+      setCopiedRedirectUri(true);
+      window.setTimeout(() => setCopiedRedirectUri(false), 2000);
+    } catch {
+      // clipboard blocked
+    }
+  };
+
+  const handleSkipInitialSetup = () => {
+    if (currentUser) {
+      markProfileSetupDismissed(currentUser.id);
+    }
+    setSetupDismissed(true);
+    setProfileTab('posts');
   };
 
   const handleForgotPassword = async (e: React.FormEvent) => {
@@ -575,7 +696,10 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
         ...res.user,
         email: res.user.email || currentUser.email,
         firebaseUid: res.user.firebaseUid || currentUser.firebaseUid,
+        authProvider: res.user.authProvider || currentUser.authProvider,
       };
+      markProfileSetupDismissed(updatedUser.id);
+      setSetupDismissed(true);
       applyProfileUpdated(updatedUser);
 
       onUpdateLocalSettings({
@@ -586,36 +710,15 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
         avatarDataUrl: updatedUser.avatarUrl || editAvatarUrl || localSettings.avatarDataUrl,
         coverDataUrl: updatedUser.coverUrl || editCoverUrl || localSettings.coverDataUrl,
       });
-      setSuccessMsg(bi(language, 'প্রোফাইল কাস্টমাইজেশন সংরক্ষণ সম্পন্ন হয়েছে!', 'Profile changes saved!'));
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Profile update failed');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleClaimFirstAdmin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMsg(null);
-    setLoading(true);
-    try {
-      const res = await apiClient.bootstrapAdmin({
-        fullName,
-        email,
-        password,
-      });
-      setStoredToken(res.token);
-      onAuthSuccess(res.user);
-      onAdminClaimed();
       setSuccessMsg(
         bi(
           language,
-          'অ্যাডমিন অ্যাকাউন্ট তৈরি হয়েছে! এখন আপনি Admin Panel পরিচালনা করতে পারবেন।',
-          'Admin account initialized! You can now manage Polytechnic Hub.'
+          'প্রোফাইল কাস্টমাইজেশন সংরক্ষণ সম্পন্ন হয়েছে! এখন স্টুডেন্ট কমিউনিটিতে পোস্ট করতে পারবেন।',
+          'Profile changes saved! You can now post in Student Community.'
         )
       );
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Admin setup failed');
+      setErrorMsg(err instanceof Error ? err.message : 'Profile update failed');
     } finally {
       setLoading(false);
     }
@@ -625,6 +728,19 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
     (d) => d.id === (currentUser?.department || localSettings.department)
   );
   const currentSemNum = (currentUser?.semester || localSettings.semester) as SemesterNumber;
+  const connectedProviderLabel = currentUser
+    ? currentUser.authProvider === 'facebook'
+      ? 'Facebook'
+      : currentUser.authProvider === 'google' || currentUser.firebaseUid
+      ? 'Google'
+      : ''
+    : '';
+  const needsFirstTimeSetup = Boolean(
+    currentUser &&
+      !setupDismissed &&
+      currentUser.firebaseUid &&
+      !(currentUser.collegeName || currentUser.instituteName || '').trim()
+  );
 
   return (
     <div className="max-w-4xl mx-auto space-y-5">
@@ -637,14 +753,25 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
         </div>
       )}
       {successMsg && (
-        <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-700 dark:text-emerald-300 flex items-center justify-between gap-2">
+        <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-700 dark:text-emerald-300 flex flex-wrap items-center justify-between gap-2">
           <span className="flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 shrink-0" />
             <span>{successMsg}</span>
           </span>
-          <button type="button" onClick={() => setSuccessMsg(null)} aria-label="Close notice">
-            <X className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-2">
+            {currentUser && (
+              <button
+                type="button"
+                onClick={() => onNavigate('community')}
+                className="min-h-[34px] px-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold"
+              >
+                {bi(language, 'কমিউনিটিতে যান', 'Go to Community')}
+              </button>
+            )}
+            <button type="button" onClick={() => setSuccessMsg(null)} aria-label="Close notice">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -757,13 +884,20 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                         </span>
                       )}
                     </div>
-                    {currentUser.email && (
+                    {(currentUser.email || connectedProviderLabel) && (
                       <p className="text-xs font-medium text-cyan-700 dark:text-cyan-400 flex items-center gap-1.5 break-all">
                         <Mail className="w-3.5 h-3.5 shrink-0" />
-                        <span>{currentUser.email}</span>
-                        {currentUser.firebaseUid && (
-                          <span className="text-[10px] font-semibold text-slate-500 dark:text-slate-400">
-                            · Google
+                        <span>
+                          {currentUser.email ||
+                            bi(
+                              language,
+                              `${connectedProviderLabel} অ্যাকাউন্ট সংযুক্ত`,
+                              `Connected via ${connectedProviderLabel}`
+                            )}
+                        </span>
+                        {currentUser.email && connectedProviderLabel && (
+                          <span className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+                            · {connectedProviderLabel}
                           </span>
                         )}
                       </p>
@@ -876,13 +1010,19 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                   </p>
                 )}
                 <ul className="space-y-2.5 text-xs text-slate-600 dark:text-slate-300">
-                  {currentUser.email && (
+                  {(currentUser.email || connectedProviderLabel) && (
                     <li className="flex items-start gap-2.5">
                       <Mail className="w-4 h-4 text-cyan-500 shrink-0 mt-0.5" />
                       <span className="break-all">
                         <strong className="text-slate-900 dark:text-white font-medium">
-                          {currentUser.email}
+                          {currentUser.email ||
+                            bi(
+                              language,
+                              `${connectedProviderLabel} অ্যাকাউন্ট`,
+                              `${connectedProviderLabel} Account`
+                            )}
                         </strong>
+                        {currentUser.email && connectedProviderLabel ? ` · ${connectedProviderLabel}` : ''}
                       </span>
                     </li>
                   )}
@@ -1114,23 +1254,58 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
               onSubmit={handleSaveProfile}
               className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-4"
             >
+              {needsFirstTimeSetup && (
+                <div className="rounded-2xl bg-cyan-500/8 border border-cyan-500/30 p-4 space-y-2">
+                  <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                    <Sparkles className="w-4 h-4 text-cyan-500 shrink-0" />
+                    <span>
+                      {bi(
+                        language,
+                        'প্রোফাইল সেটআপ / কাস্টমাইজ করুন',
+                        'Complete or Customize Your Profile'
+                      )}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                    {bi(
+                      language,
+                      `আপনার ${connectedProviderLabel || 'অ্যাকাউন্টের'} নাম (${currentUser.fullName}) ও ছবি যুক্ত হয়েছে। চাইলে এখন নাম এডিট করে আপনার ইনস্টিটিউট, ডিপার্টমেন্ট ও সেমিস্টার যোগ করুন — অথবা এখন স্কিপ করে পরে যেকোনো সময় এডিট করুন।`,
+                      `Your ${connectedProviderLabel || 'account'} name (${currentUser.fullName}) and photo are ready. Edit your name and add your institute, department, and semester now — or skip and edit anytime later.`
+                    )}
+                  </p>
+                </div>
+              )}
+
               <h3 className="text-base font-bold text-slate-900 dark:text-white">
                 {bi(language, 'প্রোফাইল ও প্রাইভেসি তথ্য হালনাগাদ', 'Update Profile & Privacy')}
               </h3>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                {currentUser.email && (
+                {(currentUser.email || connectedProviderLabel) && (
                   <div className="space-y-1 sm:col-span-2">
                     <label className="text-xs font-medium text-slate-500 flex items-center gap-1.5">
                       <Mail className="w-3.5 h-3.5 text-cyan-500" />
                       <span>
-                        {bi(language, 'সংযুক্ত ইমেইল / Gmail অ্যাকাউন্ট', 'Connected Gmail / Email Account')}
+                        {connectedProviderLabel
+                          ? bi(
+                              language,
+                              `সংযুক্ত ${connectedProviderLabel} অ্যাকাউন্ট`,
+                              `Connected ${connectedProviderLabel} Account`
+                            )
+                          : bi(language, 'সংযুক্ত ইমেইল অ্যাকাউন্ট', 'Connected Email Account')}
                       </span>
                     </label>
                     <input
-                      type="email"
+                      type="text"
                       readOnly
-                      value={currentUser.email}
+                      value={
+                        currentUser.email ||
+                        bi(
+                          language,
+                          `${connectedProviderLabel} আইডি দিয়ে সাইন-ইন করা`,
+                          `Signed in with ${connectedProviderLabel}`
+                        )
+                      }
                       className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-100 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 text-sm text-slate-600 dark:text-slate-300 cursor-not-allowed"
                     />
                   </div>
@@ -1138,13 +1313,14 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
 
                 <div className="space-y-1">
                   <label className="text-xs font-medium text-slate-500">
-                    {bi(language, 'পূর্ণ নাম', 'Full Name')}
+                    {bi(language, 'পূর্ণ নাম (এডিট করতে পারবেন)', 'Full Name (Editable)')}
                   </label>
                   <input
                     type="text"
                     required
                     value={editName}
                     onChange={(e) => setEditName(e.target.value)}
+                    placeholder={bi(language, 'আপনার পূর্ণ নাম লিখুন', 'Enter your full name')}
                     className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
                   />
                 </div>
@@ -1191,7 +1367,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                     type="text"
                     value={editRoll}
                     onChange={(e) => setEditRoll(e.target.value)}
-                    placeholder="654321"
+                    placeholder={bi(language, 'আপনার বোর্ড রোল (ঐচ্ছিক)', 'Your BTEB roll (optional)')}
                     className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-mono"
                   />
                 </div>
@@ -1205,7 +1381,11 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                     list="bd-polytechnics-list"
                     value={editCollege}
                     onChange={(e) => setEditCollege(e.target.value)}
-                    placeholder={bi(language, 'যেমন: বগুড়া পলিটেকনিক ইনস্টিটিউট', 'e.g. Bogura / Dhaka Polytechnic Institute')}
+                    placeholder={bi(
+                      language,
+                      'আপনার পলিটেকনিক ইনস্টিটিউটের নাম লিখুন বা তালিকা থেকে বাছুন',
+                      'Type or choose your Polytechnic Institute'
+                    )}
                     className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
                   />
                 </div>
@@ -1276,13 +1456,26 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                 </span>
               </label>
 
-              <button
-                type="submit"
-                disabled={loading}
-                className="min-h-[44px] px-5 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-bold"
-              >
-                {bi(language, 'পরিবর্তন সংরক্ষণ করুন', 'Save Profile')}
-              </button>
+              <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="min-h-[44px] px-5 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-bold"
+                >
+                  {needsFirstTimeSetup
+                    ? bi(language, 'সেভ করে শুরু করুন', 'Save & Continue')
+                    : bi(language, 'পরিবর্তন সংরক্ষণ করুন', 'Save Profile')}
+                </button>
+                {needsFirstTimeSetup && (
+                  <button
+                    type="button"
+                    onClick={handleSkipInitialSetup}
+                    className="min-h-[44px] px-4 py-2 rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-semibold"
+                  >
+                    {bi(language, 'এখন স্কিপ করুন', 'Skip for Now')}
+                  </button>
+                )}
+              </div>
             </form>
           )}
         </div>
@@ -1355,25 +1548,11 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                 <Mail className="w-3.5 h-3.5 inline mr-1" />
                 {bi(language, 'রিসেট', 'Reset')}
               </button>
-              {!hasAdmin && (
-                <button
-                  type="button"
-                  onClick={() => setAuthTab('claim-admin')}
-                  className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold ${
-                    authTab === 'claim-admin'
-                      ? 'bg-white dark:bg-slate-800 text-cyan-600 dark:text-cyan-400'
-                      : 'text-slate-600 dark:text-slate-400'
-                  }`}
-                >
-                  <KeyRound className="w-3.5 h-3.5 inline mr-1" />
-                  Admin
-                </button>
-              )}
             </div>
 
-            {/* Google OAuth Sign-In */}
+            {/* Google & Facebook OAuth Sign-In */}
             {(authTab === 'login' || authTab === 'register') && (
-              <div className="space-y-3">
+              <div className="space-y-2.5">
                 <button
                   type="button"
                   disabled={loading}
@@ -1399,12 +1578,109 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                     />
                   </svg>
                   <span>
-                    {loading
+                    {activeSocialProvider === 'google'
                       ? bi(language, 'Google-এ সংযুক্ত হচ্ছে...', 'Connecting with Google...')
-                      : bi(language, 'Google দিয়ে এক ক্লিকে প্রোফাইল খুলুন', 'Continue with Google')}
+                      : bi(language, 'Google দিয়ে লগইন / প্রোফাইল খুলুন', 'Continue with Google')}
                   </span>
                 </button>
-                <div className="flex items-center gap-3 text-[11px] text-slate-400">
+
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={() => void handleFacebookSignIn()}
+                  className="w-full min-h-[46px] inline-flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl bg-[#1877F2] hover:bg-[#166FE5] text-white text-sm font-semibold shadow-xs transition-colors disabled:opacity-60"
+                >
+                  <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0 fill-current" aria-hidden="true">
+                    <path d="M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073C0 18.1 4.388 23.094 10.125 24v-8.437H7.078v-3.49h3.047V9.41c0-3.025 1.792-4.697 4.533-4.697 1.312 0 2.686.235 2.686.235v2.97h-1.513c-1.491 0-1.956.93-1.956 1.886v2.269h3.328l-.532 3.49h-2.796V24C19.612 23.094 24 18.1 24 12.073z" />
+                  </svg>
+                  <span>
+                    {activeSocialProvider === 'facebook'
+                      ? bi(language, 'Facebook-এ সংযুক্ত হচ্ছে...', 'Connecting with Facebook...')
+                      : bi(language, 'Facebook দিয়ে লগইন / প্রোফাইল খুলুন', 'Continue with Facebook')}
+                  </span>
+                </button>
+
+                {/* Collapsible Facebook Setup Guide */}
+                <div className="pt-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setShowFacebookGuide((prev) => !prev)}
+                    className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-500 dark:text-slate-400 hover:text-cyan-600 dark:hover:text-cyan-400"
+                  >
+                    <HelpCircle className="w-3.5 h-3.5 shrink-0" />
+                    <span>
+                      {bi(
+                        language,
+                        'Facebook লগইন সেটআপ গাইড (Meta + Firebase)',
+                        'Facebook Login Setup Guide (Meta + Firebase)'
+                      )}
+                    </span>
+                    {showFacebookGuide ? (
+                      <ChevronUp className="w-3.5 h-3.5" />
+                    ) : (
+                      <ChevronDown className="w-3.5 h-3.5" />
+                    )}
+                  </button>
+
+                  {showFacebookGuide && (
+                    <div className="mt-2 rounded-xl bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 p-3.5 space-y-2.5 text-xs text-slate-600 dark:text-slate-300">
+                      <p className="font-semibold text-slate-900 dark:text-white">
+                        {bi(
+                          language,
+                          'Facebook লগইন চালু করতে নিচের ৩টি ধাপ সম্পন্ন করুন:',
+                          'Complete these 3 steps to activate Facebook Login:'
+                        )}
+                      </p>
+                      <ol className="list-decimal list-inside space-y-1.5 leading-relaxed">
+                        <li>
+                          {bi(
+                            language,
+                            'Meta for Developers (developers.facebook.com)-এ একটি Consumer/Facebook Login অ্যাপ তৈরি করে App ID ও App Secret কপি করুন।',
+                            'Create an app with Facebook Login at Meta for Developers (developers.facebook.com) and copy your App ID & App Secret.'
+                          )}
+                        </li>
+                        <li>
+                          {bi(
+                            language,
+                            'Firebase Console → Authentication → Sign-in method → Facebook চালু করুন এবং App ID ও App Secret বসিয়ে Save করুন।',
+                            'Open Firebase Console → Authentication → Sign-in method → Enable Facebook, paste App ID & App Secret, and Save.'
+                          )}
+                        </li>
+                        <li>
+                          {bi(
+                            language,
+                            'Meta Developers → Facebook Login → Settings → Valid OAuth Redirect URIs-এ নিচের লিংকটি যোগ করুন:',
+                            'Add this exact URL to Meta Developers → Facebook Login → Settings → Valid OAuth Redirect URIs:'
+                          )}
+                        </li>
+                      </ol>
+                      <div className="flex items-center gap-2 rounded-lg bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 px-2.5 py-2">
+                        <code className="flex-1 text-[11px] font-mono text-cyan-700 dark:text-cyan-400 break-all">
+                          {FIREBASE_OAUTH_REDIRECT_URI}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() => void handleCopyRedirectUri()}
+                          className="min-h-[32px] px-2.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200 inline-flex items-center gap-1 shrink-0"
+                        >
+                          {copiedRedirectUri ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-500" />
+                              <span>{bi(language, 'কপি হয়েছে', 'Copied')}</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              <span>{bi(language, 'কপি', 'Copy')}</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-3 text-[11px] text-slate-400 pt-1">
                   <div className="flex-1 h-px bg-slate-200 dark:bg-slate-800" />
                   <span>{bi(language, 'অথবা ইমেইল দিয়ে', 'OR WITH EMAIL')}</span>
                   <div className="flex-1 h-px bg-slate-200 dark:bg-slate-800" />
@@ -1460,7 +1736,7 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                       required
                       value={fullName}
                       onChange={(e) => setFullName(e.target.value)}
-                      placeholder={bi(language, 'যেমন: রাকিব হাসান', 'e.g. Rokib Hasan')}
+                      placeholder={bi(language, 'আপনার পূর্ণ নাম লিখুন', 'Enter your full name')}
                       className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
                     />
                   </div>
@@ -1529,7 +1805,11 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                       list="bd-polytechnics-list"
                       value={collegeName}
                       onChange={(e) => setCollegeName(e.target.value)}
-                      placeholder={bi(language, 'যেমন: বগুড়া পলিটেকনিক ইনস্টিটিউট', 'e.g. Bogura / Dhaka Polytechnic')}
+                      placeholder={bi(
+                        language,
+                        'আপনার পলিটেকনিক ইনস্টিটিউটের নাম লিখুন',
+                        'Enter your Polytechnic Institute'
+                      )}
                       className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
                     />
                   </div>
@@ -1569,50 +1849,6 @@ export const ProfileAuthView: React.FC<ProfileAuthViewProps> = ({
                   className="w-full min-h-[44px] rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-sm font-bold"
                 >
                   {bi(language, 'রিসেট লিংক পাঠান', 'Send Password Reset Link')}
-                </button>
-              </form>
-            )}
-
-            {authTab === 'claim-admin' && !hasAdmin && (
-              <form onSubmit={handleClaimFirstAdmin} className="space-y-3.5">
-                <p className="text-xs text-amber-600 dark:text-amber-300 bg-amber-500/10 border border-amber-500/30 p-3 rounded-xl">
-                  {bi(
-                    language,
-                    'প্ল্যাটফর্মে এখনো কোনো লোকাল অ্যাডমিন নেই। প্রথম অ্যাডমিন অ্যাকাউন্ট তৈরি করলে আপনি Formula Hub, AI Config, Notices ও User Roles পরিচালনা করতে পারবেন।',
-                    'No local administrator is configured yet. Claim the first Admin role to manage Formulas, AI Config, Notices & Users.'
-                  )}
-                </p>
-                <input
-                  type="text"
-                  required
-                  value={fullName}
-                  onChange={(e) => setFullName(e.target.value)}
-                  placeholder="Admin Name"
-                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                />
-                <input
-                  type="email"
-                  required
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="admin@polytechnichub.com"
-                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                />
-                <input
-                  type="password"
-                  required
-                  minLength={6}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Strong Admin Password (min 6 chars)"
-                  className="w-full min-h-[42px] px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"
-                />
-                <button
-                  type="submit"
-                  disabled={loading}
-                  className="w-full min-h-[44px] rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-bold"
-                >
-                  Claim First Admin Account
                 </button>
               </form>
             )}

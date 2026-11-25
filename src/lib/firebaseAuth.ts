@@ -1,6 +1,7 @@
 import {
   browserLocalPersistence,
   createUserWithEmailAndPassword,
+  FacebookAuthProvider,
   getRedirectResult,
   GoogleAuthProvider,
   onAuthStateChanged,
@@ -21,6 +22,9 @@ import type { AuthUser, LanguageMode } from '../types/study';
 
 export const FIREBASE_WEB_CONFIG = FIREBASE_RUNTIME_CONFIG;
 export const isFirebaseAuthConfigured = isFirebaseConfigured;
+export const FIREBASE_OAUTH_REDIRECT_URI = FIREBASE_RUNTIME_CONFIG.authDomain
+  ? `https://${FIREBASE_RUNTIME_CONFIG.authDomain}/__/auth/handler`
+  : '';
 
 const GOOGLE_REDIRECT_STORAGE_KEY = 'polytechnic_google_redirect_ctx_v1';
 const CACHED_AUTH_USER_KEY = 'polytechnic_hub_cached_user_v1';
@@ -59,6 +63,7 @@ export interface SessionValidationResult {
 export interface CanonicalFirebaseMapping {
   firebaseUid: string;
   canonicalProfileId: string;
+  authProvider: 'google' | 'facebook' | 'email';
   email: string;
   fullName: string;
   avatarUrl: string;
@@ -312,10 +317,9 @@ export function isStandaloneOrMobileInAppBrowser(): boolean {
 }
 
 export function shouldPreferGoogleRedirect(): boolean {
-  if (typeof window === 'undefined') return false;
-  if (isStandaloneOrMobileInAppBrowser()) {
-    return true;
-  }
+  // Prefer signInWithPopup everywhere (including mobile & PWA) because cross-origin
+  // signInWithRedirect across firebaseapp.com <-> run.app loses session storage under
+  // third-party cookie partitioning. Only fall back to redirect if popup is blocked.
   return false;
 }
 
@@ -369,12 +373,25 @@ function buildGoogleProvider(): GoogleAuthProvider {
   return provider;
 }
 
+function buildFacebookProvider(): FacebookAuthProvider {
+  const provider = new FacebookAuthProvider();
+  provider.addScope('public_profile');
+  provider.addScope('email');
+  provider.setCustomParameters({ display: 'popup' });
+  return provider;
+}
+
+export function detectFirebaseProvider(fbUser: User): 'google' | 'facebook' | 'email' {
+  const providers = fbUser.providerData?.map((p) => p?.providerId || '') ?? [];
+  if (providers.includes('facebook.com')) return 'facebook';
+  if (providers.includes('google.com')) return 'google';
+  return 'email';
+}
+
 function isPopupFallbackErrorCode(code: string): boolean {
   return (
     code === 'auth/popup-blocked' ||
-    code === 'auth/operation-not-supported-in-this-environment' ||
-    code === 'auth/cancelled-popup-request' ||
-    code === 'auth/internal-error'
+    code === 'auth/operation-not-supported-in-this-environment'
   );
 }
 
@@ -406,17 +423,20 @@ export async function resolveCanonicalFirebaseMapping(
   context?: GoogleSignInContext
 ): Promise<CanonicalFirebaseMapping> {
   const canonicalProfileId = await deriveProfileUuidFromFirebaseUid(fbUser.uid);
-  const email = (fbUser.email || '').trim().toLowerCase();
+  const authProvider = detectFirebaseProvider(fbUser);
+  const email = (fbUser.email || fbUser.providerData?.[0]?.email || '').trim().toLowerCase();
+  const providerDisplayName = fbUser.displayName?.trim() || fbUser.providerData?.[0]?.displayName?.trim() || '';
   const fullName =
+    providerDisplayName ||
     context?.fullName?.trim() ||
-    fbUser.displayName?.trim() ||
     (email ? email.split('@')[0] : 'Student');
   return {
     firebaseUid: fbUser.uid,
     canonicalProfileId,
+    authProvider,
     email,
     fullName,
-    avatarUrl: fbUser.photoURL?.trim() || '',
+    avatarUrl: fbUser.photoURL?.trim() || fbUser.providerData?.[0]?.photoURL?.trim() || '',
     department: context?.department?.trim() || undefined,
     semester: context?.semester,
     collegeName: context?.collegeName?.trim() || undefined,
@@ -629,27 +649,72 @@ export async function syncFirebaseUserToSupabaseProfile(
     resolveCanonicalFirebaseMapping(fbUser, context),
   ]);
 
-  const synced = await apiClient.firebaseSync({
-    idToken,
-    fullName: mapping.fullName,
-    department: mapping.department,
-    semester: mapping.semester,
-    collegeName: mapping.collegeName,
-    rollNumber: mapping.rollNumber,
-  });
+  let canonicalUser: AuthUser;
+  let sessionToken: string;
 
-  if (!isStoredTokenStructurallyValid(synced.token)) {
-    throw new Error('Server issued an invalid or expired session token.');
+  try {
+    const synced = await apiClient.firebaseSync({
+      idToken,
+      fullName: mapping.fullName,
+      department: mapping.department,
+      semester: mapping.semester,
+      collegeName: mapping.collegeName,
+      rollNumber: mapping.rollNumber,
+      authProvider: mapping.authProvider,
+    });
+
+    if (!isStoredTokenStructurallyValid(synced.token)) {
+      throw new Error('Server issued an invalid or expired session token.');
+    }
+
+    canonicalUser = {
+      ...synced.user,
+      id: synced.user.id || mapping.canonicalProfileId,
+      email: synced.user.email || mapping.email || fbUser.email || '',
+      fullName: synced.user.fullName?.trim() || mapping.fullName,
+      avatarUrl: synced.user.avatarUrl || mapping.avatarUrl,
+      firebaseUid: synced.user.firebaseUid || mapping.firebaseUid,
+      authProvider: synced.user.authProvider || mapping.authProvider,
+    };
+    sessionToken = synced.token;
+  } catch (syncErr) {
+    // Resilient fallback: Firebase Auth ALREADY authenticated this user (Google/Facebook).
+    // Never bounce the user back to the logged-out screen due to a transient backend sync hiccup;
+    // keep them signed in using their verified Firebase ID token (which the backend accepts directly)
+    // and let subsequent requests / profile edits reconcile cleanly.
+    console.warn(
+      '[Firebase Auth] /api/auth/firebase-sync fallback active:',
+      syncErr instanceof Error ? syncErr.message : syncErr
+    );
+    const now = new Date().toISOString();
+    const cached = getCachedAuthUser(mapping.canonicalProfileId);
+    canonicalUser = {
+      id: cached?.id || mapping.canonicalProfileId,
+      firebaseUid: mapping.firebaseUid,
+      authProvider: mapping.authProvider,
+      fullName: cached?.fullName?.trim() || mapping.fullName,
+      email: cached?.email || mapping.email || '',
+      role:
+        cached?.role ||
+        (fbUser.emailVerified && mapping.email === 'webrokib@gmail.com' ? 'admin' : 'student'),
+      avatarUrl: cached?.avatarUrl || mapping.avatarUrl,
+      coverUrl: cached?.coverUrl || '',
+      gender: cached?.gender || '',
+      showGender: Boolean(cached?.showGender),
+      bio: cached?.bio || '',
+      department: cached?.department || mapping.department || 'power',
+      semester: cached?.semester || mapping.semester || 4,
+      collegeName: cached?.collegeName || mapping.collegeName || '',
+      instituteName: cached?.instituteName || cached?.collegeName || mapping.collegeName || '',
+      rollNumber: cached?.rollNumber || mapping.rollNumber || '',
+      profileVisibility: cached?.profileVisibility || 'public',
+      createdAt: cached?.createdAt || now,
+      updatedAt: now,
+    };
+    sessionToken = idToken;
   }
 
-  const canonicalUser: AuthUser = {
-    ...synced.user,
-    id: synced.user.id || mapping.canonicalProfileId,
-    email: synced.user.email || mapping.email || fbUser.email || '',
-    firebaseUid: synced.user.firebaseUid || mapping.firebaseUid,
-  };
-
-  setStoredToken(synced.token);
+  setStoredToken(sessionToken);
   setCachedAuthUser(canonicalUser);
 
   // Best-effort client-side Supabase profile reconciliation when an active Supabase session exists
@@ -672,12 +737,12 @@ export async function syncFirebaseUserToSupabaseProfile(
         );
       }
     } catch {
-      // Authoritative service-role upsert already ran inside /api/auth/firebase-sync
+      // Authoritative service-role upsert runs inside /api/auth/firebase-sync
     }
   }
 
   return {
-    token: synced.token,
+    token: sessionToken,
     user: canonicalUser,
     firebaseUid: mapping.firebaseUid,
     canonicalProfileId: canonicalUser.id,
@@ -686,12 +751,12 @@ export async function syncFirebaseUserToSupabaseProfile(
 }
 
 // ============================================================================
-// UNIFIED GOOGLE POPUP / REDIRECT & SESSION RECONCILIATION FLOWS
+// UNIFIED GOOGLE & FACEBOOK POPUP / REDIRECT & SESSION RECONCILIATION FLOWS
 // ============================================================================
 
-async function startGoogleRedirectFlow(
+async function startSocialRedirectFlow(
   auth: Auth,
-  provider: GoogleAuthProvider,
+  provider: GoogleAuthProvider | FacebookAuthProvider,
   context?: GoogleSignInContext
 ): Promise<FirebaseSignInOutcome> {
   savePendingGoogleRedirect(context);
@@ -712,9 +777,39 @@ export async function signInWithGoogleUnified(
   await setPersistence(auth, browserLocalPersistence).catch(() => {});
   const provider = buildGoogleProvider();
 
-  if (shouldPreferGoogleRedirect()) {
-    return startGoogleRedirectFlow(auth, provider, context);
+  try {
+    const cred = await signInWithPopup(auth, provider);
+    clearPendingGoogleRedirect();
+    const synced = await syncFirebaseUserToSupabaseProfile(cred.user, context);
+    return {
+      redirected: false,
+      idToken: synced.idToken,
+      user: cred.user,
+      syncedUser: synced.user,
+      token: synced.token,
+    };
+  } catch (err: unknown) {
+    const code =
+      err && typeof err === 'object' && 'code' in err ? String((err as { code?: string }).code) : '';
+    if (isPopupFallbackErrorCode(code)) {
+      return startSocialRedirectFlow(auth, provider, context);
+    }
+    throw err;
   }
+}
+
+export async function signInWithFacebookUnified(
+  context?: GoogleSignInContext
+): Promise<FirebaseSignInOutcome> {
+  const auth = getFirebaseAuthInstance();
+  if (!auth) {
+    throw new Error(
+      'Firebase Authentication is not configured. Check firebase-applet-config.json or VITE_FIREBASE_* environment variables.'
+    );
+  }
+
+  await setPersistence(auth, browserLocalPersistence).catch(() => {});
+  const provider = buildFacebookProvider();
 
   try {
     const cred = await signInWithPopup(auth, provider);
@@ -731,7 +826,7 @@ export async function signInWithGoogleUnified(
     const code =
       err && typeof err === 'object' && 'code' in err ? String((err as { code?: string }).code) : '';
     if (isPopupFallbackErrorCode(code)) {
-      return startGoogleRedirectFlow(auth, provider, context);
+      return startSocialRedirectFlow(auth, provider, context);
     }
     throw err;
   }
@@ -823,21 +918,21 @@ export function formatFirebaseAuthError(err: unknown, language: LanguageMode): s
     }
     case 'auth/popup-blocked':
       return language === 'en'
-        ? 'Popup was blocked by your browser. Redirecting to Google Sign-In...'
-        : 'ব্রাউজার পপ-আপ ব্লক করেছে। রিডাইরেক্টের মাধ্যমে Google লগইন চালু হচ্ছে...';
+        ? 'Popup was blocked by your browser. Redirecting to sign in...'
+        : 'ব্রাউজার পপ-আপ ব্লক করেছে। রিডাইরেক্টের মাধ্যমে লগইন চালু হচ্ছে...';
     case 'auth/popup-closed-by-user':
     case 'auth/redirect-cancelled-by-user':
       return language === 'en'
-        ? 'Google sign-in was cancelled before completing login.'
-        : 'Google সাইন-ইন সম্পন্ন হওয়ার আগেই বাতিল করা হয়েছে।';
+        ? 'Sign-in window was closed before completing login.'
+        : 'লগইন সম্পন্ন হওয়ার আগেই পপ-আপ বন্ধ করা হয়েছে।';
     case 'auth/cancelled-popup-request':
       return language === 'en'
-        ? 'Another sign-in window was already open. Retrying sign-in...'
-        : 'আরেকটি সাইন-ইন পপ-আপ খোলা ছিল। পুনরায় চেষ্টা করুন...';
+        ? 'Another sign-in window was already open. Please tap again.'
+        : 'আরেকটি লগইন উইন্ডো খোলা ছিল। অনুগ্রহ করে আবার ট্যাপ করুন।';
     case 'auth/account-exists-with-different-credential':
       return language === 'en'
-        ? 'An account already exists with the same email using another sign-in method.'
-        : 'এই ইমেইল দিয়ে অন্য লগইন পদ্ধতিতে ইতিমধ্যেই অ্যাকাউন্ট রয়েছে।';
+        ? 'An account already exists with the same email using another sign-in method (e.g. Google or Email). Sign in with that method first.'
+        : 'এই ইমেইল দিয়ে ইতিমধ্যেই অন্য পদ্ধতিতে (যেমন Google বা Email) অ্যাকাউন্ট খোলা আছে। সেই পদ্ধতিতে সাইন ইন করুন।';
     case 'auth/user-disabled':
       return language === 'en'
         ? 'This account has been disabled. Please contact support.'
@@ -854,8 +949,8 @@ export function formatFirebaseAuthError(err: unknown, language: LanguageMode): s
         : 'ইমেইল অথবা পাসওয়ার্ড সঠিক নয়।';
     case 'auth/email-already-in-use':
       return language === 'en'
-        ? 'An account with this email already exists. Try signing in or Continue with Google.'
-        : 'এই ইমেইল দিয়ে ইতিমধ্যেই অ্যাকাউন্ট আছে। সাইন ইন অথবা Google দিয়ে লগইন চেষ্টা করুন।';
+        ? 'An account with this email already exists. Try signing in or Continue with Google/Facebook.'
+        : 'এই ইমেইল দিয়ে ইতিমধ্যেই অ্যাকাউন্ট আছে। সাইন ইন অথবা Google/Facebook দিয়ে লগইন চেষ্টা করুন।';
     case 'auth/weak-password':
       return language === 'en'
         ? 'Password should be at least 6 characters.'
@@ -865,9 +960,10 @@ export function formatFirebaseAuthError(err: unknown, language: LanguageMode): s
         ? 'Network connection failed. Please check your internet and retry.'
         : 'ইন্টারনেট সংযোগে সমস্যা হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।';
     case 'auth/operation-not-allowed':
+    case 'auth/configuration-not-found':
       return language === 'en'
-        ? 'Google Sign-In is not enabled in Firebase Console -> Authentication -> Sign-in method.'
-        : 'Firebase Console-এ Google Sign-In মেথড সক্রিয় করা নেই।';
+        ? 'This sign-in provider is not yet enabled in Firebase Console -> Authentication -> Sign-in method.'
+        : 'এই লগইন পদ্ধতিটি এখনো Firebase Console -> Authentication -> Sign-in method-এ চালু করা হয়নি।';
     default:
       return rawMessage || (language === 'en' ? 'Authentication failed.' : 'লগইন প্রক্রিয়ায় ত্রুটি হয়েছে।');
   }

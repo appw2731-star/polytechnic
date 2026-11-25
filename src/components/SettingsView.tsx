@@ -7,7 +7,6 @@ import {
   Download,
   Languages,
   Moon,
-  RotateCcw,
   Sun,
   Trash2,
   Volume2,
@@ -39,7 +38,6 @@ interface SettingsViewProps {
   onUpdateSettings: (partial: Partial<UserSettings>) => void;
   onUpdatePushPreferences: (partial: Partial<NotificationPreferences>) => Promise<void>;
   onNavigate: (view: AppView) => void;
-  onResetDemo: () => void;
   onClearAll: () => void;
 }
 
@@ -50,7 +48,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onUpdateSettings,
   onUpdatePushPreferences,
   onNavigate,
-  onResetDemo,
   onClearAll,
 }) => {
   const { settings } = state;
@@ -406,18 +403,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           >
             <Download className="w-4 h-4" />
             <span>{bi(lang, 'ব্যাকআপ ডাউনলোড (JSON)', 'Export Backup JSON')}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              onResetDemo();
-              notify(bi(lang, 'নমুনা ডেটা পুনরুদ্ধার করা হয়েছে।', 'Demo data restored.'));
-            }}
-            className="min-h-[42px] inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-100 dark:hover:bg-slate-800"
-          >
-            <RotateCcw className="w-4 h-4" />
-            <span>{bi(lang, 'ডেমো ডেটা রিসেট', 'Reset Demo Data')}</span>
           </button>
 
           {!confirmClear ? (

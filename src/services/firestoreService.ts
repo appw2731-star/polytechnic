@@ -2,13 +2,11 @@ import {
   collection,
   deleteDoc,
   doc,
-  getDoc,
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
-  setDoc,
-  updateDoc,
   where,
   type Unsubscribe,
 } from 'firebase/firestore';
@@ -37,6 +35,23 @@ const LIMITS = {
   subjectCodeMax: 40,
   maxPdfBytes: 52428800,
 };
+
+// Serialize concurrent writes per document path so parallel auth/profile hooks never race
+const inFlightSyncQueue = new Map<string, Promise<void>>();
+
+function enqueueDocSync(key: string, task: () => Promise<void>): Promise<void> {
+  const previous = inFlightSyncQueue.get(key) ?? Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(task);
+  const tracked = next.finally(() => {
+    if (inFlightSyncQueue.get(key) === tracked) {
+      inFlightSyncQueue.delete(key);
+    }
+  });
+  inFlightSyncQueue.set(key, tracked);
+  return tracked;
+}
 
 function sanitizeId(raw: string, fallbackPrefix = 'item'): string {
   const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, LIMITS.idMax);
@@ -79,36 +94,60 @@ export async function syncUserProfileToFirestore(user: AuthUser): Promise<void> 
   const safeRoll = (user.rollNumber || '').trim().slice(0, LIMITS.rollMax);
   const safeBio = (user.bio || '').trim().slice(0, LIMITS.bioMax);
 
-  try {
-    const snap = await getDoc(ref);
-    if (!snap.exists()) {
-      await setDoc(ref, {
-        uid,
-        fullName: finalName,
-        email: safeEmail,
-        department: safeDept,
-        semester: safeSem,
-        collegeName: safeCollege,
-        rollNumber: safeRoll,
-        bio: safeBio,
-        role: 'student',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+  return enqueueDocSync(docPath, async () => {
+    let opType: OperationType = OperationType.WRITE;
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists()) {
+          opType = OperationType.CREATE;
+          const firestoreRole =
+            user.role === 'admin' &&
+            auth.currentUser?.emailVerified &&
+            auth.currentUser?.email?.toLowerCase() === 'webrokib@gmail.com'
+              ? 'admin'
+              : 'student';
+          tx.set(ref, {
+            uid,
+            fullName: finalName,
+            email: safeEmail,
+            department: safeDept,
+            semester: safeSem,
+            collegeName: safeCollege,
+            rollNumber: safeRoll,
+            bio: safeBio,
+            role: firestoreRole,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          return;
+        }
+
+        const existing = snap.data() as Record<string, unknown>;
+        const unchanged =
+          existing.fullName === finalName &&
+          existing.department === safeDept &&
+          existing.semester === safeSem &&
+          (existing.collegeName ?? '') === safeCollege &&
+          (existing.rollNumber ?? '') === safeRoll &&
+          (existing.bio ?? '') === safeBio;
+        if (unchanged) return;
+
+        opType = OperationType.UPDATE;
+        tx.update(ref, {
+          fullName: finalName,
+          department: safeDept,
+          semester: safeSem,
+          collegeName: safeCollege,
+          rollNumber: safeRoll,
+          bio: safeBio,
+          updatedAt: serverTimestamp(),
+        });
       });
-    } else {
-      await updateDoc(ref, {
-        fullName: finalName,
-        department: safeDept,
-        semester: safeSem,
-        collegeName: safeCollege,
-        rollNumber: safeRoll,
-        bio: safeBio,
-        updatedAt: serverTimestamp(),
-      });
+    } catch (error) {
+      handleFirestoreError(error, opType, docPath);
     }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, docPath);
-  }
+  });
 }
 
 export async function syncStudyNoteToFirestore(
@@ -130,33 +169,44 @@ export async function syncStudyNoteToFirestore(
   const safeDept = sanitizeDepartment(department);
   const safeSem = sanitizeSemester(semester);
 
-  try {
-    const snap = await getDoc(ref);
-    if (!snap.exists()) {
-      await setDoc(ref, {
-        id: noteId,
-        userId: uid,
-        title: safeTitle,
-        content: safeContent,
-        subjectName: safeSubject,
-        department: safeDept,
-        semester: safeSem,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      await updateDoc(ref, {
-        title: safeTitle,
-        content: safeContent,
-        subjectName: safeSubject,
-        department: safeDept,
-        semester: safeSem,
-        updatedAt: serverTimestamp(),
-      });
+  return enqueueDocSync(docPath, async () => {
+    const parentSync = inFlightSyncQueue.get(`users/${uid}`);
+    if (parentSync) {
+      await parentSync.catch(() => {});
     }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, docPath);
-  }
+    let opType: OperationType = OperationType.WRITE;
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists()) {
+          opType = OperationType.CREATE;
+          tx.set(ref, {
+            id: noteId,
+            userId: uid,
+            title: safeTitle,
+            content: safeContent,
+            subjectName: safeSubject,
+            department: safeDept,
+            semester: safeSem,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          opType = OperationType.UPDATE;
+          tx.update(ref, {
+            title: safeTitle,
+            content: safeContent,
+            subjectName: safeSubject,
+            department: safeDept,
+            semester: safeSem,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      });
+    } catch (error) {
+      handleFirestoreError(error, opType, docPath);
+    }
+  });
 }
 
 export async function deleteStudyNoteFromFirestore(noteIdRaw: string): Promise<void> {
@@ -189,33 +239,44 @@ export async function syncPdfMetadataToFirestore(pdf: UserPdfRecord): Promise<vo
   const safeSubjectCode = (pdf.subjectName || '').trim().slice(0, LIMITS.subjectCodeMax);
   const safeSize = Math.min(LIMITS.maxPdfBytes, Math.max(0, Math.trunc(Number(pdf.fileSizeBytes) || 0)));
 
-  try {
-    const snap = await getDoc(ref);
-    if (!snap.exists()) {
-      await setDoc(ref, {
-        id: pdfId,
-        userId: uid,
-        customName: safeCustomName,
-        fileName: safeFileName,
-        department: safeDept,
-        semester: safeSem,
-        subjectCode: safeSubjectCode,
-        fileSizeBytes: safeSize,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      await updateDoc(ref, {
-        customName: safeCustomName,
-        department: safeDept,
-        semester: safeSem,
-        subjectCode: safeSubjectCode,
-        updatedAt: serverTimestamp(),
-      });
+  return enqueueDocSync(docPath, async () => {
+    const parentSync = inFlightSyncQueue.get(`users/${uid}`);
+    if (parentSync) {
+      await parentSync.catch(() => {});
     }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, docPath);
-  }
+    let opType: OperationType = OperationType.WRITE;
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists()) {
+          opType = OperationType.CREATE;
+          tx.set(ref, {
+            id: pdfId,
+            userId: uid,
+            customName: safeCustomName,
+            fileName: safeFileName,
+            department: safeDept,
+            semester: safeSem,
+            subjectCode: safeSubjectCode,
+            fileSizeBytes: safeSize,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          opType = OperationType.UPDATE;
+          tx.update(ref, {
+            customName: safeCustomName,
+            department: safeDept,
+            semester: safeSem,
+            subjectCode: safeSubjectCode,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      });
+    } catch (error) {
+      handleFirestoreError(error, opType, docPath);
+    }
+  });
 }
 
 export async function deletePdfMetadataFromFirestore(pdfIdRaw: string): Promise<void> {

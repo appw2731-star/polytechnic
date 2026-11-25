@@ -1,7 +1,12 @@
-import { getTodayDayBn } from '../data/curriculum';
 import { AiChatSession, StudyMateState, TimeSettings } from '../types/study';
 
 const STORAGE_KEY = 'studymate_diploma_state_v1';
+const DEMO_SANITIZED_KEY = 'polytechnic_hub_demo_sanitized_v2';
+
+const LEGACY_DEMO_TASK_IDS = new Set(['task-init-1', 'task-init-2', 'task-init-3']);
+const LEGACY_DEMO_NOTE_IDS = new Set(['note-init-1', 'note-init-2']);
+const LEGACY_DEMO_SESSION_IDS = new Set(['session-init-1', 'session-init-2']);
+const LEGACY_DEMO_ALARM_IDS = new Set(['alarm-init-1']);
 
 export function createDefaultTimeSettings(): TimeSettings {
   return {
@@ -10,34 +15,8 @@ export function createDefaultTimeSettings(): TimeSettings {
     dailyDurationMinutes: 180,
     notificationsEnabled: false,
     reminderMinutesBefore: 5,
-    sessions: [
-      {
-        id: 'session-init-1',
-        label: 'সন্ধ্যা থিওরি ও গণিত সেশন',
-        startTime: '18:30',
-        endTime: '20:00',
-        reminderEnabled: true,
-      },
-      {
-        id: 'session-init-2',
-        label: 'রাত রিভিশন ও MCQ অনুশীলন',
-        startTime: '21:00',
-        endTime: '22:00',
-        reminderEnabled: true,
-      },
-    ],
-    alarms: [
-      {
-        id: 'alarm-init-1',
-        time: '06:00',
-        label: 'সকালের পড়া ও রিভিশন',
-        enabled: false,
-        days: ['শনিবার', 'রবিবার', 'সোমবার', 'মঙ্গলবার', 'বুধবার', 'বৃহস্পতিবার'],
-        tone: 'chime',
-        snoozedUntil: null,
-        createdAt: new Date().toISOString(),
-      },
-    ],
+    sessions: [],
+    alarms: [],
   };
 }
 
@@ -53,14 +32,12 @@ export function createNewAiSession(title = 'নতুন চ্যাট সে�
 }
 
 export function createInitialState(): StudyMateState {
-  const today = getTodayDayBn();
-  const nowIso = new Date().toISOString();
-  const initialSession = createNewAiSession('প্রথম স্টাডি সেশন');
+  const initialSession = createNewAiSession('নতুন চ্যাট সেশন');
 
   return {
     settings: {
-      studentName: 'Rokib Hasan',
-      collegeName: 'ঢাকা পলিটেকনিক ইনস্টিটিউট',
+      studentName: '',
+      collegeName: '',
       avatarDataUrl: '',
       coverDataUrl: '',
       department: 'power',
@@ -72,77 +49,14 @@ export function createInitialState(): StudyMateState {
     },
     timeSettings: createDefaultTimeSettings(),
     timerHistory: [],
-    tasks: [
-      {
-        id: 'task-init-1',
-        title: 'ভালভ টাইমিং ডায়াগ্রাম ও CRDI ফুয়েল সিস্টেম রিভিশন',
-        subjectCode: '27141',
-        subjectName: 'আইসি ইঞ্জিন ডিটেইলস (IC Engine Details)',
-        day: today,
-        startTime: '18:30',
-        endTime: '19:30',
-        durationMinutes: 60,
-        completed: false,
-        priority: 'উচ্চ',
-        createdAt: nowIso,
-      },
-      {
-        id: 'task-init-2',
-        title: 'ওয়াটার-টিউব বয়লার মাউন্টিংস ও সেফটি ভালভ অনুশীলন',
-        subjectCode: '27143',
-        subjectName: 'বয়লার অপারেশন অ্যান্ড মেইনটেন্যান্স',
-        day: today,
-        startTime: '20:00',
-        endTime: '21:00',
-        durationMinutes: 60,
-        completed: true,
-        priority: 'মধ্যম',
-        createdAt: nowIso,
-      },
-      {
-        id: 'task-init-3',
-        title: 'ইঞ্জিনিয়ারিং মেকানিক্স ও MCQ মডেল টেস্ট',
-        subjectCode: '27041',
-        subjectName: 'ইঞ্জিনিয়ারিং মেকানিক্স',
-        day: today,
-        startTime: '21:15',
-        endTime: '22:00',
-        durationMinutes: 45,
-        completed: false,
-        priority: 'সাধারণ',
-        createdAt: nowIso,
-      },
-    ],
-    notes: [
-      {
-        id: 'note-init-1',
-        title: 'বয়লার মাউন্টিংস ও অ্যাক্সেসরিজের পার্থক্য (২৭১৪৩)',
-        content:
-          '• মাউন্টিংস (নিরাপত্তার জন্য অপরিহার্য): সেফটি ভালভ, ওয়াটার লেভেল ইন্ডিকেটর, প্রেশার গেজ, ফিউজিবল প্লাগ।\n• অ্যাক্সেসরিজ (দক্ষতা বাড়াতে সহায়ক): ইকোনোমাইজার, সুপারহিটার, এয়ার প্রি-হিটার, ফিড পাম্প।',
-        subjectId: 'sub-27143',
-        subjectName: 'বয়লার অপারেশন অ্যান্ড মেইনটেন্যান্স',
-        pinned: true,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      },
-      {
-        id: 'note-init-2',
-        title: 'ম্যাট্রিক্স ও নির্ণায়ক পরীক্ষার জরুরি নোট (২৫৯১১)',
-        content:
-          '• কোনো বর্গ ম্যাট্রিক্সকে সিঙ্গুলার বলা হয় যদি |A| = 0 হয়।\n• বিপরীত ম্যাট্রিক্স A⁻¹ কেবল নন-সিঙ্গুলার (|A| ≠ 0) ম্যাট্রিক্সের জন্যই পাওয়া যায়।\n• ক্রেমারের সূত্র: x = Dx / D, y = Dy / D, z = Dz / D।',
-        subjectId: 'sub-25911',
-        subjectName: 'ম্যাথমেটিক্স-১',
-        pinned: false,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      },
-    ],
-    completedChapterIds: ['ch-27141-1'],
+    tasks: [],
+    notes: [],
+    completedChapterIds: [],
     quizHistory: [],
     aiMessages: [],
     aiSessions: [initialSession],
     activeAiSessionId: initialSession.id,
-    favoriteFormulaIds: ['phy-elec-01', 'math-trig-01'],
+    favoriteFormulaIds: [],
     recentPdfIds: [],
     readNoticeIds: [],
   };
@@ -158,19 +72,21 @@ export const storageService = {
       }
       const parsed = JSON.parse(raw) as Partial<StudyMateState>;
       const defaultTime = createDefaultTimeSettings();
+      const needsLegacyDemoCleanup = !window.localStorage.getItem(DEMO_SANITIZED_KEY);
 
       const legacyMessages = Array.isArray(parsed.aiMessages) ? parsed.aiMessages : [];
-      let sessions: AiChatSession[] = Array.isArray(parsed.aiSessions) && parsed.aiSessions.length > 0
-        ? parsed.aiSessions
-            .filter((s): s is AiChatSession => Boolean(s && typeof s.id === 'string'))
-            .map((s) => ({
-              ...s,
-              title: typeof s.title === 'string' && s.title.trim() ? s.title : 'চ্যাট সেশন',
-              messages: Array.isArray(s.messages) ? s.messages : [],
-              createdAt: s.createdAt || new Date().toISOString(),
-              updatedAt: s.updatedAt || new Date().toISOString(),
-            }))
-        : fallback.aiSessions;
+      let sessions: AiChatSession[] =
+        Array.isArray(parsed.aiSessions) && parsed.aiSessions.length > 0
+          ? parsed.aiSessions
+              .filter((s): s is AiChatSession => Boolean(s && typeof s.id === 'string'))
+              .map((s) => ({
+                ...s,
+                title: typeof s.title === 'string' && s.title.trim() ? s.title : 'চ্যাট সেশন',
+                messages: Array.isArray(s.messages) ? s.messages : [],
+                createdAt: s.createdAt || new Date().toISOString(),
+                updatedAt: s.updatedAt || new Date().toISOString(),
+              }))
+          : fallback.aiSessions;
 
       if (sessions.length === 0) {
         sessions = fallback.aiSessions;
@@ -197,14 +113,57 @@ export const storageService = {
           ? parsed.activeAiSessionId
           : sessions[0].id;
 
-      return {
+      let studentName =
+        typeof parsed.settings?.studentName === 'string' ? parsed.settings.studentName.trim() : '';
+      let collegeName =
+        typeof parsed.settings?.collegeName === 'string' ? parsed.settings.collegeName.trim() : '';
+
+      let tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+      let notes = Array.isArray(parsed.notes) ? parsed.notes : [];
+      let timeSessions = Array.isArray(parsed.timeSettings?.sessions)
+        ? parsed.timeSettings.sessions
+        : [];
+      let alarms = Array.isArray(parsed.timeSettings?.alarms) ? parsed.timeSettings.alarms : [];
+      let completedChapterIds = Array.isArray(parsed.completedChapterIds)
+        ? parsed.completedChapterIds
+        : [];
+      let favoriteFormulaIds = Array.isArray(parsed.favoriteFormulaIds)
+        ? parsed.favoriteFormulaIds
+        : [];
+
+      // One-time cleanup of legacy pre-seeded demo items while preserving real user entries
+      if (needsLegacyDemoCleanup) {
+        if (studentName.toLowerCase() === 'rokib hasan') {
+          studentName = '';
+          if (
+            collegeName === 'ঢাকা পলিটেকনিক ইনস্টিটিউট' ||
+            collegeName === 'বগুড়া পলিটেকনিক ইনস্টিটিউট'
+          ) {
+            collegeName = '';
+          }
+        }
+        tasks = tasks.filter((t) => !LEGACY_DEMO_TASK_IDS.has(t.id));
+        notes = notes.filter((n) => !LEGACY_DEMO_NOTE_IDS.has(n.id));
+        timeSessions = timeSessions.filter((s) => !LEGACY_DEMO_SESSION_IDS.has(s.id));
+        alarms = alarms.filter((a) => !LEGACY_DEMO_ALARM_IDS.has(a.id));
+        if (completedChapterIds.length === 1 && completedChapterIds[0] === 'ch-27141-1') {
+          completedChapterIds = [];
+        }
+        if (
+          favoriteFormulaIds.length === 2 &&
+          favoriteFormulaIds.includes('phy-elec-01') &&
+          favoriteFormulaIds.includes('math-trig-01')
+        ) {
+          favoriteFormulaIds = [];
+        }
+      }
+
+      const loaded: StudyMateState = {
         settings: {
           ...fallback.settings,
           ...(parsed.settings ?? {}),
-          collegeName:
-            typeof parsed.settings?.collegeName === 'string' && parsed.settings.collegeName.trim()
-              ? parsed.settings.collegeName.trim()
-              : fallback.settings.collegeName,
+          studentName,
+          collegeName,
           avatarDataUrl:
             typeof parsed.settings?.avatarDataUrl === 'string' ? parsed.settings.avatarDataUrl : '',
           coverDataUrl:
@@ -219,29 +178,32 @@ export const storageService = {
         timeSettings: {
           ...defaultTime,
           ...(parsed.timeSettings ?? {}),
-          sessions: Array.isArray(parsed.timeSettings?.sessions)
-            ? parsed.timeSettings.sessions
-            : defaultTime.sessions,
-          alarms: Array.isArray(parsed.timeSettings?.alarms)
-            ? parsed.timeSettings.alarms
-            : defaultTime.alarms,
+          sessions: timeSessions,
+          alarms,
         },
         timerHistory: Array.isArray(parsed.timerHistory) ? parsed.timerHistory : [],
-        tasks: Array.isArray(parsed.tasks) ? parsed.tasks : fallback.tasks,
-        notes: Array.isArray(parsed.notes) ? parsed.notes : fallback.notes,
-        completedChapterIds: Array.isArray(parsed.completedChapterIds)
-          ? parsed.completedChapterIds
-          : fallback.completedChapterIds,
+        tasks,
+        notes,
+        completedChapterIds,
         quizHistory: Array.isArray(parsed.quizHistory) ? parsed.quizHistory : [],
         aiMessages: legacyMessages,
         aiSessions: sessions,
         activeAiSessionId: activeId,
-        favoriteFormulaIds: Array.isArray(parsed.favoriteFormulaIds)
-          ? parsed.favoriteFormulaIds
-          : fallback.favoriteFormulaIds,
+        favoriteFormulaIds,
         recentPdfIds: Array.isArray(parsed.recentPdfIds) ? parsed.recentPdfIds : [],
         readNoticeIds: Array.isArray(parsed.readNoticeIds) ? parsed.readNoticeIds : [],
       };
+
+      if (needsLegacyDemoCleanup) {
+        try {
+          window.localStorage.setItem(STORAGE_KEY, JSON.stringify(loaded));
+          window.localStorage.setItem(DEMO_SANITIZED_KEY, '1');
+        } catch {
+          // ignore storage write errors
+        }
+      }
+
+      return loaded;
     } catch {
       return fallback;
     }
@@ -255,33 +217,8 @@ export const storageService = {
     }
   },
 
-  resetToDemo(): StudyMateState {
-    const fresh = createInitialState();
-    this.saveState(fresh);
-    return fresh;
-  },
-
   clearAll(): StudyMateState {
-    const freshSession = createNewAiSession('নতুন চ্যাট সেশন');
-    const empty: StudyMateState = {
-      settings: createInitialState().settings,
-      timeSettings: {
-        ...createDefaultTimeSettings(),
-        sessions: [],
-        alarms: [],
-      },
-      timerHistory: [],
-      tasks: [],
-      notes: [],
-      completedChapterIds: [],
-      quizHistory: [],
-      aiMessages: [],
-      aiSessions: [freshSession],
-      activeAiSessionId: freshSession.id,
-      favoriteFormulaIds: [],
-      recentPdfIds: [],
-      readNoticeIds: [],
-    };
+    const empty = createInitialState();
     this.saveState(empty);
     return empty;
   },

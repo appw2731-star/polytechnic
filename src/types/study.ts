@@ -258,6 +258,7 @@ export interface AuthUser {
   role: UserRole;
   avatarUrl: string;
   coverUrl?: string;
+  authProvider?: 'google' | 'facebook' | 'email';
   gender: '' | 'male' | 'female';
   showGender: boolean;
   bio: string;
