@@ -32,7 +32,7 @@ import {
   type PushSoundMode,
   type UserRole,
 } from './server/database.ts';
-import { dispatchFcmMessage, isFcmAdminConfigured } from './server/fcmAdmin.ts';
+import { dispatchFcmMessage, getFirebaseServiceAccount, isFcmAdminConfigured } from './server/fcmAdmin.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -277,8 +277,8 @@ async function verifySupabaseToken(token: string): Promise<PublicUser | null> {
 
 let cachedFirebaseCerts: { certs: Record<string, string>; expiresAtMs: number } | null = null;
 
-async function getFirebasePublicCerts(): Promise<Record<string, string>> {
-  if (cachedFirebaseCerts && Date.now() < cachedFirebaseCerts.expiresAtMs) {
+async function getFirebasePublicCerts(forceRefresh = false): Promise<Record<string, string>> {
+  if (!forceRefresh && cachedFirebaseCerts && Date.now() < cachedFirebaseCerts.expiresAtMs) {
     return cachedFirebaseCerts.certs;
   }
   const resp = await fetch(
@@ -314,6 +314,7 @@ const ACCEPTED_FIREBASE_PROJECT_IDS = Array.from(
       String(FIREBASE_APPLET_CONFIG.projectId || '').trim(),
       (process.env.VITE_FIREBASE_PROJECT_ID || '').trim(),
       (process.env.FIREBASE_PROJECT_ID || '').trim(),
+      String(getFirebaseServiceAccount()?.project_id || '').trim(),
     ].filter(Boolean)
   )
 );
@@ -346,10 +347,15 @@ async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFirebaseC
     return null;
   }
 
-  const certs = await getFirebasePublicCerts();
-  const certPem = certs[header.kid];
+  let certs = await getFirebasePublicCerts(false);
+  let certPem = certs[header.kid];
   if (!certPem) {
-    return null;
+    // Handle Google signing key rotation immediately without waiting for cache TTL
+    certs = await getFirebasePublicCerts(true);
+    certPem = certs[header.kid];
+    if (!certPem) {
+      return null;
+    }
   }
 
   const verifier = crypto.createVerify('RSA-SHA256');
@@ -429,6 +435,19 @@ async function resolveBearerUser(
 
     if (localUser) {
       if (localUser.isDisabled) return null;
+      if (isPrimaryAdminEmail(localUser.email) && localUser.role !== 'admin') {
+        const elevated = dbStore.mutate((draft) => {
+          const found = draft.users.find((u) => u.id === localUser!.id);
+          if (found) {
+            found.role = 'admin';
+            found.updatedAt = new Date().toISOString();
+          }
+          return found;
+        });
+        if (elevated) {
+          return { user: toPublicUser(elevated) };
+        }
+      }
       return { user: toPublicUser(localUser) };
     }
 
@@ -442,7 +461,13 @@ async function resolveBearerUser(
             (localPayload.firebaseUid && u.firebaseUid === localPayload.firebaseUid) ||
             (localPayload.email && u.email && u.email.toLowerCase() === localPayload.email.toLowerCase())
         );
-        if (existing) return existing;
+        if (existing) {
+          if (isPrimaryAdminEmail(existing.email) && existing.role !== 'admin') {
+            existing.role = 'admin';
+            existing.updatedAt = now;
+          }
+          return existing;
+        }
         const created: DbUser = {
           id: localPayload.sub,
           firebaseUid: localPayload.firebaseUid,
@@ -453,7 +478,10 @@ async function resolveBearerUser(
             'Student',
           email: (localPayload.email || '').trim().toLowerCase(),
           passwordHash: '',
-          role: localPayload.role === 'admin' ? 'admin' : 'student',
+          role:
+            localPayload.role === 'admin' || isPrimaryAdminEmail(localPayload.email)
+              ? 'admin'
+              : 'student',
           avatarUrl: '',
           coverUrl: '',
           gender: '',
@@ -2810,12 +2838,14 @@ async function createServer() {
       mergedMap.set(u.id, toPublicUser(u));
     }
 
-    if (SUPABASE_URL && SUPABASE_ANON_KEY && req.supabaseAccessToken) {
+    const sbKey = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+    const sbAuth = SUPABASE_SERVICE_ROLE_KEY || req.supabaseAccessToken;
+    if (SUPABASE_URL && sbKey && sbAuth) {
       try {
         const profRes = await fetch(`${SUPABASE_URL}/rest/v1/profiles?select=*&order=created_at.desc`, {
           headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${req.supabaseAccessToken}`,
+            apikey: sbKey,
+            Authorization: `Bearer ${sbAuth}`,
           },
         });
         if (profRes.ok) {

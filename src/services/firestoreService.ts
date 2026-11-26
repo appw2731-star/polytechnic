@@ -10,17 +10,30 @@ import {
   query,
   runTransaction,
   serverTimestamp,
+  setDoc,
+  updateDoc,
   where,
   type Unsubscribe,
 } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, isFirebaseConfigured, OperationType } from '../firebase';
 import type {
+  AppReleaseConfig,
   AuthUser,
   CommunityPost,
   CommunityReply,
+  FormulaItem,
+  McqQuestion,
+  PlatformNotice,
   PublicStudentProfile,
+  PushAudienceType,
+  PushCategory,
+  PushNotificationCampaign,
+  PushSoundMode,
+  SemesterNumber,
+  SharedPdfNote,
   StudyNote,
   UserPdfRecord,
+  UserRole,
 } from '../types/study';
 
 // Constants synchronized verbatim with firebase-blueprint.json & firestore.rules
@@ -870,3 +883,740 @@ export function subscribeUserStudyNotes(
     }
   );
 }
+
+// ============================================================================
+// ADMIN MANAGEMENT & REAL-TIME PUSH NOTIFICATIONS (CLOUD FIRESTORE)
+// ============================================================================
+
+export function isVerifiedAdminFirebaseSession(): boolean {
+  if (!isFirebaseConfigured) return false;
+  const fbUser = auth.currentUser;
+  if (!fbUser || !fbUser.uid || !fbUser.emailVerified) return false;
+  return VALID_ID_REGEX.test(fbUser.uid) && fbUser.uid.length <= LIMITS.idMax;
+}
+
+function mapNoticeDoc(id: string, data: Record<string, unknown>): PlatformNotice {
+  const rawCat = String(data.category || 'general');
+  const category: PlatformNotice['category'] =
+    rawCat === 'exam' || rawCat === 'result' || rawCat === 'urgent' ? rawCat : 'general';
+  return {
+    id: String(data.id || id),
+    title: String(data.title || ''),
+    body: String(data.body || ''),
+    category,
+    officialLink: String(data.officialLink || ''),
+    pinned: Boolean(data.pinned),
+    createdAt: toIsoTimestamp(data.createdAt),
+  };
+}
+
+function mapCampaignDoc(id: string, data: Record<string, unknown>): PushNotificationCampaign {
+  const rawCat = String(data.category || 'GENERAL');
+  const validCats: PushCategory[] = ['APP_UPDATE', 'IMPORTANT', 'EDUCATION', 'EMERGENCY', 'GENERAL'];
+  const category: PushCategory = validCats.includes(rawCat as PushCategory)
+    ? (rawCat as PushCategory)
+    : 'GENERAL';
+  const rawAudience = String(data.audienceType || 'all');
+  const audienceType: PushAudienceType =
+    rawAudience === 'selected_users' || rawAudience === 'department_semester'
+      ? rawAudience
+      : 'all';
+  const rawSound = String(data.soundMode || 'custom');
+  const soundMode: PushSoundMode =
+    rawSound === 'default' || rawSound === 'silent' ? rawSound : 'custom';
+  const rawStatus = String(data.status || 'sent');
+  const status: PushNotificationCampaign['status'] =
+    rawStatus === 'partial' || rawStatus === 'failed' ? rawStatus : 'sent';
+  const rawSem = Number(data.targetSemester || 0);
+
+  return {
+    id: String(data.id || id),
+    title: String(data.title || ''),
+    body: String(data.body || ''),
+    category,
+    imageUrl: String(data.imageUrl || ''),
+    targetView: String(data.targetView || 'notifications'),
+    actionUrl: String(data.actionUrl || ''),
+    audienceType,
+    targetUserIds: Array.isArray(data.targetUserIds) ? data.targetUserIds.map(String) : [],
+    targetDepartment: String(data.targetDepartment || ''),
+    targetSemester: rawSem >= 1 && rawSem <= 8 ? rawSem : null,
+    soundMode,
+    status,
+    totalRecipients: Math.max(0, Math.trunc(Number(data.totalRecipients) || 0)),
+    fcmSentCount: 0,
+    fcmFailedCount: 0,
+    createdBy: String(data.createdBy || ''),
+    createdAt: toIsoTimestamp(data.createdAt),
+  };
+}
+
+export async function fetchAllUsersForAdminFromFirestore(): Promise<AuthUser[]> {
+  if (!isVerifiedAdminFirebaseSession()) return [];
+  try {
+    const snap = await getDocs(query(collection(db, 'users'), limit(300)));
+    return snap.docs.map((d) => {
+      const data = d.data() as Record<string, unknown>;
+      const uid = String(data.uid || d.id);
+      const college = String(data.collegeName || '');
+      const gender: '' | 'male' | 'female' =
+        data.gender === 'male' || data.gender === 'female' ? data.gender : '';
+      const profileVisibility: 'public' | 'department' | 'private' =
+        data.profileVisibility === 'private' || data.profileVisibility === 'department'
+          ? data.profileVisibility
+          : 'public';
+      const authProvider =
+        data.authProvider === 'google' ||
+        data.authProvider === 'facebook' ||
+        data.authProvider === 'email'
+          ? data.authProvider
+          : undefined;
+      return {
+        id: uid,
+        firebaseUid: uid,
+        authProvider,
+        fullName: String(data.fullName || 'Student'),
+        email: String(data.email || ''),
+        role: data.role === 'admin' ? 'admin' : 'student',
+        avatarUrl: String(data.avatarUrl || ''),
+        coverUrl: String(data.coverUrl || ''),
+        gender,
+        showGender: Boolean(data.showGender),
+        bio: String(data.bio || ''),
+        department: String(data.department || 'power'),
+        semester: sanitizeSemester(typeof data.semester === 'number' ? data.semester : 4),
+        collegeName: college,
+        instituteName: college,
+        rollNumber: String(data.rollNumber || ''),
+        profileVisibility,
+        isDisabled: Boolean(data.isDisabled),
+        createdAt: toIsoTimestamp(data.createdAt),
+        updatedAt: toIsoTimestamp(data.updatedAt),
+      };
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, 'users');
+  }
+}
+
+export async function adminSetUserRoleInFirestore(
+  userIdRaw: string,
+  role: UserRole,
+  emailHint = ''
+): Promise<void> {
+  if (!isVerifiedAdminFirebaseSession()) return;
+  const uid = sanitizeId(userIdRaw, 'usr');
+  const userRef = doc(db, 'users', uid);
+  const publicRef = doc(db, 'publicProfiles', uid);
+  const adminMarkerRef = doc(db, 'admins', uid);
+
+  try {
+    const snap = await getDoc(userRef);
+    const resolvedEmail =
+      (snap.exists() ? String((snap.data() as Record<string, unknown>).email || '') : '') ||
+      emailHint;
+    if (snap.exists()) {
+      await updateDoc(userRef, {
+        role,
+        updatedAt: serverTimestamp(),
+      });
+    }
+    const pubSnap = await getDoc(publicRef);
+    if (pubSnap.exists()) {
+      await updateDoc(publicRef, {
+        role,
+        updatedAt: serverTimestamp(),
+      });
+    }
+    if (role === 'admin' && resolvedEmail && resolvedEmail.length >= 3) {
+      await setDoc(adminMarkerRef, {
+        uid,
+        email: resolvedEmail.trim().slice(0, LIMITS.emailMax),
+        grantedAt: serverTimestamp(),
+      });
+    } else if (role === 'student') {
+      await deleteDoc(adminMarkerRef).catch(() => {});
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `users/${uid}`);
+  }
+}
+
+export async function adminSetUserStatusInFirestore(
+  userIdRaw: string,
+  isDisabled: boolean
+): Promise<void> {
+  if (!isVerifiedAdminFirebaseSession()) return;
+  const uid = sanitizeId(userIdRaw, 'usr');
+  const userRef = doc(db, 'users', uid);
+  try {
+    const snap = await getDoc(userRef);
+    if (!snap.exists()) return;
+    await updateDoc(userRef, {
+      isDisabled: Boolean(isDisabled),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `users/${uid}`);
+  }
+}
+
+export async function adminModerateCommunityPostInFirestore(
+  postIdRaw: string,
+  payload: { isHidden?: boolean }
+): Promise<CommunityPost | null> {
+  if (!isVerifiedAdminFirebaseSession()) return null;
+  const postId = sanitizeId(postIdRaw, 'post');
+  const ref = doc(db, 'communityPosts', postId);
+  try {
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return null;
+    const nextHidden =
+      typeof payload.isHidden === 'boolean'
+        ? payload.isHidden
+        : Boolean((snap.data() as Record<string, unknown>).isHidden);
+    await updateDoc(ref, {
+      isHidden: nextHidden,
+      updatedAt: serverTimestamp(),
+    });
+    const updatedSnap = await getDoc(ref);
+    if (!updatedSnap.exists()) return null;
+    const d = updatedSnap.data() as Record<string, unknown>;
+    return {
+      id: String(d.id || postId),
+      authorId: String(d.authorId || ''),
+      authorName: String(d.authorName || 'Student'),
+      authorAvatarUrl: String(d.authorAvatarUrl || ''),
+      authorCollegeName: String(d.authorCollegeName || ''),
+      authorDepartment: String(d.authorDepartment || d.department || 'power'),
+      authorRole: d.authorRole === 'admin' ? 'admin' : 'student',
+      department: String(d.department || 'power'),
+      semester: sanitizeSemester(typeof d.semester === 'number' ? d.semester : 4),
+      subjectTag: String(d.subjectTag || ''),
+      title: String(d.title || ''),
+      body: String(d.body || ''),
+      imageUrl: String(d.imageUrl || ''),
+      likedByUserIds: Array.isArray(d.likedByUserIds) ? d.likedByUserIds.map(String) : [],
+      reportsCount: 0,
+      isHidden: Boolean(d.isHidden),
+      replies: Array.isArray(d.replies) ? (d.replies as CommunityReply[]) : [],
+      createdAt: toIsoTimestamp(d.createdAt),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `communityPosts/${postId}`);
+  }
+}
+
+// --- Platform Notices ---
+export async function fetchPlatformNoticesFromFirestore(): Promise<PlatformNotice[]> {
+  if (!isFirebaseConfigured) return [];
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'platformNotices'), orderBy('createdAt', 'desc'), limit(50))
+    );
+    return snap.docs.map((d) => mapNoticeDoc(d.id, d.data() as Record<string, unknown>));
+  } catch {
+    return [];
+  }
+}
+
+export async function adminCreateNoticeInFirestore(
+  input: Omit<PlatformNotice, 'id' | 'createdAt'>,
+  idOverride?: string
+): Promise<PlatformNotice> {
+  const uid = auth.currentUser?.uid;
+  if (!uid || !isVerifiedAdminFirebaseSession()) {
+    throw new Error('Admin Firebase session is required to publish notices.');
+  }
+  const noticeId = sanitizeId(idOverride || `ntc-${Date.now()}`, 'ntc');
+  const title = (input.title || '').trim().slice(0, 180);
+  const body = (input.body || '').trim().slice(0, 4000);
+  if (title.length < 2 || body.length < 2) {
+    throw new Error('Notice title and body must be at least 2 characters.');
+  }
+  const category: PlatformNotice['category'] =
+    input.category === 'exam' || input.category === 'result' || input.category === 'urgent'
+      ? input.category
+      : 'general';
+  const officialLink = (input.officialLink || '').trim().slice(0, 500);
+
+  try {
+    await setDoc(doc(db, 'platformNotices', noticeId), {
+      id: noticeId,
+      title,
+      body,
+      category,
+      officialLink,
+      pinned: Boolean(input.pinned),
+      createdBy: uid,
+      createdAt: serverTimestamp(),
+    });
+    return {
+      id: noticeId,
+      title,
+      body,
+      category,
+      officialLink,
+      pinned: Boolean(input.pinned),
+      createdAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `platformNotices/${noticeId}`);
+  }
+}
+
+export async function adminDeleteNoticeInFirestore(noticeIdRaw: string): Promise<void> {
+  if (!isVerifiedAdminFirebaseSession()) return;
+  const noticeId = sanitizeId(noticeIdRaw, 'ntc');
+  try {
+    await deleteDoc(doc(db, 'platformNotices', noticeId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `platformNotices/${noticeId}`);
+  }
+}
+
+// --- Push Notifications (Real-Time Broadcasts) ---
+export async function fetchPushNotificationsFromFirestore(): Promise<PushNotificationCampaign[]> {
+  if (!isFirebaseConfigured || !auth.currentUser) return [];
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'pushNotifications'), orderBy('createdAt', 'desc'), limit(60))
+    );
+    return snap.docs.map((d) => mapCampaignDoc(d.id, d.data() as Record<string, unknown>));
+  } catch {
+    return [];
+  }
+}
+
+export function subscribePushNotificationsFromFirestore(
+  onCampaigns: (campaigns: PushNotificationCampaign[]) => void
+): Unsubscribe {
+  if (!isFirebaseConfigured || !auth.currentUser) return () => {};
+  const q = query(collection(db, 'pushNotifications'), orderBy('createdAt', 'desc'), limit(50));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      onCampaigns(snapshot.docs.map((d) => mapCampaignDoc(d.id, d.data() as Record<string, unknown>)));
+    },
+    (error) => {
+      console.warn('Firestore pushNotifications listener warning:', error.message);
+    }
+  );
+}
+
+export async function adminCreatePushNotificationInFirestore(
+  input: {
+    id?: string;
+    title: string;
+    body: string;
+    category: PushCategory;
+    imageUrl?: string;
+    targetView?: string;
+    actionUrl?: string;
+    audienceType: PushAudienceType;
+    targetUserIds?: string[];
+    targetDepartment?: string;
+    targetSemester?: number | null;
+    soundMode?: PushSoundMode;
+    totalRecipients?: number;
+  }
+): Promise<PushNotificationCampaign> {
+  const uid = auth.currentUser?.uid;
+  if (!uid || !isVerifiedAdminFirebaseSession()) {
+    throw new Error('Admin Firebase session is required to send notifications.');
+  }
+  const campaignId = sanitizeId(input.id || `push-${Date.now()}`, 'push');
+  const title = (input.title || '').trim().slice(0, 140);
+  const body = (input.body || '').trim().slice(0, 1000);
+  if (title.length < 2 || body.length < 2) {
+    throw new Error('Notification title and message must be at least 2 characters.');
+  }
+  const validCats: PushCategory[] = ['APP_UPDATE', 'IMPORTANT', 'EDUCATION', 'EMERGENCY', 'GENERAL'];
+  const category: PushCategory = validCats.includes(input.category) ? input.category : 'GENERAL';
+  const audienceType: PushAudienceType =
+    input.audienceType === 'selected_users' || input.audienceType === 'department_semester'
+      ? input.audienceType
+      : 'all';
+  const targetUserIds = Array.isArray(input.targetUserIds)
+    ? input.targetUserIds.map(String).filter(Boolean).slice(0, 200)
+    : [];
+  const targetDepartment = (input.targetDepartment || '').trim().slice(0, 40);
+  const rawSem = Number(input.targetSemester || 0);
+  const targetSemester = rawSem >= 1 && rawSem <= 8 ? Math.trunc(rawSem) : 0;
+  const soundMode: PushSoundMode =
+    input.soundMode === 'default' || input.soundMode === 'silent' ? input.soundMode : 'custom';
+  const imageUrl = (input.imageUrl || '').trim().slice(0, 500);
+  const targetView = (input.targetView || 'notifications').trim().slice(0, 60) || 'notifications';
+  const actionUrl = (input.actionUrl || '').trim().slice(0, 500);
+  const totalRecipients = Math.min(
+    100000,
+    Math.max(0, Math.trunc(Number(input.totalRecipients) || (audienceType === 'selected_users' ? targetUserIds.length : 1)))
+  );
+
+  try {
+    await setDoc(doc(db, 'pushNotifications', campaignId), {
+      id: campaignId,
+      title,
+      body,
+      category,
+      imageUrl,
+      targetView,
+      actionUrl,
+      audienceType,
+      targetUserIds,
+      targetDepartment,
+      targetSemester,
+      soundMode,
+      status: 'sent',
+      totalRecipients,
+      createdBy: uid,
+      createdAt: serverTimestamp(),
+    });
+    return {
+      id: campaignId,
+      title,
+      body,
+      category,
+      imageUrl,
+      targetView,
+      actionUrl,
+      audienceType,
+      targetUserIds,
+      targetDepartment,
+      targetSemester: targetSemester > 0 ? targetSemester : null,
+      soundMode,
+      status: 'sent',
+      totalRecipients,
+      fcmSentCount: 0,
+      fcmFailedCount: 0,
+      createdBy: uid,
+      createdAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `pushNotifications/${campaignId}`);
+  }
+}
+
+// --- Platform Formulas ---
+export async function fetchPlatformFormulasFromFirestore(): Promise<FormulaItem[]> {
+  if (!isFirebaseConfigured) return [];
+  try {
+    const snap = await getDocs(query(collection(db, 'platformFormulas'), limit(200)));
+    return snap.docs.map((d) => {
+      const data = d.data() as Record<string, unknown>;
+      return {
+        id: String(data.id || d.id),
+        subject: data.subject === 'mathematics' ? 'mathematics' : 'physics',
+        chapter: String(data.chapter || ''),
+        chapterBn: String(data.chapterBn || data.chapter || ''),
+        nameEn: String(data.nameEn || ''),
+        nameBn: String(data.nameBn || data.nameEn || ''),
+        expressionLatex: String(data.expressionLatex || ''),
+        expressionPlain: String(data.expressionPlain || data.expressionLatex || ''),
+        symbols: [],
+        explanationBn: String(data.explanationBn || ''),
+        explanationEn: String(data.explanationEn || ''),
+        exampleProblemBn: String(data.exampleProblemBn || ''),
+        exampleProblemEn: String(data.exampleProblemEn || ''),
+        exampleSolutionBn: String(data.exampleSolutionBn || ''),
+        exampleSolutionEn: String(data.exampleSolutionEn || ''),
+        isCustom: true,
+        updatedAt: toIsoTimestamp(data.updatedAt),
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function adminSaveFormulaInFirestore(
+  formula: Omit<FormulaItem, 'id'> & { id?: string }
+): Promise<FormulaItem> {
+  if (!isVerifiedAdminFirebaseSession()) {
+    throw new Error('Admin Firebase session is required to save formulas.');
+  }
+  const formulaId = sanitizeId(
+    formula.id || `${formula.subject === 'mathematics' ? 'math' : 'phy'}-custom-${Date.now()}`,
+    'frm'
+  );
+  const subject: 'physics' | 'mathematics' =
+    formula.subject === 'mathematics' ? 'mathematics' : 'physics';
+  const payload = {
+    id: formulaId,
+    subject,
+    chapter: (formula.chapter || 'general').trim().slice(0, 100) || 'general',
+    chapterBn: (formula.chapterBn || formula.chapter || '').trim().slice(0, 140),
+    nameEn: (formula.nameEn || formula.nameBn || 'Formula').trim().slice(0, 180) || 'Formula',
+    nameBn: (formula.nameBn || formula.nameEn || '').trim().slice(0, 180),
+    expressionLatex: (formula.expressionLatex || '').trim().slice(0, 500),
+    expressionPlain: (formula.expressionPlain || formula.expressionLatex || '').trim().slice(0, 500),
+    explanationBn: (formula.explanationBn || '').trim().slice(0, 2000),
+    explanationEn: (formula.explanationEn || '').trim().slice(0, 2000),
+    exampleProblemBn: (formula.exampleProblemBn || '').trim().slice(0, 1500),
+    exampleProblemEn: (formula.exampleProblemEn || '').trim().slice(0, 1500),
+    exampleSolutionBn: (formula.exampleSolutionBn || '').trim().slice(0, 2000),
+    exampleSolutionEn: (formula.exampleSolutionEn || '').trim().slice(0, 2000),
+    isCustom: true,
+    updatedAt: serverTimestamp(),
+  };
+
+  try {
+    await setDoc(doc(db, 'platformFormulas', formulaId), payload);
+    return {
+      ...payload,
+      symbols: formula.symbols ?? [],
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `platformFormulas/${formulaId}`);
+  }
+}
+
+export async function adminDeleteFormulaInFirestore(formulaIdRaw: string): Promise<void> {
+  if (!isVerifiedAdminFirebaseSession()) return;
+  const formulaId = sanitizeId(formulaIdRaw, 'frm');
+  try {
+    await deleteDoc(doc(db, 'platformFormulas', formulaId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `platformFormulas/${formulaId}`);
+  }
+}
+
+// --- Platform Shared Notes / PDFs ---
+export async function fetchPlatformSharedNotesFromFirestore(): Promise<SharedPdfNote[]> {
+  if (!isFirebaseConfigured) return [];
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'platformSharedNotes'), orderBy('createdAt', 'desc'), limit(150))
+    );
+    return snap.docs.map((d) => {
+      const data = d.data() as Record<string, unknown>;
+      return {
+        id: String(data.id || d.id),
+        title: String(data.title || ''),
+        department: String(data.department || 'power'),
+        semester: sanitizeSemester(typeof data.semester === 'number' ? data.semester : 4),
+        subjectCode: String(data.subjectCode || ''),
+        summary: String(data.summary || ''),
+        pdfUrl: String(data.pdfUrl || ''),
+        downloadPermitted: data.downloadPermitted !== false,
+        createdAt: toIsoTimestamp(data.createdAt),
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function adminSaveSharedNoteInFirestore(
+  note: Omit<SharedPdfNote, 'id' | 'createdAt'> & { id?: string }
+): Promise<SharedPdfNote> {
+  if (!isVerifiedAdminFirebaseSession()) {
+    throw new Error('Admin Firebase session is required to save shared notes.');
+  }
+  const noteId = sanitizeId(note.id || `sn-${Date.now()}`, 'sn');
+  const ref = doc(db, 'platformSharedNotes', noteId);
+  const safeFields = {
+    id: noteId,
+    title: (note.title || '').trim().slice(0, 200),
+    department: sanitizeDepartment(note.department),
+    semester: sanitizeSemester(note.semester),
+    subjectCode: (note.subjectCode || '').trim().slice(0, 40),
+    summary: (note.summary || '').trim().slice(0, 1000),
+    pdfUrl: (note.pdfUrl || '').trim().slice(0, 1000),
+    downloadPermitted: note.downloadPermitted !== false,
+  };
+  try {
+    const snap = await getDoc(ref);
+    if (snap.exists()) {
+      await updateDoc(ref, {
+        title: safeFields.title,
+        department: safeFields.department,
+        semester: safeFields.semester,
+        subjectCode: safeFields.subjectCode,
+        summary: safeFields.summary,
+        pdfUrl: safeFields.pdfUrl,
+        downloadPermitted: safeFields.downloadPermitted,
+      });
+      return {
+        ...safeFields,
+        createdAt: toIsoTimestamp((snap.data() as Record<string, unknown>).createdAt),
+      };
+    }
+    await setDoc(ref, {
+      ...safeFields,
+      createdAt: serverTimestamp(),
+    });
+    return {
+      ...safeFields,
+      createdAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `platformSharedNotes/${noteId}`);
+  }
+}
+
+export async function adminDeleteSharedNoteInFirestore(noteIdRaw: string): Promise<void> {
+  if (!isVerifiedAdminFirebaseSession()) return;
+  const noteId = sanitizeId(noteIdRaw, 'sn');
+  try {
+    await deleteDoc(doc(db, 'platformSharedNotes', noteId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `platformSharedNotes/${noteId}`);
+  }
+}
+
+// --- Platform MCQs ---
+export async function fetchPlatformMcqsFromFirestore(): Promise<(McqQuestion & { semester?: number })[]> {
+  if (!isFirebaseConfigured) return [];
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'platformMcqs'), orderBy('createdAt', 'desc'), limit(200))
+    );
+    return snap.docs.map((d) => {
+      const data = d.data() as Record<string, unknown>;
+      const rawOpts = Array.isArray(data.optionsBn) ? data.optionsBn.map(String) : ['', '', '', ''];
+      const optionsBn: [string, string, string, string] = [
+        rawOpts[0] || '',
+        rawOpts[1] || '',
+        rawOpts[2] || '',
+        rawOpts[3] || '',
+      ];
+      const ci = Math.min(3, Math.max(0, Math.trunc(Number(data.correctIndex) || 0))) as 0 | 1 | 2 | 3;
+      return {
+        id: String(data.id || d.id),
+        category: String(data.category || 'পাওয়ার টেকনোলজি'),
+        department: sanitizeDepartment(typeof data.department === 'string' ? data.department : 'power') as McqQuestion['department'],
+        semester: sanitizeSemester(typeof data.semester === 'number' ? data.semester : 4) as SemesterNumber,
+        questionBn: String(data.questionBn || ''),
+        optionsBn,
+        correctIndex: ci,
+        explanationBn: String(data.explanationBn || ''),
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function adminCreateMcqInFirestore(
+  mcq: {
+    id?: string;
+    category: string;
+    department: string;
+    semester: number;
+    questionBn: string;
+    optionsBn: [string, string, string, string];
+    correctIndex: 0 | 1 | 2 | 3;
+    explanationBn: string;
+  }
+): Promise<McqQuestion & { semester?: number }> {
+  if (!isVerifiedAdminFirebaseSession()) {
+    throw new Error('Admin Firebase session is required to publish MCQs.');
+  }
+  const mcqId = sanitizeId(mcq.id || `mcq-${Date.now()}`, 'mcq');
+  const department = sanitizeDepartment(mcq.department);
+  const semester = sanitizeSemester(mcq.semester) as SemesterNumber;
+  const optionsBn: [string, string, string, string] = [
+    String(mcq.optionsBn[0] || '').trim(),
+    String(mcq.optionsBn[1] || '').trim(),
+    String(mcq.optionsBn[2] || '').trim(),
+    String(mcq.optionsBn[3] || '').trim(),
+  ];
+  const correctIndex = Math.min(3, Math.max(0, Math.trunc(Number(mcq.correctIndex) || 0))) as 0 | 1 | 2 | 3;
+  try {
+    await setDoc(doc(db, 'platformMcqs', mcqId), {
+      id: mcqId,
+      category: (mcq.category || 'General').trim().slice(0, 100) || 'General',
+      department,
+      semester,
+      questionBn: (mcq.questionBn || '').trim().slice(0, 600),
+      optionsBn,
+      correctIndex,
+      explanationBn: (mcq.explanationBn || '').trim().slice(0, 1200),
+      createdAt: serverTimestamp(),
+    });
+    return {
+      id: mcqId,
+      category: (mcq.category || 'General').trim().slice(0, 100) || 'General',
+      department: department as McqQuestion['department'],
+      semester,
+      questionBn: (mcq.questionBn || '').trim().slice(0, 600),
+      optionsBn,
+      correctIndex,
+      explanationBn: (mcq.explanationBn || '').trim().slice(0, 1200),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `platformMcqs/${mcqId}`);
+  }
+}
+
+export async function adminDeleteMcqInFirestore(mcqIdRaw: string): Promise<void> {
+  if (!isVerifiedAdminFirebaseSession()) return;
+  const mcqId = sanitizeId(mcqIdRaw, 'mcq');
+  try {
+    await deleteDoc(doc(db, 'platformMcqs', mcqId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `platformMcqs/${mcqId}`);
+  }
+}
+
+// --- Platform App Config ---
+export async function fetchPlatformAppConfigFromFirestore(): Promise<AppReleaseConfig | null> {
+  if (!isFirebaseConfigured) return null;
+  try {
+    const snap = await getDoc(doc(db, 'platformConfig', 'main'));
+    if (!snap.exists()) return null;
+    const data = snap.data() as Record<string, unknown>;
+    return {
+      appVersion: String(data.appVersion || '2.0.0'),
+      apkStatus: data.apkStatus === 'available' ? 'available' : 'coming_soon',
+      apkDownloadUrl: String(data.apkDownloadUrl || ''),
+      apkReleaseNotes: String(data.apkReleaseNotes || ''),
+      btebResultUrl: String(data.btebResultUrl || 'https://result.bteb.gov.bd/result-search'),
+      officialWebsiteUrl: String(data.officialWebsiteUrl || 'https://bteb.gov.bd/'),
+      updatedAt: toIsoTimestamp(data.updatedAt),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function adminSaveAppConfigInFirestore(
+  config: Partial<AppReleaseConfig>
+): Promise<AppReleaseConfig> {
+  if (!isVerifiedAdminFirebaseSession()) {
+    throw new Error('Admin Firebase session is required to update configuration.');
+  }
+  const existing = await fetchPlatformAppConfigFromFirestore();
+  const merged = {
+    appVersion: (config.appVersion ?? existing?.appVersion ?? '2.0.0').trim().slice(0, 40) || '2.0.0',
+    apkStatus: (config.apkStatus ?? existing?.apkStatus ?? 'coming_soon') === 'available'
+      ? ('available' as const)
+      : ('coming_soon' as const),
+    apkDownloadUrl: (config.apkDownloadUrl ?? existing?.apkDownloadUrl ?? '').trim().slice(0, 600),
+    apkReleaseNotes: (config.apkReleaseNotes ?? existing?.apkReleaseNotes ?? '').trim().slice(0, 1000),
+    btebResultUrl:
+      (config.btebResultUrl ?? existing?.btebResultUrl ?? 'https://result.bteb.gov.bd/result-search')
+        .trim()
+        .slice(0, 600) || 'https://result.bteb.gov.bd/result-search',
+    officialWebsiteUrl:
+      (config.officialWebsiteUrl ?? existing?.officialWebsiteUrl ?? 'https://bteb.gov.bd/')
+        .trim()
+        .slice(0, 600) || 'https://bteb.gov.bd/',
+  };
+
+  try {
+    await setDoc(doc(db, 'platformConfig', 'main'), {
+      ...merged,
+      updatedAt: serverTimestamp(),
+    });
+    return {
+      ...merged,
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, 'platformConfig/main');
+  }
+}
+

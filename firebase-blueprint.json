@@ -69,6 +69,9 @@
           "type": "string",
           "enum": ["student", "admin"]
         },
+        "isDisabled": {
+          "type": "boolean"
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
@@ -399,6 +402,345 @@
         }
       },
       "required": ["uid", "email", "grantedAt"]
+    },
+    "PlatformNotice": {
+      "title": "PlatformNotice",
+      "description": "Admin-published announcement or BTEB notice visible to all students.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 180
+        },
+        "body": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 4000
+        },
+        "category": {
+          "type": "string",
+          "enum": ["general", "exam", "result", "urgent"]
+        },
+        "officialLink": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "title", "body", "category", "pinned", "createdBy", "createdAt"]
+    },
+    "PushNotificationCampaign": {
+      "title": "PushNotificationCampaign",
+      "description": "Admin-dispatched real-time notification campaign delivered to students in-app across devices.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 140
+        },
+        "body": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1000
+        },
+        "category": {
+          "type": "string",
+          "enum": ["APP_UPDATE", "IMPORTANT", "EDUCATION", "EMERGENCY", "GENERAL"]
+        },
+        "imageUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "targetView": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "actionUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "audienceType": {
+          "type": "string",
+          "enum": ["all", "selected_users", "department_semester"]
+        },
+        "targetUserIds": {
+          "type": "array"
+        },
+        "targetDepartment": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "targetSemester": {
+          "type": "integer"
+        },
+        "soundMode": {
+          "type": "string",
+          "enum": ["custom", "default", "silent"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["sent", "partial", "failed"]
+        },
+        "totalRecipients": {
+          "type": "integer"
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "body",
+        "category",
+        "audienceType",
+        "targetUserIds",
+        "soundMode",
+        "status",
+        "totalRecipients",
+        "createdBy",
+        "createdAt"
+      ]
+    },
+    "PlatformFormula": {
+      "title": "PlatformFormula",
+      "description": "Admin-managed Physics or Mathematics formula item synced to Formula Hub.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "subject": {
+          "type": "string",
+          "enum": ["physics", "mathematics"]
+        },
+        "chapter": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "chapterBn": {
+          "type": "string",
+          "maxLength": 140
+        },
+        "nameEn": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180
+        },
+        "nameBn": {
+          "type": "string",
+          "maxLength": 180
+        },
+        "expressionLatex": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "expressionPlain": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "explanationBn": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "explanationEn": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "exampleProblemBn": {
+          "type": "string",
+          "maxLength": 1500
+        },
+        "exampleProblemEn": {
+          "type": "string",
+          "maxLength": 1500
+        },
+        "exampleSolutionBn": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "exampleSolutionEn": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "isCustom": {
+          "type": "boolean"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "subject", "chapter", "nameEn", "expressionLatex", "updatedAt"]
+    },
+    "PlatformSharedNote": {
+      "title": "PlatformSharedNote",
+      "description": "Admin-published shared PDF book or study note entry.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 200
+        },
+        "department": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "semester": {
+          "type": "integer"
+        },
+        "subjectCode": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "pdfUrl": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "downloadPermitted": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "title", "department", "semester", "pdfUrl", "downloadPermitted", "createdAt"]
+    },
+    "PlatformMcq": {
+      "title": "PlatformMcq",
+      "description": "Admin-published MCQ question for Quiz and Model Test.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "department": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "semester": {
+          "type": "integer"
+        },
+        "questionBn": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 600
+        },
+        "optionsBn": {
+          "type": "array"
+        },
+        "correctIndex": {
+          "type": "integer"
+        },
+        "explanationBn": {
+          "type": "string",
+          "maxLength": 1200
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "category", "department", "semester", "questionBn", "optionsBn", "correctIndex", "createdAt"]
+    },
+    "PlatformAppConfig": {
+      "title": "PlatformAppConfig",
+      "description": "Admin-managed application release settings, APK download link, and BTEB portal links.",
+      "type": "object",
+      "properties": {
+        "appVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "apkStatus": {
+          "type": "string",
+          "enum": ["coming_soon", "available"]
+        },
+        "apkDownloadUrl": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "apkReleaseNotes": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "btebResultUrl": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "officialWebsiteUrl": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["appVersion", "apkStatus", "btebResultUrl", "officialWebsiteUrl", "updatedAt"]
     }
   },
   "firestore": {
@@ -425,6 +767,30 @@
     "/admins/{userId}": {
       "schema": { "$ref": "#/entities/AdminMarker" },
       "description": "Admin role assignment markers managed strictly by admins."
+    },
+    "/platformNotices/{noticeId}": {
+      "schema": { "$ref": "#/entities/PlatformNotice" },
+      "description": "Admin-published platform notices visible to all students across dev and published builds."
+    },
+    "/pushNotifications/{campaignId}": {
+      "schema": { "$ref": "#/entities/PushNotificationCampaign" },
+      "description": "Admin-dispatched real-time notification campaigns streamed to signed-in students."
+    },
+    "/platformFormulas/{formulaId}": {
+      "schema": { "$ref": "#/entities/PlatformFormula" },
+      "description": "Admin-managed custom formulas for Physics and Mathematics."
+    },
+    "/platformSharedNotes/{noteId}": {
+      "schema": { "$ref": "#/entities/PlatformSharedNote" },
+      "description": "Admin-published shared PDF books and notes."
+    },
+    "/platformMcqs/{mcqId}": {
+      "schema": { "$ref": "#/entities/PlatformMcq" },
+      "description": "Admin-published MCQ questions."
+    },
+    "/platformConfig/{configId}": {
+      "schema": { "$ref": "#/entities/PlatformAppConfig" },
+      "description": "Admin-managed app release and BTEB link configuration."
     }
   }
 }

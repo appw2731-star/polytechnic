@@ -64,7 +64,7 @@ service cloud.firestore {
         'uid', 'fullName', 'email', 'department', 'semester',
         'collegeName', 'rollNumber', 'bio', 'avatarUrl', 'coverUrl',
         'gender', 'showGender', 'profileVisibility', 'authProvider',
-        'role', 'createdAt', 'updatedAt'
+        'role', 'isDisabled', 'createdAt', 'updatedAt'
       ]) &&
       isValidId(data.uid) &&
       data.uid == pathUserId &&
@@ -82,6 +82,7 @@ service cloud.firestore {
       (!('profileVisibility' in data) || (data.profileVisibility in ['public', 'department', 'private'])) &&
       (!('authProvider' in data) || (data.authProvider in ['google', 'facebook', 'email'])) &&
       (data.role == 'student' || data.role == 'admin') &&
+      (!('isDisabled' in data) || data.isDisabled is bool) &&
       data.createdAt is timestamp &&
       data.updatedAt is timestamp;
     }
@@ -194,6 +195,142 @@ service cloud.firestore {
       data.grantedAt is timestamp;
     }
 
+    function isValidPlatformNotice(data, noticeId) {
+      return data.keys().hasAll([
+        'id', 'title', 'body', 'category', 'pinned', 'createdBy', 'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'title', 'body', 'category', 'officialLink', 'pinned', 'createdBy', 'createdAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == noticeId &&
+      data.title is string && data.title.size() >= 2 && data.title.size() <= 180 &&
+      data.body is string && data.body.size() >= 2 && data.body.size() <= 4000 &&
+      (data.category in ['general', 'exam', 'result', 'urgent']) &&
+      (!('officialLink' in data) || (data.officialLink is string && data.officialLink.size() <= 500)) &&
+      data.pinned is bool &&
+      isValidId(data.createdBy) &&
+      data.createdAt is timestamp;
+    }
+
+    function isValidPushNotificationCampaign(data, campaignId) {
+      return data.keys().hasAll([
+        'id', 'title', 'body', 'category', 'audienceType', 'targetUserIds',
+        'soundMode', 'status', 'totalRecipients', 'createdBy', 'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'title', 'body', 'category', 'imageUrl', 'targetView', 'actionUrl',
+        'audienceType', 'targetUserIds', 'targetDepartment', 'targetSemester',
+        'soundMode', 'status', 'totalRecipients', 'createdBy', 'createdAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == campaignId &&
+      data.title is string && data.title.size() >= 2 && data.title.size() <= 140 &&
+      data.body is string && data.body.size() >= 2 && data.body.size() <= 1000 &&
+      (data.category in ['APP_UPDATE', 'IMPORTANT', 'EDUCATION', 'EMERGENCY', 'GENERAL']) &&
+      (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 500)) &&
+      (!('targetView' in data) || (data.targetView is string && data.targetView.size() <= 60)) &&
+      (!('actionUrl' in data) || (data.actionUrl is string && data.actionUrl.size() <= 500)) &&
+      (data.audienceType in ['all', 'selected_users', 'department_semester']) &&
+      data.targetUserIds is list && data.targetUserIds.size() <= 200 &&
+      (data.targetUserIds.size() == 0 || data.targetUserIds[0] is string) &&
+      (!('targetDepartment' in data) || (data.targetDepartment is string && data.targetDepartment.size() <= 40)) &&
+      (!('targetSemester' in data) || (data.targetSemester is int && data.targetSemester >= 0 && data.targetSemester <= 8)) &&
+      (data.soundMode in ['custom', 'default', 'silent']) &&
+      (data.status in ['sent', 'partial', 'failed']) &&
+      data.totalRecipients is int && data.totalRecipients >= 0 && data.totalRecipients <= 100000 &&
+      isValidId(data.createdBy) &&
+      data.createdAt is timestamp;
+    }
+
+    function isValidPlatformFormula(data, formulaId) {
+      return data.keys().hasAll([
+        'id', 'subject', 'chapter', 'nameEn', 'expressionLatex', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'subject', 'chapter', 'chapterBn', 'nameEn', 'nameBn',
+        'expressionLatex', 'expressionPlain', 'explanationBn', 'explanationEn',
+        'exampleProblemBn', 'exampleProblemEn', 'exampleSolutionBn', 'exampleSolutionEn',
+        'isCustom', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == formulaId &&
+      (data.subject in ['physics', 'mathematics']) &&
+      data.chapter is string && data.chapter.size() >= 1 && data.chapter.size() <= 100 &&
+      (!('chapterBn' in data) || (data.chapterBn is string && data.chapterBn.size() <= 140)) &&
+      data.nameEn is string && data.nameEn.size() >= 1 && data.nameEn.size() <= 180 &&
+      (!('nameBn' in data) || (data.nameBn is string && data.nameBn.size() <= 180)) &&
+      data.expressionLatex is string && data.expressionLatex.size() >= 1 && data.expressionLatex.size() <= 500 &&
+      (!('expressionPlain' in data) || (data.expressionPlain is string && data.expressionPlain.size() <= 500)) &&
+      (!('explanationBn' in data) || (data.explanationBn is string && data.explanationBn.size() <= 2000)) &&
+      (!('explanationEn' in data) || (data.explanationEn is string && data.explanationEn.size() <= 2000)) &&
+      (!('exampleProblemBn' in data) || (data.exampleProblemBn is string && data.exampleProblemBn.size() <= 1500)) &&
+      (!('exampleProblemEn' in data) || (data.exampleProblemEn is string && data.exampleProblemEn.size() <= 1500)) &&
+      (!('exampleSolutionBn' in data) || (data.exampleSolutionBn is string && data.exampleSolutionBn.size() <= 2000)) &&
+      (!('exampleSolutionEn' in data) || (data.exampleSolutionEn is string && data.exampleSolutionEn.size() <= 2000)) &&
+      (!('isCustom' in data) || data.isCustom is bool) &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidPlatformSharedNote(data, noteId) {
+      return data.keys().hasAll([
+        'id', 'title', 'department', 'semester', 'pdfUrl', 'downloadPermitted', 'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'title', 'department', 'semester', 'subjectCode', 'summary',
+        'pdfUrl', 'downloadPermitted', 'createdAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == noteId &&
+      data.title is string && data.title.size() >= 2 && data.title.size() <= 200 &&
+      isValidDepartment(data.department) &&
+      isValidSemester(data.semester) &&
+      (!('subjectCode' in data) || (data.subjectCode is string && data.subjectCode.size() <= 40)) &&
+      (!('summary' in data) || (data.summary is string && data.summary.size() <= 1000)) &&
+      data.pdfUrl is string && data.pdfUrl.size() <= 1000 &&
+      data.downloadPermitted is bool &&
+      data.createdAt is timestamp;
+    }
+
+    function isValidPlatformMcq(data, mcqId) {
+      return data.keys().hasAll([
+        'id', 'category', 'department', 'semester', 'questionBn', 'optionsBn', 'correctIndex', 'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'category', 'department', 'semester', 'questionBn', 'optionsBn',
+        'correctIndex', 'explanationBn', 'createdAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == mcqId &&
+      data.category is string && data.category.size() >= 1 && data.category.size() <= 100 &&
+      isValidDepartment(data.department) &&
+      isValidSemester(data.semester) &&
+      data.questionBn is string && data.questionBn.size() >= 2 && data.questionBn.size() <= 600 &&
+      data.optionsBn is list && data.optionsBn.size() == 4 &&
+      data.optionsBn[0] is string && data.optionsBn[1] is string &&
+      data.optionsBn[2] is string && data.optionsBn[3] is string &&
+      data.correctIndex is int && data.correctIndex >= 0 && data.correctIndex <= 3 &&
+      (!('explanationBn' in data) || (data.explanationBn is string && data.explanationBn.size() <= 1200)) &&
+      data.createdAt is timestamp;
+    }
+
+    function isValidPlatformAppConfig(data) {
+      return data.keys().hasAll([
+        'appVersion', 'apkStatus', 'btebResultUrl', 'officialWebsiteUrl', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'appVersion', 'apkStatus', 'apkDownloadUrl', 'apkReleaseNotes',
+        'btebResultUrl', 'officialWebsiteUrl', 'updatedAt'
+      ]) &&
+      data.appVersion is string && data.appVersion.size() >= 1 && data.appVersion.size() <= 40 &&
+      (data.apkStatus in ['coming_soon', 'available']) &&
+      (!('apkDownloadUrl' in data) || (data.apkDownloadUrl is string && data.apkDownloadUrl.size() <= 600)) &&
+      (!('apkReleaseNotes' in data) || (data.apkReleaseNotes is string && data.apkReleaseNotes.size() <= 1000)) &&
+      data.btebResultUrl is string && data.btebResultUrl.size() <= 600 &&
+      data.officialWebsiteUrl is string && data.officialWebsiteUrl.size() <= 600 &&
+      data.updatedAt is timestamp;
+    }
+
     // -----------------------------------------------------------------------
     // Collection: /admins/{userId}
     // -----------------------------------------------------------------------
@@ -211,6 +348,125 @@ service cloud.firestore {
         incoming().diff(existing()).affectedKeys().hasOnly(['email', 'grantedAt']) &&
         incoming().grantedAt == request.time;
       allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /platformNotices/{noticeId}
+    // -----------------------------------------------------------------------
+    match /platformNotices/{noticeId} {
+      allow get: if isValidId(noticeId);
+      allow list: if true;
+      allow create: if isAdmin() &&
+        isValidId(noticeId) &&
+        isValidPlatformNotice(incoming(), noticeId) &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if isAdmin() &&
+        isValidId(noticeId) &&
+        isValidPlatformNotice(incoming(), noticeId) &&
+        incoming().id == existing().id &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'title', 'body', 'category', 'officialLink', 'pinned'
+        ]);
+      allow delete: if isAdmin() && isValidId(noticeId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /pushNotifications/{campaignId}
+    // -----------------------------------------------------------------------
+    match /pushNotifications/{campaignId} {
+      allow get: if isSignedIn() && isValidId(campaignId);
+      allow list: if isSignedIn();
+      allow create: if isAdmin() &&
+        isValidId(campaignId) &&
+        isValidPushNotificationCampaign(incoming(), campaignId) &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if isAdmin() &&
+        isValidId(campaignId) &&
+        isValidPushNotificationCampaign(incoming(), campaignId) &&
+        incoming().id == existing().id &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'title', 'body', 'category', 'imageUrl', 'targetView', 'actionUrl',
+          'audienceType', 'targetUserIds', 'targetDepartment', 'targetSemester',
+          'soundMode', 'status', 'totalRecipients'
+        ]);
+      allow delete: if isAdmin() && isValidId(campaignId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /platformFormulas/{formulaId}
+    // -----------------------------------------------------------------------
+    match /platformFormulas/{formulaId} {
+      allow get: if isValidId(formulaId);
+      allow list: if true;
+      allow create: if isAdmin() &&
+        isValidId(formulaId) &&
+        isValidPlatformFormula(incoming(), formulaId) &&
+        incoming().updatedAt == request.time;
+      allow update: if isAdmin() &&
+        isValidId(formulaId) &&
+        isValidPlatformFormula(incoming(), formulaId) &&
+        incoming().id == existing().id &&
+        incoming().updatedAt == request.time;
+      allow delete: if isAdmin() && isValidId(formulaId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /platformSharedNotes/{noteId}
+    // -----------------------------------------------------------------------
+    match /platformSharedNotes/{noteId} {
+      allow get: if isValidId(noteId);
+      allow list: if true;
+      allow create: if isAdmin() &&
+        isValidId(noteId) &&
+        isValidPlatformSharedNote(incoming(), noteId) &&
+        incoming().createdAt == request.time;
+      allow update: if isAdmin() &&
+        isValidId(noteId) &&
+        isValidPlatformSharedNote(incoming(), noteId) &&
+        incoming().id == existing().id &&
+        incoming().createdAt == existing().createdAt;
+      allow delete: if isAdmin() && isValidId(noteId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /platformMcqs/{mcqId}
+    // -----------------------------------------------------------------------
+    match /platformMcqs/{mcqId} {
+      allow get: if isValidId(mcqId);
+      allow list: if true;
+      allow create: if isAdmin() &&
+        isValidId(mcqId) &&
+        isValidPlatformMcq(incoming(), mcqId) &&
+        incoming().createdAt == request.time;
+      allow update: if isAdmin() &&
+        isValidId(mcqId) &&
+        isValidPlatformMcq(incoming(), mcqId) &&
+        incoming().id == existing().id &&
+        incoming().createdAt == existing().createdAt;
+      allow delete: if isAdmin() && isValidId(mcqId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection: /platformConfig/{configId}
+    // -----------------------------------------------------------------------
+    match /platformConfig/{configId} {
+      allow get: if configId == 'main';
+      allow list: if false;
+      allow create: if isAdmin() &&
+        configId == 'main' &&
+        isValidPlatformAppConfig(incoming()) &&
+        incoming().updatedAt == request.time;
+      allow update: if isAdmin() &&
+        configId == 'main' &&
+        isValidPlatformAppConfig(incoming()) &&
+        incoming().updatedAt == request.time;
+      allow delete: if false;
     }
 
     // -----------------------------------------------------------------------
@@ -327,7 +583,7 @@ service cloud.firestore {
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
         (
-          (isOwner(userId) && incoming().role == 'student') ||
+          (isOwner(userId) && incoming().role == 'student' && (!('isDisabled' in incoming()) || incoming().isDisabled == false)) ||
           isAdmin()
         );
 
@@ -341,6 +597,7 @@ service cloud.firestore {
           (
             isOwner(userId) &&
             incoming().role == existing().role &&
+            (!('isDisabled' in incoming()) || ('isDisabled' in existing() && incoming().isDisabled == existing().isDisabled)) &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'fullName', 'department', 'semester', 'collegeName', 'rollNumber', 'bio',
               'avatarUrl', 'coverUrl', 'gender', 'showGender', 'profileVisibility', 'authProvider',
@@ -352,7 +609,7 @@ service cloud.firestore {
             incoming().diff(existing()).affectedKeys().hasOnly([
               'fullName', 'department', 'semester', 'collegeName', 'rollNumber', 'bio',
               'avatarUrl', 'coverUrl', 'gender', 'showGender', 'profileVisibility', 'authProvider',
-              'role', 'updatedAt'
+              'role', 'isDisabled', 'updatedAt'
             ])
           )
         );

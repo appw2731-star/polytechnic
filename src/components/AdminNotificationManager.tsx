@@ -109,6 +109,16 @@ export const AdminNotificationManager: React.FC<AdminNotificationManagerProps> =
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (audienceType === 'selected_users' && selectedUserIds.length === 0) {
+      onError(
+        bi(
+          language,
+          'কমপক্ষে একজন ব্যবহারকারী নির্বাচন করুন।',
+          'Please select at least one recipient user.'
+        )
+      );
+      return;
+    }
     setSending(true);
     try {
       const parsedSem = targetSemester ? Number(targetSemester) : null;
@@ -116,6 +126,18 @@ export const AdminNotificationManager: React.FC<AdminNotificationManagerProps> =
         deliveryMode === 'schedule' && scheduledForLocal
           ? new Date(scheduledForLocal).toISOString()
           : null;
+
+      const resolvedTargetIds =
+        audienceType === 'selected_users'
+          ? Array.from(
+              new Set(
+                selectedUserIds.flatMap((id) => {
+                  const found = users.find((u) => u.id === id);
+                  return found?.firebaseUid ? [id, found.firebaseUid] : [id];
+                })
+              )
+            )
+          : [];
 
       if (editingScheduledId) {
         await apiClient.adminUpdateScheduledNotification(editingScheduledId, {
@@ -125,7 +147,7 @@ export const AdminNotificationManager: React.FC<AdminNotificationManagerProps> =
           imageUrl,
           targetView,
           audienceType,
-          targetUserIds: selectedUserIds,
+          targetUserIds: resolvedTargetIds,
           targetDepartment: audienceType === 'department_semester' ? targetDepartment : '',
           targetSemester: audienceType === 'department_semester' ? parsedSem : null,
           soundMode,
@@ -140,7 +162,7 @@ export const AdminNotificationManager: React.FC<AdminNotificationManagerProps> =
           imageUrl,
           targetView,
           audienceType,
-          targetUserIds: selectedUserIds,
+          targetUserIds: resolvedTargetIds,
           targetDepartment: audienceType === 'department_semester' ? targetDepartment : '',
           targetSemester: audienceType === 'department_semester' ? parsedSem : null,
           soundMode,

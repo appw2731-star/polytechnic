@@ -1,4 +1,10 @@
 import { AiChatSession, StudyMateState, TimeSettings } from '../types/study';
+import {
+  computeStudyStreak,
+  recordActivityDate,
+  sanitizeDateKeys,
+  toDhakaDateKey,
+} from '../utils/studyStreak';
 
 const STORAGE_KEY = 'studymate_diploma_state_v1';
 const DEMO_SANITIZED_KEY = 'polytechnic_hub_demo_sanitized_v2';
@@ -59,6 +65,9 @@ export function createInitialState(): StudyMateState {
     favoriteFormulaIds: [],
     recentPdfIds: [],
     readNoticeIds: [],
+    streakActivityDates: [toDhakaDateKey()],
+    streakStudyActionDates: [],
+    longestStudyStreak: 1,
   };
 }
 
@@ -193,6 +202,23 @@ export const storageService = {
         recentPdfIds: Array.isArray(parsed.recentPdfIds) ? parsed.recentPdfIds : [],
         readNoticeIds: Array.isArray(parsed.readNoticeIds) ? parsed.readNoticeIds : [],
       };
+
+      // Record today's app visit toward the student's Study Streak and compute best streak
+      const streakActivityDates = recordActivityDate(
+        sanitizeDateKeys(parsed.streakActivityDates),
+        toDhakaDateKey()
+      );
+      const streakStudyActionDates = sanitizeDateKeys(parsed.streakStudyActionDates);
+      const initialStreak = computeStudyStreak({
+        activityDates: streakActivityDates,
+        studyActionDates: streakStudyActionDates,
+        timerHistory: loaded.timerHistory,
+        quizHistory: loaded.quizHistory,
+        storedBest: parsed.longestStudyStreak,
+      });
+      loaded.streakActivityDates = streakActivityDates;
+      loaded.streakStudyActionDates = streakStudyActionDates;
+      loaded.longestStudyStreak = initialStreak.longestStreak;
 
       if (needsLegacyDemoCleanup) {
         try {

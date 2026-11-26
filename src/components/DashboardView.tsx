@@ -11,11 +11,14 @@ import {
   Clock,
   Download,
   ExternalLink,
+  Flame,
   FolderOpen,
   HelpCircle,
+  Lightbulb,
   MessageSquare,
   NotebookPen,
   Pencil,
+  RefreshCw,
   Search,
   Sigma,
   Target,
@@ -28,6 +31,11 @@ import {
   getSubjectsForUser,
   getTodayDayBn,
 } from '../data/curriculum';
+import {
+  ENGINEERING_STUDY_TIPS,
+  getRandomStudyTip,
+  type EngineeringStudyTip,
+} from '../data/studyTips';
 import { bi } from '../i18n/translations';
 import type { ProfileUpdateResult } from '../services/profileUpdateService';
 import {
@@ -40,6 +48,7 @@ import {
   StudyMateState,
 } from '../types/study';
 import { formatDateBn, toBnDigits } from '../utils/formatBn';
+import { computeStudyStreak } from '../utils/studyStreak';
 import { DashboardHero, type HeroProfileChangePayload } from './DashboardHero';
 import { LiveBangladeshClock } from './LiveBangladeshClock';
 import { MathFormula } from './MathFormula';
@@ -72,9 +81,37 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const semesterSubjects = getSubjectsForUser(state.settings.department, state.settings.semester);
 
   const [globalSearch, setGlobalSearch] = useState('');
+  const [dailyTip, setDailyTip] = useState<EngineeringStudyTip>(() => getRandomStudyTip());
   const weeklyGoalHours = Math.min(100, Math.max(1, state.settings.weeklyStudyGoalHours ?? 14));
   const [isEditingGoal, setIsEditingGoal] = useState(false);
   const [goalInput, setGoalInput] = useState(String(weeklyGoalHours));
+
+  const dailyTipIndex = useMemo(
+    () => Math.max(1, ENGINEERING_STUDY_TIPS.findIndex((t) => t.id === dailyTip.id) + 1),
+    [dailyTip.id]
+  );
+
+  const handleNextStudyTip = () => {
+    setDailyTip((prev) => getRandomStudyTip(prev.id));
+  };
+
+  const studyStreak = useMemo(
+    () =>
+      computeStudyStreak({
+        activityDates: state.streakActivityDates,
+        studyActionDates: state.streakStudyActionDates,
+        timerHistory: state.timerHistory,
+        quizHistory: state.quizHistory,
+        storedBest: state.longestStudyStreak,
+      }),
+    [
+      state.streakActivityDates,
+      state.streakStudyActionDates,
+      state.timerHistory,
+      state.quizHistory,
+      state.longestStudyStreak,
+    ]
+  );
 
   const weeklyStudyStats = useMemo(() => {
     // Compute start of current study week in Asia/Dhaka (Saturday 00:00:00 BDT = UTC+6)
@@ -404,6 +441,53 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </section>
 
+      {/* Daily Study Tip Section */}
+      <section
+        aria-label={bi(lang, 'দৈনিক স্টাডি টিপ', 'Daily Study Tip')}
+        className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+          <div className="flex items-start gap-3.5 min-w-0 flex-1">
+            <div className="w-10 h-10 rounded-xl bg-amber-500/12 text-amber-600 dark:text-amber-400 flex items-center justify-center shrink-0 mt-0.5">
+              <Lightbulb className="w-5 h-5" />
+            </div>
+            <div className="min-w-0 flex-1 space-y-1.5">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500 dark:text-slate-400">
+                <span className="font-semibold text-amber-700 dark:text-amber-400">
+                  {bi(lang, 'আজকের স্টাডি টিপ', 'Daily Study Tip')}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span>{bi(lang, dailyTip.categoryBn, dailyTip.categoryEn)}</span>
+                <span aria-hidden="true">·</span>
+                <span className="tabular-nums font-mono text-[11px]">
+                  {lang === 'bn'
+                    ? `${toBnDigits(dailyTipIndex)} / ${toBnDigits(ENGINEERING_STUDY_TIPS.length)}`
+                    : `${dailyTipIndex} / ${ENGINEERING_STUDY_TIPS.length}`}
+                </span>
+              </div>
+              <h2 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white leading-snug text-balance">
+                {bi(lang, dailyTip.titleBn, dailyTip.titleEn)}
+              </h2>
+              <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed max-w-3xl">
+                {bi(lang, dailyTip.tipBn, dailyTip.tipEn)}
+              </p>
+              <p className="text-xs text-cyan-700 dark:text-cyan-400 font-medium pt-0.5">
+                {bi(lang, dailyTip.actionHintBn, dailyTip.actionHintEn)}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleNextStudyTip}
+            className="min-h-[40px] inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 hover:border-cyan-500/60 hover:bg-slate-50 dark:hover:bg-slate-800/70 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 self-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500"
+          >
+            <RefreshCw className="w-3.5 h-3.5 text-cyan-600 dark:text-cyan-400" />
+            <span>{bi(lang, 'নতুন টিপস', 'New Tip')}</span>
+          </button>
+        </div>
+      </section>
+
       {/* 4-Column Study Metrics Strip */}
       <section className="grid grid-cols-2 lg:grid-cols-4 gap-3 lg:gap-4">
         <div className="p-4 lg:p-5 rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
@@ -462,6 +546,200 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               ? bi(lang, `${toBnDigits(state.quizHistory.length)}টি কুইজ`, `${state.quizHistory.length} quizzes taken`)
               : bi(lang, 'এখনো কুইজ দেওয়া হয়নি', 'No quizzes yet')}
           </p>
+        </div>
+      </section>
+
+      {/* Study Streak Visual Indicator */}
+      <section
+        aria-label={bi(lang, 'স্টাডি স্ট্রিক', 'Study Streak')}
+        className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-5 lg:p-6"
+      >
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+          {/* Streak Counter & Motivation */}
+          <div className="flex items-start gap-4 min-w-0 flex-1">
+            <div
+              className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 border ${
+                studyStreak.currentStreak > 0
+                  ? 'bg-gradient-to-br from-amber-500/15 to-orange-500/15 border-amber-500/30 text-orange-500 dark:text-amber-400'
+                  : 'bg-slate-100 dark:bg-slate-800/80 border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-500'
+              }`}
+            >
+              <Flame className="w-6 h-6" />
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500 dark:text-slate-400">
+                <span className="font-semibold text-orange-600 dark:text-amber-400">
+                  {bi(lang, 'স্টাডি স্ট্রিক', 'Study Streak')}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span>{bi(lang, studyStreak.tierLabelBn, studyStreak.tierLabelEn)}</span>
+                <span aria-hidden="true">·</span>
+                <span
+                  className={
+                    studyStreak.completedStudyToday
+                      ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                      : 'text-amber-600 dark:text-amber-400 font-medium'
+                  }
+                >
+                  {studyStreak.completedStudyToday
+                    ? bi(lang, 'আজকের পড়াশোনা সম্পন্ন', "Today's study logged")
+                    : bi(lang, 'আজকের চেক-ইন সক্রিয়', 'Daily check-in active')}
+                </span>
+              </div>
+
+              <div className="mt-1.5 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                <p className="text-2xl sm:text-3xl font-bold text-slate-900 dark:text-white tabular-nums tracking-tight">
+                  {lang === 'bn'
+                    ? `${toBnDigits(studyStreak.currentStreak)} দিন`
+                    : `${studyStreak.currentStreak} ${studyStreak.currentStreak === 1 ? 'Day' : 'Days'}`}
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                  {lang === 'bn'
+                    ? `সেরা: ${toBnDigits(studyStreak.longestStreak)} দিন · মোট সক্রিয়: ${toBnDigits(studyStreak.totalActiveDays)} দিন`
+                    : `Best: ${studyStreak.longestStreak} ${studyStreak.longestStreak === 1 ? 'day' : 'days'} · Total active: ${studyStreak.totalActiveDays} ${studyStreak.totalActiveDays === 1 ? 'day' : 'days'}`}
+                </p>
+              </div>
+
+              <p className="mt-2 text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed max-w-xl">
+                {bi(lang, studyStreak.encouragementBn, studyStreak.encouragementEn)}
+              </p>
+            </div>
+          </div>
+
+          {/* 7-Day Visual Consistency Strip */}
+          <div className="shrink-0">
+            <div className="flex items-center justify-between lg:justify-end gap-2 mb-2.5">
+              <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                {bi(lang, 'গত ৭ দিনের ধারাবাহিকতা', 'Last 7 Days')}
+              </span>
+              <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                {lang === 'bn'
+                  ? `${toBnDigits(studyStreak.activeDaysLast7)} / ৭ দিন`
+                  : `${studyStreak.activeDaysLast7} / 7 days`}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-7 gap-2 sm:gap-2.5" role="list" aria-label={bi(lang, 'গত ৭ দিনের স্ট্রিক ইতিহাস', '7-day streak history')}>
+              {studyStreak.last7Days.map((day) => {
+                const statusLabel = day.hasStudyAction
+                  ? bi(lang, 'পড়াশোনা সম্পন্ন', 'Study completed')
+                  : day.active
+                  ? bi(lang, 'অ্যাপ চেক-ইন', 'App check-in')
+                  : bi(lang, 'অ্যাক্টিভিটি নেই', 'No activity');
+
+                return (
+                  <div
+                    key={day.dateKey}
+                    role="listitem"
+                    title={`${day.dateKey} — ${statusLabel}`}
+                    className="flex flex-col items-center gap-1.5"
+                  >
+                    <span
+                      className={`text-[11px] leading-none ${
+                        day.isToday
+                          ? 'font-bold text-orange-600 dark:text-amber-400'
+                          : 'font-medium text-slate-500 dark:text-slate-400'
+                      }`}
+                    >
+                      {lang === 'bn' ? day.dayShortBn : day.dayShortEn}
+                    </span>
+
+                    <div
+                      aria-label={`${lang === 'bn' ? day.dayShortBn : day.dayShortEn} (${day.dateKey}): ${statusLabel}`}
+                      className={`w-9 h-9 sm:w-10 sm:h-10 rounded-xl flex items-center justify-center transition-colors ${
+                        day.hasStudyAction
+                          ? 'bg-gradient-to-br from-amber-500 to-orange-500 text-white shadow-sm shadow-orange-500/20'
+                          : day.active
+                          ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/40'
+                          : 'bg-slate-100 dark:bg-slate-800/70 text-slate-400 dark:text-slate-500 border border-slate-200 dark:border-slate-700/80'
+                      } ${
+                        day.isToday
+                          ? 'ring-2 ring-amber-500/45 ring-offset-2 ring-offset-white dark:ring-offset-[#111827]'
+                          : ''
+                      }`}
+                    >
+                      {day.hasStudyAction ? (
+                        <Flame className="w-4 h-4" />
+                      ) : day.active ? (
+                        <Check className="w-4 h-4 stroke-[2.5]" />
+                      ) : (
+                        <span className="text-xs font-mono tabular-nums">
+                          {lang === 'bn' ? toBnDigits(day.dayNumber) : day.dayNumber}
+                        </span>
+                      )}
+                    </div>
+
+                    <span className="text-[10px] leading-none tabular-nums text-slate-400 dark:text-slate-500">
+                      {day.isToday
+                        ? bi(lang, 'আজ', 'Today')
+                        : lang === 'bn'
+                        ? toBnDigits(day.dayNumber)
+                        : day.dayNumber}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center justify-start lg:justify-end gap-x-4 gap-y-1 text-[11px] text-slate-500 dark:text-slate-400">
+              <span className="inline-flex items-center gap-1">
+                <Flame className="w-3 h-3 text-orange-500" />
+                <span>{bi(lang, 'পড়াশোনা সম্পন্ন', 'Study done')}</span>
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <Check className="w-3 h-3 text-amber-500 stroke-[2.5]" />
+                <span>{bi(lang, 'অ্যাপ চেক-ইন', 'App check-in')}</span>
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-[4px] bg-slate-200 dark:bg-slate-700 inline-block" />
+                <span>{bi(lang, 'বাদ গেছে', 'Missed')}</span>
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Milestone Progress Bar + Quick Action */}
+        <div className="mt-5 pt-4 border-t border-slate-200/80 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex-1 max-w-lg space-y-1.5">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="font-medium text-slate-700 dark:text-slate-200">
+                {lang === 'bn'
+                  ? `পরবর্তী মাইলফলক: ${toBnDigits(studyStreak.nextMilestone)} দিন`
+                  : `Next milestone: ${studyStreak.nextMilestone} days`}
+              </span>
+              <span className="text-slate-500 dark:text-slate-400 tabular-nums font-mono">
+                {lang === 'bn'
+                  ? `আর ${toBnDigits(studyStreak.daysToNextMilestone)} দিন বাকি`
+                  : `${studyStreak.daysToNextMilestone} ${studyStreak.daysToNextMilestone === 1 ? 'day' : 'days'} to go`}
+              </span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-amber-500 to-orange-500 transition-all duration-500"
+                style={{ width: `${Math.max(4, studyStreak.milestonePercent)}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => onNavigate('routine')}
+              className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 hover:border-amber-500/60 hover:bg-slate-50 dark:hover:bg-slate-800/70 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
+            >
+              <CalendarCheck2 className="w-3.5 h-3.5 text-amber-500" />
+              <span>{bi(lang, 'আজকের টাস্ক', "Today's Tasks")}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onNavigate('timer')}
+              className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
+            >
+              <Timer className="w-3.5 h-3.5" />
+              <span>{bi(lang, 'ফোকাস সেশন শুরু', 'Start Focus Timer')}</span>
+            </button>
+          </div>
         </div>
       </section>
 

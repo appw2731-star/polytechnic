@@ -40,9 +40,16 @@ import {
 } from './lib/firebaseAuth';
 import { supabase } from './lib/supabaseClient';
 import { aiService } from './services/aiService';
-import { apiClient, BootstrapResponse, getStoredToken, setStoredToken } from './services/apiClient';
+import {
+  apiClient,
+  BootstrapResponse,
+  doesCampaignTargetUser,
+  getStoredToken,
+  setStoredToken,
+} from './services/apiClient';
 import {
   deleteStudyNoteFromFirestore,
+  subscribePushNotificationsFromFirestore,
   subscribeUserStudyNotes,
   syncStudyNoteToFirestore,
   syncUserProfileToFirestore,
@@ -54,6 +61,7 @@ import { profileUpdateService, type ProfileUpdateResult } from './services/profi
 import { pushNotificationService } from './services/pushNotificationService';
 import type { HeroProfileChangePayload } from './components/DashboardHero';
 import { createNewAiSession, storageService } from './services/storageService';
+import { computeStudyStreak, recordActivityDate, toDhakaDateKey } from './utils/studyStreak';
 import {
   AiChatMessage,
   AiChatSession,
@@ -409,6 +417,56 @@ export default function App() {
       void sb.removeChannel(channel);
     };
   }, [currentUser, refreshNotificationInbox]);
+
+  useEffect(() => {
+    if (!currentUser || !isOnline) return;
+    let initialized = false;
+    const seenCampaignIds = new Set<string>();
+
+    const unsubscribe = subscribePushNotificationsFromFirestore((campaigns) => {
+      const matching = campaigns.filter((c) => doesCampaignTargetUser(c, currentUser));
+      if (!initialized) {
+        for (const c of campaigns) seenCampaignIds.add(c.id);
+        initialized = true;
+        if (matching.length > 0) {
+          void refreshNotificationInbox();
+        }
+        return;
+      }
+
+      const newlyArrived = matching.filter((c) => !seenCampaignIds.has(c.id));
+      for (const c of campaigns) seenCampaignIds.add(c.id);
+
+      if (newlyArrived.length > 0) {
+        const latest = newlyArrived[0];
+        const prefs = pushPreferencesRef.current;
+        if (isCategoryAllowedByPrefs(latest.category, prefs)) {
+          if (prefs.soundEnabled && latest.soundMode !== 'silent') {
+            void playNotificationSound(
+              latest.soundMode === 'default' ? 'system' : prefs.soundStyle,
+              true
+            );
+          }
+          const safeView: AppView = VALID_APP_VIEWS.has(latest.targetView as AppView)
+            ? (latest.targetView as AppView)
+            : 'notifications';
+          setInAppToast({
+            title: latest.title || 'Polytechnic Hub',
+            body: latest.body || '',
+            category: latest.category || 'GENERAL',
+            targetView: safeView,
+            imageUrl: latest.imageUrl || undefined,
+            notificationId: `fs-notif-${latest.id}`,
+          });
+        }
+        void refreshNotificationInbox();
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [currentUser, isOnline, refreshNotificationInbox]);
 
   const refreshBootstrap = useCallback(async () => {
     try {
@@ -864,6 +922,71 @@ export default function App() {
     };
   }, []);
 
+  const applyStreakUpdate = useCallback(
+    (
+      prev: StudyMateState,
+      options?: {
+        studyAction?: boolean;
+        nextTimerHistory?: CompletedTimerSession[];
+        nextQuizHistory?: QuizAttempt[];
+      }
+    ): Pick<
+      StudyMateState,
+      'streakActivityDates' | 'streakStudyActionDates' | 'longestStudyStreak'
+    > => {
+      const todayKey = toDhakaDateKey();
+      const nextActivityDates = recordActivityDate(prev.streakActivityDates, todayKey);
+      const nextStudyActionDates = options?.studyAction
+        ? recordActivityDate(prev.streakStudyActionDates, todayKey)
+        : prev.streakStudyActionDates ?? [];
+      const summary = computeStudyStreak({
+        activityDates: nextActivityDates,
+        studyActionDates: nextStudyActionDates,
+        timerHistory: options?.nextTimerHistory ?? prev.timerHistory,
+        quizHistory: options?.nextQuizHistory ?? prev.quizHistory,
+        storedBest: prev.longestStudyStreak,
+      });
+      return {
+        streakActivityDates: nextActivityDates,
+        streakStudyActionDates: nextStudyActionDates,
+        longestStudyStreak: summary.longestStreak,
+      };
+    },
+    []
+  );
+
+  // Keep daily app-visit streak accurate if the student keeps the app open across midnight (BDT)
+  useEffect(() => {
+    const syncDailyCheckIn = () => {
+      const todayKey = toDhakaDateKey();
+      setState((prev) => {
+        if (prev.streakActivityDates?.includes(todayKey)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          ...applyStreakUpdate(prev, { studyAction: false }),
+        };
+      });
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        syncDailyCheckIn();
+      }
+    };
+
+    syncDailyCheckIn();
+    window.addEventListener('focus', syncDailyCheckIn);
+    document.addEventListener('visibilitychange', handleVisibility);
+    const intervalId = window.setInterval(syncDailyCheckIn, 5 * 60 * 1000);
+    return () => {
+      window.removeEventListener('focus', syncDailyCheckIn);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.clearInterval(intervalId);
+    };
+  }, [applyStreakUpdate]);
+
   const handleToggleTheme = () => {
     setState((prev) => ({
       ...prev,
@@ -905,10 +1028,14 @@ export default function App() {
   };
 
   const handleAddCompletedTimerSession = (session: CompletedTimerSession) => {
-    setState((prev) => ({
-      ...prev,
-      timerHistory: [session, ...prev.timerHistory],
-    }));
+    setState((prev) => {
+      const nextTimerHistory = [session, ...prev.timerHistory];
+      return {
+        ...prev,
+        timerHistory: nextTimerHistory,
+        ...applyStreakUpdate(prev, { studyAction: true, nextTimerHistory }),
+      };
+    });
   };
 
   const handleClearTimerHistory = () => {
@@ -926,10 +1053,15 @@ export default function App() {
   };
 
   const handleToggleTask = (taskId: string) => {
-    setState((prev) => ({
-      ...prev,
-      tasks: prev.tasks.map((t) => (t.id === taskId ? { ...t, completed: !t.completed } : t)),
-    }));
+    setState((prev) => {
+      const target = prev.tasks.find((t) => t.id === taskId);
+      const markingCompleted = Boolean(target && !target.completed);
+      return {
+        ...prev,
+        tasks: prev.tasks.map((t) => (t.id === taskId ? { ...t, completed: !t.completed } : t)),
+        ...(markingCompleted ? applyStreakUpdate(prev, { studyAction: true }) : {}),
+      };
+    });
   };
 
   const handleDeleteTask = (taskId: string) => {
@@ -948,6 +1080,7 @@ export default function App() {
         completedChapterIds: exists
           ? prev.completedChapterIds.filter((id) => id !== chapterId)
           : [...prev.completedChapterIds, chapterId],
+        ...(!exists ? applyStreakUpdate(prev, { studyAction: true }) : {}),
       };
     });
   };
@@ -969,7 +1102,11 @@ export default function App() {
       createdAt: now,
       updatedAt: now,
     };
-    setState((prev) => ({ ...prev, notes: [newNote, ...prev.notes] }));
+    setState((prev) => ({
+      ...prev,
+      notes: [newNote, ...prev.notes],
+      ...applyStreakUpdate(prev, { studyAction: true }),
+    }));
     void syncStudyNoteToFirestore(
       newNote,
       state.settings.department,
@@ -1026,7 +1163,14 @@ export default function App() {
   };
 
   const handleSaveQuizAttempt = (attempt: QuizAttempt) => {
-    setState((prev) => ({ ...prev, quizHistory: [attempt, ...prev.quizHistory] }));
+    setState((prev) => {
+      const nextQuizHistory = [attempt, ...prev.quizHistory];
+      return {
+        ...prev,
+        quizHistory: nextQuizHistory,
+        ...applyStreakUpdate(prev, { studyAction: true, nextQuizHistory }),
+      };
+    });
   };
 
   const handleUpdateAiSessionMessages = (

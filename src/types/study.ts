@@ -249,6 +249,9 @@ export interface StudyMateState {
   favoriteFormulaIds: string[];
   recentPdfIds: string[];
   readNoticeIds: string[];
+  streakActivityDates?: string[];
+  streakStudyActionDates?: string[];
+  longestStudyStreak?: number;
 }
 
 export interface AuthUser {

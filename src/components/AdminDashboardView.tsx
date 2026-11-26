@@ -14,6 +14,7 @@ import {
   Layers,
   MessageSquare,
   Plus,
+  RefreshCw,
   Settings,
   ShieldAlert,
   ShieldCheck,
@@ -146,27 +147,54 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
   const [users, setUsers] = useState<AuthUser[]>([]);
   const [modPosts, setModPosts] = useState<CommunityPost[]>([]);
 
-  const notify = (msg: string) => {
+  const [loadingAdminLists, setLoadingAdminLists] = useState(false);
+
+  const notify = useCallback((msg: string) => {
     setErrorMsg(null);
     setStatusMsg(msg);
-    window.setTimeout(() => setStatusMsg(null), 3200);
-  };
+    window.setTimeout(() => setStatusMsg(null), 3600);
+  }, []);
+
+  const handleError = useCallback((msg: string) => {
+    setErrorMsg(msg);
+  }, []);
 
   const loadAdminLists = useCallback(async () => {
     if (!currentUser || currentUser.role !== 'admin') return;
+    setLoadingAdminLists(true);
     try {
-      const [uRes, cRes, mRes, aiRes] = await Promise.all([
+      const [uRes, cRes, mRes, aiRes] = await Promise.allSettled([
         apiClient.adminListUsers(),
         apiClient.getCommunityPosts(true),
         apiClient.adminGetMetrics(),
         apiClient.adminGetAiConfig(),
       ]);
-      setUsers(uRes.users);
-      setModPosts(cRes.posts);
-      setMetrics(mRes.metrics);
-      setAiConfig(aiRes.aiConfig);
+      const errors: string[] = [];
+      if (uRes.status === 'fulfilled') {
+        setUsers(uRes.value.users);
+      } else {
+        errors.push(uRes.reason instanceof Error ? uRes.reason.message : 'Users load failed');
+      }
+      if (cRes.status === 'fulfilled') {
+        setModPosts(cRes.value.posts);
+      } else {
+        errors.push(cRes.reason instanceof Error ? cRes.reason.message : 'Posts load failed');
+      }
+      if (mRes.status === 'fulfilled') {
+        setMetrics(mRes.value.metrics);
+      }
+      if (aiRes.status === 'fulfilled') {
+        setAiConfig(aiRes.value.aiConfig);
+      }
+      if (errors.length === 2) {
+        setErrorMsg(errors[0]);
+      } else {
+        setErrorMsg(null);
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to load admin data');
+    } finally {
+      setLoadingAdminLists(false);
     }
   }, [currentUser]);
 
@@ -417,6 +445,17 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
             )}
           </p>
         </div>
+        <button
+          type="button"
+          disabled={loadingAdminLists}
+          onClick={() => {
+            void Promise.all([loadAdminLists(), onRefreshBootstrap()]);
+          }}
+          className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:border-cyan-500/50 disabled:opacity-50"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${loadingAdminLists ? 'animate-spin' : ''}`} />
+          <span>{bi(language, 'রিফ্রেশ করুন', 'Refresh')}</span>
+        </button>
       </div>
 
       {statusMsg && (
@@ -701,7 +740,10 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                       void apiClient
                         .adminDeleteFormula(f.subject, f.id)
                         .then(onRefreshBootstrap)
-                        .then(() => notify('Formula deleted!'))
+                        .then(() => notify(bi(language, 'সূত্র মুছে ফেলা হয়েছে!', 'Formula deleted!')))
+                        .catch((err) =>
+                          setErrorMsg(err instanceof Error ? err.message : 'Failed to delete formula')
+                        )
                     }
                     className="p-2 text-red-500 hover:bg-red-500/10 rounded-lg"
                   >
@@ -884,7 +926,15 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                 </div>
                 <button
                   type="button"
-                  onClick={() => void apiClient.adminDeleteNotice(n.id).then(onRefreshBootstrap)}
+                  onClick={() =>
+                    void apiClient
+                      .adminDeleteNotice(n.id)
+                      .then(onRefreshBootstrap)
+                      .then(() => notify(bi(language, 'নোটিশ মুছে ফেলা হয়েছে।', 'Notice deleted.')))
+                      .catch((err) =>
+                        setErrorMsg(err instanceof Error ? err.message : 'Failed to delete notice')
+                      )
+                  }
                   className="p-2 text-red-500 hover:bg-red-500/10 rounded-lg"
                 >
                   <Trash2 className="w-4 h-4" />
@@ -1062,7 +1112,10 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                         void apiClient
                           .adminDeleteSharedNote(sn.id)
                           .then(onRefreshBootstrap)
-                          .then(() => notify('PDF Book deleted.'))
+                          .then(() => notify(bi(language, 'পিডিএফ বই মুছে ফেলা হয়েছে।', 'PDF Book deleted.')))
+                          .catch((err) =>
+                            setErrorMsg(err instanceof Error ? err.message : 'Failed to delete PDF book')
+                          )
                       }
                       className="p-2 text-red-500 hover:bg-red-500/10 rounded-lg"
                     >
@@ -1191,7 +1244,15 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                 </div>
                 <button
                   type="button"
-                  onClick={() => void apiClient.adminDeleteMcq(m.id).then(onRefreshBootstrap)}
+                  onClick={() =>
+                    void apiClient
+                      .adminDeleteMcq(m.id)
+                      .then(onRefreshBootstrap)
+                      .then(() => notify(bi(language, 'MCQ প্রশ্ন মুছে ফেলা হয়েছে।', 'MCQ deleted.')))
+                      .catch((err) =>
+                        setErrorMsg(err instanceof Error ? err.message : 'Failed to delete MCQ')
+                      )
+                  }
                   className="p-2 text-red-500 hover:bg-red-500/10 rounded-lg"
                 >
                   <Trash2 className="w-4 h-4" />
@@ -1227,6 +1288,16 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                     void apiClient
                       .adminModeratePost(p.id, { isHidden: !p.isHidden })
                       .then(loadAdminLists)
+                      .then(() =>
+                        notify(
+                          p.isHidden
+                            ? bi(language, 'পোস্ট পুনরায় দৃশ্যমান করা হয়েছে।', 'Post unhidden.')
+                            : bi(language, 'পোস্ট লুকানো হয়েছে।', 'Post hidden.')
+                        )
+                      )
+                      .catch((err) =>
+                        setErrorMsg(err instanceof Error ? err.message : 'Failed to update post')
+                      )
                   }
                   className="min-h-[34px] inline-flex items-center gap-1 px-3 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs"
                 >
@@ -1235,7 +1306,15 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => void apiClient.deleteCommunityPost(p.id).then(loadAdminLists)}
+                  onClick={() =>
+                    void apiClient
+                      .deleteCommunityPost(p.id)
+                      .then(loadAdminLists)
+                      .then(() => notify(bi(language, 'পোস্ট মুছে ফেলা হয়েছে।', 'Post deleted.')))
+                      .catch((err) =>
+                        setErrorMsg(err instanceof Error ? err.message : 'Failed to delete post')
+                      )
+                  }
                   className="p-2 text-red-500 hover:bg-red-500/10 rounded-lg"
                 >
                   <Trash2 className="w-4 h-4" />
@@ -1350,11 +1429,25 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={() =>
+                    onClick={() => {
+                      const nextRole = u.role === 'admin' ? 'student' : 'admin';
                       void apiClient
-                        .adminSetUserRole(u.id, u.role === 'admin' ? 'student' : 'admin')
+                        .adminSetUserRole(u.id, nextRole, {
+                          firebaseUid: u.firebaseUid,
+                          email: u.email,
+                        })
                         .then(loadAdminLists)
-                    }
+                        .then(() =>
+                          notify(
+                            nextRole === 'admin'
+                              ? bi(language, `${u.fullName}-কে অ্যাডমিন করা হয়েছে।`, `${u.fullName} promoted to Admin.`)
+                              : bi(language, `${u.fullName}-কে স্টুডেন্ট করা হয়েছে।`, `${u.fullName} changed to Student.`)
+                          )
+                        )
+                        .catch((err) =>
+                          setErrorMsg(err instanceof Error ? err.message : 'Failed to update role')
+                        );
+                    }}
                     className="min-h-[34px] px-3 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold"
                   >
                     {u.role === 'admin' ? 'Demote to Student' : 'Promote to Admin'}
@@ -1363,10 +1456,17 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                     type="button"
                     onClick={() =>
                       void apiClient
-                        .adminSetUserStatus(u.id, !u.isDisabled)
+                        .adminSetUserStatus(u.id, !u.isDisabled, { firebaseUid: u.firebaseUid })
                         .then(loadAdminLists)
                         .then(() =>
-                          notify(u.isDisabled ? 'User account enabled.' : 'User account disabled.')
+                          notify(
+                            u.isDisabled
+                              ? bi(language, 'ইউজার অ্যাকাউন্ট সক্রিয় করা হয়েছে।', 'User account enabled.')
+                              : bi(language, 'ইউজার অ্যাকাউন্ট নিষ্ক্রিয় করা হয়েছে।', 'User account disabled.')
+                          )
+                        )
+                        .catch((err) =>
+                          setErrorMsg(err instanceof Error ? err.message : 'Failed to update account status')
                         )
                     }
                     className={`min-h-[34px] inline-flex items-center gap-1 px-3 py-1 rounded-lg border text-xs font-semibold ${
@@ -1390,7 +1490,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
           language={language}
           users={users}
           onNotify={notify}
-          onError={(msg) => setErrorMsg(msg)}
+          onError={handleError}
         />
       )}
     </div>
