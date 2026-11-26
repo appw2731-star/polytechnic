@@ -1,4 +1,10 @@
-import { AiChatSession, StudyMateState, TimeSettings } from '../types/study';
+import {
+  AiChatSession,
+  StudyMateState,
+  TimeSettings,
+  UpcomingExam,
+  UpcomingExamType,
+} from '../types/study';
 import {
   computeStudyStreak,
   recordActivityDate,
@@ -68,6 +74,7 @@ export function createInitialState(): StudyMateState {
     streakActivityDates: [toDhakaDateKey()],
     streakStudyActionDates: [],
     longestStudyStreak: 1,
+    upcomingExams: [],
   };
 }
 
@@ -201,6 +208,41 @@ export const storageService = {
         favoriteFormulaIds,
         recentPdfIds: Array.isArray(parsed.recentPdfIds) ? parsed.recentPdfIds : [],
         readNoticeIds: Array.isArray(parsed.readNoticeIds) ? parsed.readNoticeIds : [],
+        upcomingExams: Array.isArray(parsed.upcomingExams)
+          ? parsed.upcomingExams
+              .filter(
+                (item): item is UpcomingExam =>
+                  Boolean(
+                    item &&
+                      typeof item.id === 'string' &&
+                      typeof item.title === 'string' &&
+                      item.title.trim().length > 0 &&
+                      typeof item.examDate === 'string' &&
+                      /^\d{4}-\d{2}-\d{2}$/.test(item.examDate)
+                  )
+              )
+              .map((item) => {
+                const validTypes: UpcomingExamType[] = ['final', 'midterm', 'practical', 'quiz'];
+                const examType: UpcomingExamType = validTypes.includes(item.examType)
+                  ? item.examType
+                  : 'final';
+                const examTime =
+                  typeof item.examTime === 'string' && /^\d{2}:\d{2}$/.test(item.examTime)
+                    ? item.examTime
+                    : '10:00';
+                return {
+                  id: item.id,
+                  title: item.title.trim().slice(0, 120),
+                  examDate: item.examDate,
+                  examTime,
+                  examType,
+                  createdAt:
+                    typeof item.createdAt === 'string' && item.createdAt
+                      ? item.createdAt
+                      : new Date().toISOString(),
+                };
+              })
+          : [],
       };
 
       // Record today's app visit toward the student's Study Streak and compute best streak

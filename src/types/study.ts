@@ -235,6 +235,17 @@ export interface UserSettings {
   weeklyStudyGoalHours?: number;
 }
 
+export type UpcomingExamType = 'final' | 'midterm' | 'practical' | 'quiz';
+
+export interface UpcomingExam {
+  id: string;
+  title: string;
+  examDate: string; // YYYY-MM-DD
+  examTime: string; // HH:MM (24-hour)
+  examType: UpcomingExamType;
+  createdAt: string;
+}
+
 export interface StudyMateState {
   settings: UserSettings;
   timeSettings: TimeSettings;
@@ -252,6 +263,7 @@ export interface StudyMateState {
   streakActivityDates?: string[];
   streakStudyActionDates?: string[];
   longestStudyStreak?: number;
+  upcomingExams?: UpcomingExam[];
 }
 
 export interface AuthUser {

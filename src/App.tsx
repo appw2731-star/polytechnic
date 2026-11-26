@@ -83,6 +83,7 @@ import {
   StudyTask,
   Subject,
   TimeSettings,
+  UpcomingExam,
   UserNotificationItem,
   UserSettings,
 } from './types/study';
@@ -1072,6 +1073,25 @@ export default function App() {
     setState((prev) => ({ ...prev, tasks: prev.tasks.filter((t) => !t.completed) }));
   };
 
+  const handleAddUpcomingExam = (exam: Omit<UpcomingExam, 'id' | 'createdAt'>) => {
+    const newExam: UpcomingExam = {
+      ...exam,
+      id: `exam-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      createdAt: new Date().toISOString(),
+    };
+    setState((prev) => ({
+      ...prev,
+      upcomingExams: [...(prev.upcomingExams ?? []), newExam],
+    }));
+  };
+
+  const handleDeleteUpcomingExam = (examId: string) => {
+    setState((prev) => ({
+      ...prev,
+      upcomingExams: (prev.upcomingExams ?? []).filter((e) => e.id !== examId),
+    }));
+  };
+
   const handleToggleChapter = (chapterId: string) => {
     setState((prev) => {
       const exists = prev.completedChapterIds.includes(chapterId);
@@ -1628,6 +1648,8 @@ export default function App() {
               formulas={allFormulas}
               onNavigate={setActiveView}
               onToggleTask={handleToggleTask}
+              onAddExam={handleAddUpcomingExam}
+              onDeleteExam={handleDeleteUpcomingExam}
               onUpdateWeeklyGoal={(hours) =>
                 handleUpdateSettings({ weeklyStudyGoalHours: hours })
               }

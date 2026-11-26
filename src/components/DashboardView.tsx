@@ -46,12 +46,14 @@ import {
   PlatformNotice,
   SemesterNumber,
   StudyMateState,
+  UpcomingExam,
 } from '../types/study';
 import { formatDateBn, toBnDigits } from '../utils/formatBn';
 import { computeStudyStreak } from '../utils/studyStreak';
 import { DashboardHero, type HeroProfileChangePayload } from './DashboardHero';
 import { LiveBangladeshClock } from './LiveBangladeshClock';
 import { MathFormula } from './MathFormula';
+import { UpcomingExamCountdown } from './UpcomingExamCountdown';
 
 interface DashboardViewProps {
   state: StudyMateState;
@@ -60,6 +62,8 @@ interface DashboardViewProps {
   formulas: FormulaItem[];
   onNavigate: (view: AppView) => void;
   onToggleTask: (taskId: string) => void;
+  onAddExam: (exam: Omit<UpcomingExam, 'id' | 'createdAt'>) => void;
+  onDeleteExam: (examId: string) => void;
   onUpdateWeeklyGoal?: (hours: number) => void;
   onUpdateHeroProfile?: (
     partial: HeroProfileChangePayload
@@ -73,6 +77,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   formulas,
   onNavigate,
   onToggleTask,
+  onAddExam,
+  onDeleteExam,
   onUpdateWeeklyGoal,
   onUpdateHeroProfile,
 }) => {
@@ -440,6 +446,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
       </section>
+
+      {/* Upcoming Exam Dates & Live Nearest-Exam Countdown */}
+      <UpcomingExamCountdown
+        language={lang}
+        exams={state.upcomingExams ?? []}
+        semesterSubjects={semesterSubjects}
+        onAddExam={onAddExam}
+        onDeleteExam={onDeleteExam}
+      />
 
       {/* Daily Study Tip Section */}
       <section
