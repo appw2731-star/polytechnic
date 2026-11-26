@@ -1795,7 +1795,13 @@ export default function App() {
           )}
 
           {activeView === 'progress' && (
-            <ProgressView state={state} onNavigate={setActiveView} />
+            <ProgressView
+              state={state}
+              onNavigate={setActiveView}
+              onUpdateWeeklyGoal={(hours) =>
+                handleUpdateSettings({ weeklyStudyGoalHours: hours })
+              }
+            />
           )}
 
           {activeView === 'install' && (

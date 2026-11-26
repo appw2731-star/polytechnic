@@ -3,13 +3,19 @@ import { BarChart3, CheckCircle2, Clock, HelpCircle } from 'lucide-react';
 import { getSubjectsForUser } from '../data/curriculum';
 import { AppView, StudyMateState } from '../types/study';
 import { formatDateBn, toBnDigits } from '../utils/formatBn';
+import { WeeklyStudyGoalChart } from './WeeklyStudyGoalChart';
 
 interface ProgressViewProps {
   state: StudyMateState;
   onNavigate: (view: AppView) => void;
+  onUpdateWeeklyGoal?: (hours: number) => void;
 }
 
-export const ProgressView: React.FC<ProgressViewProps> = ({ state, onNavigate }) => {
+export const ProgressView: React.FC<ProgressViewProps> = ({
+  state,
+  onNavigate,
+  onUpdateWeeklyGoal,
+}) => {
   const completedTasks = state.tasks.filter((t) => t.completed);
   const totalTasks = state.tasks.length;
   const taskPct = totalTasks > 0 ? Math.round((completedTasks.length / totalTasks) * 100) : 0;
@@ -106,6 +112,13 @@ export const ProgressView: React.FC<ProgressViewProps> = ({ state, onNavigate })
           </p>
         </div>
       </section>
+
+      {/* Weekly Study Time vs Goal Recharts Bar Chart */}
+      <WeeklyStudyGoalChart
+        state={state}
+        onNavigate={onNavigate}
+        onUpdateWeeklyGoal={onUpdateWeeklyGoal}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Subject-wise Chapter Progress */}
